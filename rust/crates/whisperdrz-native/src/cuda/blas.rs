@@ -82,6 +82,31 @@ entry_points!(BlasFns -> blas::cublasStatus_t {
         blas::cublasComputeType_t,
         blas::cublasGemmAlgo_t,
     );
+    gemm_strided = "cublasGemmStridedBatchedEx": fn(
+        blas::cublasHandle_t,
+        blas::cublasOperation_t,
+        blas::cublasOperation_t,
+        c_int,
+        c_int,
+        c_int,
+        *const c_void,
+        *const c_void,
+        blas::cudaDataType,
+        c_int,
+        i64,
+        *const c_void,
+        blas::cudaDataType,
+        c_int,
+        i64,
+        *const c_void,
+        *mut c_void,
+        blas::cudaDataType,
+        c_int,
+        i64,
+        c_int,
+        blas::cublasComputeType_t,
+        blas::cublasGemmAlgo_t,
+    );
 });
 
 entry_points!(LtFns -> lt::cublasStatus_t {
@@ -213,6 +238,37 @@ struct LinearPlan {
     x: lt::cublasLtMatrixLayout_t,
     y: lt::cublasLtMatrixLayout_t,
     algo: lt::cublasLtMatmulAlgo_t,
+}
+
+/// Arithmetic of an FP32 GEMM
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum F32Math {
+    /// FP32 products and sums (`CUBLAS_COMPUTE_32F`), what torch's FP32 matmuls use
+    /// with `torch.backends.cuda.matmul.allow_tf32 = False`
+    Full,
+    /// Operands rounded to TF32 on tensor cores, FP32 sums (`CUBLAS_COMPUTE_32F_FAST_TF32`),
+    /// the precision of torch's cuDNN convolutions under its default
+    /// `torch.backends.cudnn.allow_tf32 = True`
+    Tf32,
+}
+
+/// One FP32 operand of a strided-batched GEMM: device address, leading dimension and
+/// the element stride from one batch entry to the next (0 shares one matrix)
+#[derive(Clone, Copy, Debug)]
+pub struct Operand {
+    pub ptr: u64,
+    pub ld: usize,
+    pub stride: usize,
+}
+
+impl Operand {
+    pub fn new(ptr: u64, ld: usize) -> Self {
+        Self { ptr, ld, stride: 0 }
+    }
+
+    pub fn strided(ptr: u64, ld: usize, stride: usize) -> Self {
+        Self { ptr, ld, stride }
+    }
 }
 
 /// GEMMs on the GPU's stream with torch's descriptors
@@ -467,6 +523,68 @@ impl Blas {
                     blas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
                 ),
                 "cublasGemmEx",
+            )
+        }
+    }
+
+    /// Column-major FP32 `c[i] = op(a[i]) @ op(b[i]) + beta c[i]` for `batch` entries,
+    /// `c` being `m x n` and the product's inner dimension `k`, through
+    /// `cublasGemmStridedBatchedEx` with the default algorithm
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f32(
+        &self,
+        math: F32Math,
+        (trans_a, trans_b): (bool, bool),
+        (m, n, k): (usize, usize, usize),
+        a: Operand,
+        b: Operand,
+        c: Operand,
+        batch: usize,
+        beta: f32,
+    ) -> Result<()> {
+        let op = |t: bool| {
+            if t {
+                blas::cublasOperation_t::CUBLAS_OP_T
+            } else {
+                blas::cublasOperation_t::CUBLAS_OP_N
+            }
+        };
+        let compute = match math {
+            F32Math::Full => blas::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            F32Math::Tf32 => blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+        };
+        let f32t = blas::cudaDataType::CUDA_R_32F;
+        let alpha = 1f32;
+        let dim = |v: usize| c_int::try_from(v).wrap_err("GEMM dimension overflows int");
+        let stride = |v: usize| i64::try_from(v).wrap_err("GEMM stride overflows i64");
+        unsafe {
+            check_blas(
+                (self.libs.blas.gemm_strided)(
+                    self.handle,
+                    op(trans_a),
+                    op(trans_b),
+                    dim(m)?,
+                    dim(n)?,
+                    dim(k)?,
+                    (&alpha as *const f32).cast(),
+                    a.ptr as *const c_void,
+                    f32t,
+                    dim(a.ld)?,
+                    stride(a.stride)?,
+                    b.ptr as *const c_void,
+                    f32t,
+                    dim(b.ld)?,
+                    stride(b.stride)?,
+                    (&beta as *const f32).cast(),
+                    c.ptr as *mut c_void,
+                    f32t,
+                    dim(c.ld)?,
+                    stride(c.stride)?,
+                    dim(batch)?,
+                    compute,
+                    blas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                ),
+                "cublasGemmStridedBatchedEx",
             )
         }
     }

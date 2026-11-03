@@ -16,6 +16,13 @@ export WHISPERDRZ_WEIGHTS="${WHISPERDRZ_WEIGHTS:-$(ls "$HOME"/.cache/huggingface
 export WHISPERDRZ_CUBLAS_DIR="${WHISPERDRZ_CUBLAS_DIR:-$("$python" -I -c 'import os, nvidia.cublas as c; print(os.path.join(c.__path__[0], "lib"))')}"
 
 "$python" -I "$root/tools/gemm_ref.py" "$ref"
+# ECAPA2: weights and torch's per-layer truth, made once (the reference dump runs every
+# recorded segment through torch, so it is reused while its manifest exists)
+ecapa_ref="${WHISPERDRZ_ECAPA2_REF:-$HOME/.cache/whisperdrz/ecapa2/ref}"
+export WHISPERDRZ_ECAPA2_REF="$ecapa_ref"
+export WHISPERDRZ_ECAPA2_WEIGHTS="${WHISPERDRZ_ECAPA2_WEIGHTS:-$HOME/.cache/whisperdrz/ecapa2/ecapa2.safetensors}"
+[[ -f "$WHISPERDRZ_ECAPA2_WEIGHTS" ]] || "$python" -I "$root/tools/ecapa2.py" export "$(dirname "$WHISPERDRZ_ECAPA2_WEIGHTS")"
+[[ -f "$ecapa_ref/manifest.json" ]] || "$python" -I "$root/tools/ecapa2.py" ref "$ecapa_ref"
 cd "$root"
 # the Python reference is whisperdrz a783291's src/, extracted from git when missing
 ref_src="${WHISPERDRZ_REF_SRC:-$HOME/.cache/whisperdrz/ref-a783291/src}"
@@ -40,5 +47,5 @@ export WHISPERDRZ_ENCODER_REF="${WHISPERDRZ_ENCODER_REF:-$HOME/.cache/whisperdrz
 
 # every GPU test binary runs even after one fails
 cargo test --release --features cuda --no-fail-fast -p whisperdrz-native \
-  --test gpu_blas --test gpu_weights --test gpu_decoder_attn --test gpu_ops --test gpu_encoder \
+  --test gpu_blas --test gpu_weights --test gpu_decoder_attn --test gpu_ops --test gpu_encoder --test gpu_ecapa2 \
   "$@" -- --nocapture --test-threads 1

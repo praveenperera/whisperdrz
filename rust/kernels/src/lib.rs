@@ -11,6 +11,7 @@
 
 pub mod attention;
 pub mod common;
+pub mod ecapa2;
 pub mod elementwise;
 pub mod flash;
 pub mod mma_f16;
