@@ -17,19 +17,28 @@ export WHISPERDRZ_CUBLAS_DIR="${WHISPERDRZ_CUBLAS_DIR:-$("$python" -I -c 'import
 
 "$python" -I "$root/tools/gemm_ref.py" "$ref"
 cd "$root"
-# decoder attention: flash-attn and FP32 references on synthetic caches plus the layers of
-# one traced prefill (reference snapshot src, checkpoint, short3 trace)
-attn_ref="${WHISPERDRZ_ATTN_REF:-$HOME/.cache/whisperdrz/attn-ref}"
 # the Python reference is whisperdrz a783291's src/, extracted from git when missing
 ref_src="${WHISPERDRZ_REF_SRC:-$HOME/.cache/whisperdrz/ref-a783291/src}"
 if [[ ! -d "$ref_src/whisperdrz" ]]; then
   mkdir -p "$(dirname "$ref_src")"
   git -C "$(git -C "$root" rev-parse --show-toplevel)" archive a783291 src | tar -x -C "$(dirname "$ref_src")"
 fi
+traces="${WHISPERDRZ_FIXTURES:-$HOME/.cache/whisperdrz/fixtures/ref-a783291}"
+
+# decoder attention: flash-attn and FP32 references on synthetic caches plus the layers of
+# one traced prefill
+attn_ref="${WHISPERDRZ_ATTN_REF:-$HOME/.cache/whisperdrz/attn-ref}"
 "$python" -I "$root/tools/attn_ref.py" "$attn_ref" --src "$ref_src" --weights "$WHISPERDRZ_WEIGHTS" \
-  --trace "${WHISPERDRZ_FIXTURES:-$HOME/.cache/whisperdrz/fixtures/ref-a783291}/short3"
+  --trace "$traces/short3"
 export WHISPERDRZ_ATTN_REF="$attn_ref"
+
+# encoder: torch per layer and end to end on recorded inputs (skips when its output is
+# already there); the shared transformer kernels are checked against f64 in gpu_ops
+export WHISPERDRZ_GPU=1
+export WHISPERDRZ_ENCODER_REF="${WHISPERDRZ_ENCODER_REF:-$HOME/.cache/whisperdrz/encoder-ref}"
+"$python" -I "$root/tools/encoder_layers.py" --src "$ref_src" --model "$WHISPERDRZ_WEIGHTS" "$WHISPERDRZ_ENCODER_REF"
 
 # every GPU test binary runs even after one fails
 cargo test --release --features cuda --no-fail-fast -p whisperdrz-native \
-  --test gpu_blas --test gpu_weights --test gpu_decoder_attn "$@" -- --nocapture --test-threads 1
+  --test gpu_blas --test gpu_weights --test gpu_decoder_attn --test gpu_ops --test gpu_encoder \
+  "$@" -- --nocapture --test-threads 1

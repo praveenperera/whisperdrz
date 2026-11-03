@@ -12,3 +12,7 @@
 pub mod attention;
 pub mod common;
 pub mod elementwise;
+pub mod flash;
+pub mod mma_f16;
+pub mod norm;
+pub mod pointwise;

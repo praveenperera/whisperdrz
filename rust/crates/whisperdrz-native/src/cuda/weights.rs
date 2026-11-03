@@ -82,6 +82,13 @@ impl Weights {
         Ok(t)
     }
 
+    /// Removes and returns the tensor `name`, checked against the shape the caller
+    /// expects, for a consumer that repacks it and frees the original
+    pub fn take(&mut self, name: &str, shape: &[usize]) -> Result<Tensor> {
+        self.get(name, shape)?;
+        Ok(self.0.remove(name).expect("checked by get"))
+    }
+
     pub fn len(&self) -> usize {
         self.0.len()
     }
