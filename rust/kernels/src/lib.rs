@@ -9,5 +9,6 @@
 
 #![no_std]
 
+pub mod attention;
 pub mod common;
 pub mod elementwise;

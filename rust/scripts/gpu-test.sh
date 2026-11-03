@@ -17,4 +17,14 @@ export WHISPERDRZ_CUBLAS_DIR="${WHISPERDRZ_CUBLAS_DIR:-$("$python" -I -c 'import
 
 "$python" -I "$root/tools/gemm_ref.py" "$ref"
 cd "$root"
-cargo test --release --features cuda --no-fail-fast -p whisperdrz-native --test gpu_blas --test gpu_weights "$@" -- --nocapture --test-threads 1
+# decoder attention: flash-attn and FP32 references on synthetic caches plus the layers of
+# one traced prefill (reference snapshot src, checkpoint, short3 trace)
+attn_ref="${WHISPERDRZ_ATTN_REF:-$HOME/.cache/whisperdrz/attn-ref}"
+ref_src="${WHISPERDRZ_REF_SRC:-/home/praveen/.t3/worktrees/whisperdrz/perf-bit-identical-climb/_scratch/native-port/snap/ref-a783291/src}"
+"$python" -I "$root/tools/attn_ref.py" "$attn_ref" --src "$ref_src" --weights "$WHISPERDRZ_WEIGHTS" \
+  --trace "${WHISPERDRZ_FIXTURES:-$HOME/.cache/whisperdrz/fixtures/ref-a783291}/short3"
+export WHISPERDRZ_ATTN_REF="$attn_ref"
+
+# every GPU test binary runs even after one fails
+cargo test --release --features cuda --no-fail-fast -p whisperdrz-native \
+  --test gpu_blas --test gpu_weights --test gpu_decoder_attn "$@" -- --nocapture --test-threads 1

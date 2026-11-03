@@ -1,6 +1,21 @@
 0 bytes gmem
+Compiling entry function 'kv_lens' for 'sm_120'
+Function properties for kv_lens
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 10 registers, used 0 barriers
+Compile time = 2.611 ms
 Compiling entry function 'gelu_f16' for 'sm_120'
 Function properties for gelu_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 12 registers, used 0 barriers
-Compile time = 3.989 ms
+Compile time = 2.170 ms
+Compiling entry function 'attn_decode_f16' for 'sm_120'
+Function properties for attn_decode_f16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 72 registers, used 1 barriers, 1056 bytes smem
+Compile time = 33.967 ms
+Compiling entry function 'attn_combine_f16' for 'sm_120'
+Function properties for attn_combine_f16
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 39 registers, used 0 barriers
+Compile time = 9.277 ms
