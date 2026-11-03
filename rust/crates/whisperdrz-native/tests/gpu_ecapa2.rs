@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use eyre::{Result, bail, ensure, eyre};
+use eyre::{Result, WrapErr, bail, ensure, eyre};
 use safetensors::SafeTensors;
 use serde_json::{Value, json};
 use whisperdrz_fixtures::{ArrayData, read_npy};
@@ -804,11 +804,25 @@ fn layers_match_torch_fp32() -> Result<()> {
     Ok(())
 }
 
-fn cosine(a: &[f32], b: &[f64]) -> f64 {
+/// Cosine similarity, failing on a length mismatch, a zero or non-finite norm, or a
+/// non-finite result, so a zero or NaN embedding can't slip past a min over scores
+fn cosine(a: &[f32], b: &[f64]) -> Result<f64> {
+    ensure!(
+        a.len() == b.len(),
+        "cosine of {} and {} values",
+        a.len(),
+        b.len()
+    );
     let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y).sum();
     let na = a.iter().map(|&x| x as f64 * x as f64).sum::<f64>().sqrt();
     let nb = b.iter().map(|y| y * y).sum::<f64>().sqrt();
-    dot / (na * nb)
+    ensure!(
+        na.is_finite() && na > 0.0 && nb.is_finite() && nb > 0.0,
+        "embedding norms {na} and {nb}"
+    );
+    let c = dot / (na * nb);
+    ensure!(c.is_finite(), "cosine {c}");
+    Ok(c)
 }
 
 fn floats(v: &Value) -> Result<Vec<f64>> {
@@ -858,13 +872,20 @@ fn embeddings_match_recorded() -> Result<()> {
             );
             let e = normalize(&model.embed(&gpu, &blas, &audio)?);
             ensure!(e.len() == 192, "{name}: embedding width {}", e.len());
-            rec.push(cosine(&e, &floats(&seg["recorded"])?));
-            tru.push(cosine(&e, &floats(&seg["truth"])?));
+            rec.push(
+                cosine(&e, &floats(&seg["recorded"])?)
+                    .wrap_err_with(|| format!("{name} vs recorded"))?,
+            );
+            tru.push(
+                cosine(&e, &floats(&seg["truth"])?).wrap_err_with(|| format!("{name} vs truth"))?,
+            );
             ours.insert(
                 name.to_string(),
                 json!({"set": seg["set"], "stem": seg["stem"], "seq": seg["seq"], "embedding": e}),
             );
         }
+        // an empty set would leave the min at infinity and pass the floor below
+        ensure!(!rec.is_empty(), "no recorded segments embedded");
         let stat = |v: &[f64]| {
             (
                 v.iter().fold(f64::INFINITY, |m, &x| m.min(x)),
