@@ -489,6 +489,18 @@ impl Blas {
             (y, n_out),
         )
     }
+
+    /// `y[rows, n] = x[rows, k] @ b[k, n]`, all FP16 row-major, as torch's `mm` runs the
+    /// LM head on the contiguous transposed token embedding
+    pub fn matmul(
+        &self,
+        x: u64,
+        b: u64,
+        y: u64,
+        (rows, k, n): (usize, usize, usize),
+    ) -> Result<()> {
+        self.gemm_ex_f16(false, false, (n, rows, k), (b, n), (x, k), (y, n))
+    }
 }
 
 impl Drop for Blas {
