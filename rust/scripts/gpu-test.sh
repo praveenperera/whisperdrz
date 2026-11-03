@@ -20,7 +20,12 @@ cd "$root"
 # decoder attention: flash-attn and FP32 references on synthetic caches plus the layers of
 # one traced prefill (reference snapshot src, checkpoint, short3 trace)
 attn_ref="${WHISPERDRZ_ATTN_REF:-$HOME/.cache/whisperdrz/attn-ref}"
-ref_src="${WHISPERDRZ_REF_SRC:-/home/praveen/.t3/worktrees/whisperdrz/perf-bit-identical-climb/_scratch/native-port/snap/ref-a783291/src}"
+# the Python reference is whisperdrz a783291's src/, extracted from git when missing
+ref_src="${WHISPERDRZ_REF_SRC:-$HOME/.cache/whisperdrz/ref-a783291/src}"
+if [[ ! -d "$ref_src/whisperdrz" ]]; then
+  mkdir -p "$(dirname "$ref_src")"
+  git -C "$(git -C "$root" rev-parse --show-toplevel)" archive a783291 src | tar -x -C "$(dirname "$ref_src")"
+fi
 "$python" -I "$root/tools/attn_ref.py" "$attn_ref" --src "$ref_src" --weights "$WHISPERDRZ_WEIGHTS" \
   --trace "${WHISPERDRZ_FIXTURES:-$HOME/.cache/whisperdrz/fixtures/ref-a783291}/short3"
 export WHISPERDRZ_ATTN_REF="$attn_ref"
