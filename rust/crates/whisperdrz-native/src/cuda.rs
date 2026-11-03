@@ -6,6 +6,7 @@ pub mod decoder_attn;
 pub mod device;
 pub mod ecapa2;
 pub mod encoder;
+pub mod model;
 pub mod ops;
 pub mod weights;
 

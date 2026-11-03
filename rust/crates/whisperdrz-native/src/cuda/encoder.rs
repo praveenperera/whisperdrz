@@ -95,9 +95,11 @@ impl Block {
     }
 }
 
-/// Activation buffers for one batch size, reused across blocks and calls
+/// Activation buffers sized for up to `capacity` windows, reused across blocks and calls
 pub struct Workspace {
+    /// Windows the next call runs, at most `capacity`
     batch: usize,
+    capacity: usize,
     /// The residual stream `[B, 1500, 1280]`
     x: Buf,
     /// LayerNorm output, the input of the next GEMM
@@ -118,6 +120,7 @@ impl Workspace {
         let rows = batch * N_CTX;
         Ok(Self {
             batch,
+            capacity: batch,
             x: gpu.alloc(rows * D_MODEL * 2)?,
             h: gpu.alloc(rows * D_MODEL * 2)?,
             qkv: gpu.alloc(rows * 3 * D_MODEL * 2)?,
@@ -129,6 +132,23 @@ impl Workspace {
 
     pub fn batch(&self) -> usize {
         self.batch
+    }
+
+    /// The most windows a call can run
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Sets the windows the next calls run, up to the capacity the workspace was made
+    /// for, so one workspace sized for the largest batch serves every smaller one
+    pub fn set_batch(&mut self, batch: usize) -> Result<()> {
+        ensure!(
+            (1..=self.capacity).contains(&batch),
+            "encoder batch {batch} outside 1..={}",
+            self.capacity
+        );
+        self.batch = batch;
+        Ok(())
     }
 
     /// The residual stream `[B, 1500, 1280]`: the stem's output after [`Encoder::stem`],
