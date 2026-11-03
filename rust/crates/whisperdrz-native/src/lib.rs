@@ -9,6 +9,7 @@
 
 pub mod decode;
 pub mod dtw;
+pub mod mel;
 pub mod post;
 pub mod speaker;
 pub mod text;
