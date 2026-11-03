@@ -16,6 +16,7 @@ use std::time::Instant;
 use eyre::{Context, Result, bail, ensure};
 use serde_json::{Map, Value, json};
 use whisperdrz_native::cuda::model::GpuModel;
+use whisperdrz_native::cuda::nvtx;
 use whisperdrz_native::decode::tables::DecoderTables;
 use whisperdrz_native::mel::{LogMel, N_MELS, SAMPLE_RATE};
 use whisperdrz_native::speaker::PyRandom;
@@ -121,20 +122,25 @@ fn main() -> Result<()> {
     let tables = Arc::new(DecoderTables::new(Tokenizer::multilingual()?)?);
     let log_mel = LogMel::new();
     let mel = Box::new(move |audio: &[f32]| {
+        let _range = nvtx::Range::new("mel");
         let data = log_mel.compute(audio)?;
         Mel::new(N_MELS, data.len() / N_MELS, data)
     });
     let mut trn = Transcriber::new(config, model, mel, tables)?;
 
     let warmup = &audios[0][..audios[0].len().min(WARMUP_SECONDS * SAMPLE_RATE)];
+    let range = nvtx::Range::new("warmup");
     trn.transcribe(warmup, &mut PyRandom::new(0))?;
+    drop(range);
 
     let mut out = Map::new();
     let mut total_audio = 0.0;
     let mut total_wall = 0.0;
     for (path, audio) in paths.iter().zip(&audios) {
         let start = Instant::now();
+        let range = nvtx::Range::new("transcribe");
         let result = trn.transcribe(audio, &mut PyRandom::new(0))?;
+        drop(range);
         let wall = start.elapsed().as_secs_f64();
 
         let seconds = audio.len() as f64 / SAMPLE_RATE as f64;

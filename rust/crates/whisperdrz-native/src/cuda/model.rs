@@ -18,7 +18,7 @@ use super::decoder::{self, Decoder, MAX_ROWS, N_LAYER, N_VOCAB, PREFILL_LEN};
 use super::decoder_attn::{Batch, DecoderAttn, KvCaches};
 use super::ecapa2::{self, Ecapa2, Precision};
 use super::encoder::{D_MODEL, N_CTX, N_FRAMES, N_MELS, Workspace};
-use super::{Blas, Buf, Encoder, Gpu, Weights};
+use super::{Blas, Buf, Encoder, Gpu, Weights, nvtx};
 use crate::dtw::{DtwBatch, Matrices};
 use crate::speaker::EMBED_DIM;
 use crate::transcriber::{DecodeStep, Logits, MelBatch, Model};
@@ -269,26 +269,32 @@ impl GpuModel {
 
 impl Model for GpuModel {
     fn reset_kv(&mut self, slots: &[usize]) -> Result<()> {
+        let _range = nvtx::Range::new("reset_kv");
         GpuModel::reset_kv(self, slots)
     }
 
     fn encode(&mut self, mel: &MelBatch, slots: &[usize]) -> Result<()> {
+        let _range = nvtx::Range::new("encode");
         GpuModel::encode(self, mel, slots)
     }
 
     fn prefill(&mut self, tokens: &[u32], slots: &[usize]) -> Result<Logits> {
+        let _range = nvtx::Range::new("prefill");
         GpuModel::prefill(self, tokens, slots)
     }
 
     fn decode_step(&mut self, step: &DecodeStep) -> Result<Logits> {
+        let _range = nvtx::Range::new("decode_step");
         GpuModel::decode_step(self, step)
     }
 
     fn dtw_prep(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Matrices> {
+        let _range = nvtx::Range::new("dtw_prep");
         GpuModel::dtw_prep(self, batch, xa_slots)
     }
 
     fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]> {
+        let _range = nvtx::Range::new("embed");
         GpuModel::embed(self, audio)
     }
 }
