@@ -46,7 +46,9 @@ pub fn extract_line_audio_segments(
 
     let mut out = Vec::new();
     for (line, seg) in parse_to_segments(text)?.iter().enumerate() {
-        let Speaker::Id(speaker) = seg.speaker else { continue };
+        let Speaker::Id(speaker) = seg.speaker else {
+            continue;
+        };
         // `int(max(0, start) * 16000)`: `int()` truncates toward zero
         let mut s = (py::max(0.0, seg.start) * SAMPLE_RATE) as i64;
         let mut e = (seg.end * SAMPLE_RATE) as i64;
@@ -61,12 +63,18 @@ pub fn extract_line_audio_segments(
 
         let max_samples = (max_duration * SAMPLE_RATE) as i64;
         if duration > max_samples {
-            let window = ((rng.uniform(MIN_WINDOW, max_duration) * SAMPLE_RATE) as i64).min(duration);
+            let window =
+                ((rng.uniform(MIN_WINDOW, max_duration) * SAMPLE_RATE) as i64).min(duration);
             s += rng.randint(0, duration - window)?;
             e = s + window;
         }
 
-        out.push(LineCrop { line, speaker, start: s as usize, len: (e - s) as usize });
+        out.push(LineCrop {
+            line,
+            speaker,
+            start: s as usize,
+            len: (e - s) as usize,
+        });
     }
 
     Ok(out)
@@ -96,7 +104,11 @@ pub fn remap_speakers_per_line(
     threshold: f64,
     min_duration: f64,
 ) -> Result<Remap> {
-    let unchanged = |crops| Remap { text: text.to_owned(), crops, clustering: None };
+    let unchanged = |crops| Remap {
+        text: text.to_owned(),
+        crops,
+        clustering: None,
+    };
 
     let segments = parse_to_segments(text)?;
     if segments.is_empty() {
@@ -118,12 +130,21 @@ pub fn remap_speakers_per_line(
     }
 
     let clustering = cluster_speakers(&embeddings, threshold, 1)?;
-    let embedded: HashMap<usize, i64> = crops.iter().zip(&clustering.labels).map(|(c, &l)| (c.line, l)).collect();
+    let embedded: HashMap<usize, i64> = crops
+        .iter()
+        .zip(&clustering.labels)
+        .map(|(c, &l)| (c.line, l))
+        .collect();
     // crops come out in line order, so this is `sorted(embedded_set)` with starts
-    let embedded_info: Vec<(usize, f64)> = crops.iter().map(|c| (c.line, segments[c.line].start)).collect();
+    let embedded_info: Vec<(usize, f64)> = crops
+        .iter()
+        .map(|c| (c.line, segments[c.line].start))
+        .collect();
 
-    let mut model_speaker: HashMap<usize, Speaker> =
-        crops.iter().map(|c| (c.line, Speaker::Id(c.speaker))).collect();
+    let mut model_speaker: HashMap<usize, Speaker> = crops
+        .iter()
+        .map(|c| (c.line, Speaker::Id(c.speaker)))
+        .collect();
     for (i, seg) in segments.iter().enumerate() {
         if seg.speaker != Speaker::Crowd {
             model_speaker.entry(i).or_insert(seg.speaker);
@@ -200,12 +221,20 @@ pub fn remap_speakers_per_line(
                 None => py::int(spk)?,
             };
             let rest = &stripped[m.end()..];
-            out.push(if rest.is_empty() { format!("[{new_spk}]") } else { format!("[{new_spk}] {rest}") });
+            out.push(if rest.is_empty() {
+                format!("[{new_spk}]")
+            } else {
+                format!("[{new_spk}] {rest}")
+            });
             seg_idx += 1;
         } else {
             out.push(line.to_owned());
         }
     }
 
-    Ok(Remap { text: out.join("\n"), crops, clustering: Some(clustering) })
+    Ok(Remap {
+        text: out.join("\n"),
+        crops,
+        clustering: Some(clustering),
+    })
 }

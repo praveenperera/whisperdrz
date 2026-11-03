@@ -98,7 +98,8 @@ pub fn float(s: &str) -> Result<f64> {
         return Err(eyre!("could not convert string to float: {s:?}"));
     }
 
-    t.parse::<f64>().map_err(|_| eyre!("could not convert string to float: {s:?}"))
+    t.parse::<f64>()
+        .map_err(|_| eyre!("could not convert string to float: {s:?}"))
 }
 
 /// `int(s)` for a `\d+` capture; CPython ints are unbounded, so values past `i64`

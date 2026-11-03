@@ -10,30 +10,48 @@ use whisperdrz_native::post::{self, FinalizeState, py};
 use whisperdrz_native::speaker::{PyRandom, cluster_speakers, torch_cpu};
 
 fn data(name: &str) -> Result<Value> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name);
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name);
     Ok(serde_json::from_str(&std::fs::read_to_string(&path)?)?)
 }
 
 fn f32s(v: &Value) -> Vec<f32> {
-    v.as_array().into_iter().flatten().map(|b| f32::from_bits(b.as_u64().unwrap_or(0) as u32)).collect()
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .map(|b| f32::from_bits(b.as_u64().unwrap_or(0) as u32))
+        .collect()
 }
 
 fn same_bits(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count() + a.len().abs_diff(b.len())
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
+        + a.len().abs_diff(b.len())
 }
 
 #[test]
 fn pyrandom_matches_cpython() -> Result<()> {
-    for case in data("pyrandom.json")?.as_array().ok_or_else(|| eyre!("not a list"))? {
+    for case in data("pyrandom.json")?
+        .as_array()
+        .ok_or_else(|| eyre!("not a list"))?
+    {
         let seed = case["seed"].as_u64().ok_or_else(|| eyre!("seed"))?;
         let mut r = PyRandom::new(seed);
         for (i, call) in case["calls"].as_array().into_iter().flatten().enumerate() {
             let args = call[1].as_array().ok_or_else(|| eyre!("args"))?;
             let got = match call[0].as_str().unwrap_or_default() {
                 "random" => json!(r.random()),
-                "uniform" => json!(r.uniform(args[0].as_f64().unwrap_or(0.0), args[1].as_f64().unwrap_or(0.0))),
+                "uniform" => json!(r.uniform(
+                    args[0].as_f64().unwrap_or(0.0),
+                    args[1].as_f64().unwrap_or(0.0)
+                )),
                 "getrandbits" => json!(r.getrandbits(args[0].as_u64().unwrap_or(0) as u32)),
-                "randint" => json!(r.randint(args[0].as_i64().unwrap_or(0), args[1].as_i64().unwrap_or(0))?),
+                "randint" => {
+                    json!(r.randint(args[0].as_i64().unwrap_or(0), args[1].as_i64().unwrap_or(0))?)
+                }
                 other => return Err(eyre!("unknown op {other}")),
             };
             ensure!(got == call[2], "seed {seed} draw {i} {call}: got {got}");
@@ -52,20 +70,41 @@ fn torch_kernels_match_bits() -> Result<()> {
         torch_cpu::normalize(row);
     }
 
-    ensure!(same_bits(&xn, &f32s(&d["normalize"])) == 0, "normalize differs");
+    ensure!(
+        same_bits(&xn, &f32s(&d["normalize"])) == 0,
+        "normalize differs"
+    );
 
     let want = f32s(&d["normalize"]);
-    let sumsq: Vec<f32> =
-        want.as_chunks::<192>().0.iter().map(|r| torch_cpu::sum(&r.map(|v| v * v))).collect();
-    ensure!(same_bits(&sumsq, &f32s(&d["sumsq"])) == 0, "pow(2).sum(-1) differs");
+    let sumsq: Vec<f32> = want
+        .as_chunks::<192>()
+        .0
+        .iter()
+        .map(|r| torch_cpu::sum(&r.map(|v| v * v)))
+        .collect();
+    ensure!(
+        same_bits(&sumsq, &f32s(&d["sumsq"])) == 0,
+        "pow(2).sum(-1) differs"
+    );
 
     let cd = torch_cpu::cdist(&want[..25 * 192], &want[..25 * 192], 192);
-    ensure!(same_bits(&cd, &f32s(&d["cdist25"])) == 0, "cdist (25 rows) differs");
+    ensure!(
+        same_bits(&cd, &f32s(&d["cdist25"])) == 0,
+        "cdist (25 rows) differs"
+    );
     let cd = torch_cpu::cdist(&want[..7 * 192], &want[30 * 192..33 * 192], 192);
-    ensure!(same_bits(&cd, &f32s(&d["cdist7x3"])) == 0, "cdist (7x3) differs");
+    ensure!(
+        same_bits(&cd, &f32s(&d["cdist7x3"])) == 0,
+        "cdist (7x3) differs"
+    );
 
-    let cols: Vec<f32> = (0..192).map(|c| torch_cpu::column_sum(&(0..40).map(|r| x[r * 192 + c]).collect::<Vec<_>>())).collect();
-    ensure!(same_bits(&cols, &f32s(&d["colsum40"])) == 0, "sum(0) over 40 rows differs");
+    let cols: Vec<f32> = (0..192)
+        .map(|c| torch_cpu::column_sum(&(0..40).map(|r| x[r * 192 + c]).collect::<Vec<_>>()))
+        .collect();
+    ensure!(
+        same_bits(&cols, &f32s(&d["colsum40"])) == 0,
+        "sum(0) over 40 rows differs"
+    );
     Ok(())
 }
 
@@ -73,12 +112,27 @@ fn torch_kernels_match_bits() -> Result<()> {
 fn clustering_matches_torch() -> Result<()> {
     let d = data("torch_cpu.json")?;
     for (i, case) in d["clusters"].as_array().into_iter().flatten().enumerate() {
-        let emb: Vec<Vec<f32>> = f32s(&case["emb"]).as_chunks::<192>().0.iter().map(|r| r.to_vec()).collect();
+        let emb: Vec<Vec<f32>> = f32s(&case["emb"])
+            .as_chunks::<192>()
+            .0
+            .iter()
+            .map(|r| r.to_vec())
+            .collect();
         let threshold = case["threshold"].as_f64().unwrap_or(0.0);
         let min_size = case["min_cluster_size"].as_u64().unwrap_or(1) as usize;
         let c = cluster_speakers(&emb, threshold, min_size)?;
-        let want: Vec<i64> = case["labels"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
-        ensure!(c.labels == want, "case {i} (n={}): want {want:?}, got {:?}", emb.len(), c.labels);
+        let want: Vec<i64> = case["labels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_i64)
+            .collect();
+        ensure!(
+            c.labels == want,
+            "case {i} (n={}): want {want:?}, got {:?}",
+            emb.len(),
+            c.labels
+        );
     }
 
     Ok(())
@@ -96,7 +150,9 @@ fn run(fn_name: &str, args: &[Value]) -> Result<Value> {
         "fix_nonmonotonic_timestamps" => json!(post::fix_nonmonotonic_timestamps(text()?)?),
         "fix_speaker_ids" => json!(post::fix_speaker_ids(text()?)?),
         "merge_consecutive_speakers" => json!(post::merge_consecutive_speakers(text()?)?),
-        "remove_speaker_tags_not_after_newline" => json!(post::remove_speaker_tags_not_after_newline(text()?)?),
+        "remove_speaker_tags_not_after_newline" => {
+            json!(post::remove_speaker_tags_not_after_newline(text()?)?)
+        }
         "consolidate_adjacent_tags" => json!(post::consolidate_adjacent_tags(text()?)?),
         "remove_orphan_paired_tags" => json!(post::remove_orphan_paired_tags(text()?)?),
         "remove_invalid_timing_pairs" => json!(post::remove_invalid_timing_pairs(text()?, 0.02)?),
@@ -106,7 +162,10 @@ fn run(fn_name: &str, args: &[Value]) -> Result<Value> {
         "strip_to_last_closing" => json!(post::strip_to_last_closing(text()?)?),
         "parse_to_segments" => segments(&post::parse_to_segments(text()?)?),
         "reconcile_decoder_and_alignment_timings" => {
-            json!(post::reconcile_decoder_and_alignment_timings(text()?, args[1].as_i64().unwrap_or(92))?)
+            json!(post::reconcile_decoder_and_alignment_timings(
+                text()?,
+                args[1].as_i64().unwrap_or(92)
+            )?)
         }
         "clean_chunk" => {
             let c = post::clean_chunk(text()?, args[1].as_i64().unwrap_or(92))?;
@@ -121,7 +180,11 @@ fn run(fn_name: &str, args: &[Value]) -> Result<Value> {
                 cutearly: args[0]["cutearly"].as_bool().unwrap_or(false),
             };
             let cur = args[1].as_str().ok_or_else(|| eyre!("cur arg"))?;
-            json!(post::finalize_transcription(&st, cur, args[2].as_bool().unwrap_or(true))?)
+            json!(post::finalize_transcription(
+                &st,
+                cur,
+                args[2].as_bool().unwrap_or(true)
+            )?)
         }
         "fmt_2f" => json!(py::fmt_2f(num(0)?)),
         "round2" => json!(py::round2(num(0)?)),
@@ -150,6 +213,12 @@ fn text_functions_match_python() -> Result<()> {
         }
     }
 
-    ensure!(bad.is_empty(), "{} of {} cases differ; first: {}", bad.len(), cases.len(), bad[0]);
+    ensure!(
+        bad.is_empty(),
+        "{} of {} cases differ; first: {}",
+        bad.len(),
+        cases.len(),
+        bad[0]
+    );
     Ok(())
 }

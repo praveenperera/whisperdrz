@@ -4,9 +4,9 @@
 use eyre::Result;
 
 use super::pattern::{Lazy, PyRe};
+use super::py;
 use super::speakers::BRACKET_DIGIT;
 use super::timings::quantize_timestamps;
-use super::py;
 
 static TAG_WITHOUT_NEWLINE: Lazy = Lazy::new(|| PyRe::fancy(r"(?<!\n)(?<=.)(\[\d\])"));
 static TAG_AT_START: Lazy = Lazy::new(|| PyRe::plain(r"^\[\d\]"));
@@ -27,7 +27,11 @@ pub struct FinalizeState {
 /// `apply_offset`), puts every single-digit speaker tag on its own line, ends the
 /// text with a newline unless `keepspeaker`, and with `cutearly` drops a speaker tag
 /// within the first ten characters
-pub fn finalize_transcription(state: &FinalizeState, cur: &str, apply_offset: bool) -> Result<String> {
+pub fn finalize_transcription(
+    state: &FinalizeState,
+    cur: &str,
+    apply_offset: bool,
+) -> Result<String> {
     let offset = if apply_offset { state.offset } else { 0.0 };
     let cur = quantize_timestamps(cur, offset, 0.02)?;
     let cur = cur.replace("[]", "\n[0]");

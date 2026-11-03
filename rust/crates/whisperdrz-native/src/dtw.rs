@@ -15,6 +15,10 @@
 //! cross-attention capture and the softmax/normalise/median prep stay on the GPU side,
 //! behind the `prep` closure
 
+use eyre::{Result, ensure};
+
+use crate::text::Tokenizer;
+
 mod batch;
 mod chunk;
 mod kernel;
@@ -53,4 +57,54 @@ pub trait DtwTokenizer {
 
     /// `<|startoftranscript|>` plus the language and task tokens
     fn sot_sequence(&self) -> &[u32];
+}
+
+/// [`DtwTokenizer`] over the real [`Tokenizer`] with the `en`/`transcribe` start sequence
+/// the transcriber's tokenizer uses
+pub struct TokenizerDtw<'t> {
+    tokenizer: &'t Tokenizer,
+    sot_sequence: [u32; 3],
+}
+
+impl<'t> TokenizerDtw<'t> {
+    pub fn new(tokenizer: &'t Tokenizer) -> Result<Self> {
+        // with every single byte ranked, byte-pair encoding can't hit an unranked piece,
+        // which is the only way `encode` fails on the one-character inputs DTW sends
+        for b in 0..=255u8 {
+            ensure!(
+                tokenizer.rank(&[b]).is_some(),
+                "byte {b} has no rank in the tokenizer"
+            );
+        }
+
+        Ok(Self {
+            tokenizer,
+            sot_sequence: [
+                tokenizer.sot(),
+                tokenizer.language_token("en")?,
+                tokenizer.transcribe(),
+            ],
+        })
+    }
+}
+
+impl DtwTokenizer for TokenizerDtw<'_> {
+    fn encode(&self, text: &str) -> Vec<u32> {
+        // DTW encodes single characters and " " only; `new` rules out the failure path
+        self.tokenizer
+            .encode(text)
+            .unwrap_or_else(|e| panic!("encode {text:?} for DTW: {e}"))
+    }
+
+    fn eot(&self) -> u32 {
+        self.tokenizer.eot()
+    }
+
+    fn no_timestamps(&self) -> u32 {
+        self.tokenizer.no_timestamps()
+    }
+
+    fn sot_sequence(&self) -> &[u32] {
+        &self.sot_sequence
+    }
 }

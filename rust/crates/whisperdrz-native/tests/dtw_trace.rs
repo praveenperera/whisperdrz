@@ -16,12 +16,13 @@ use std::cell::Cell;
 
 use eyre::{Result, bail, ensure, eyre};
 use serde_json::Value;
-use support::{TableTokenizer, bits, opt_usize, strings, token_groups};
+use support::{bits, opt_usize, strings, token_groups};
 use whisperdrz_fixtures::{Event, TraceSet, plain};
 use whisperdrz_native::dtw::{
-    DtwOptions, Matrices, NegMatrix, PreparedBatch, TagAnchor, WordAnchor, apply_anchor_bands,
-    dtw_from_neg_matrix, fill_word_timings_batch,
+    DtwOptions, Matrices, NegMatrix, PreparedBatch, TagAnchor, TokenizerDtw, WordAnchor,
+    apply_anchor_bands, dtw_from_neg_matrix, fill_word_timings_batch,
 };
+use whisperdrz_native::text::Tokenizer;
 
 /// Calls checked and mismatches found for one label
 #[derive(Default)]
@@ -215,7 +216,7 @@ fn recorded_matrices(set: &TraceSet, prep: &Event) -> Result<Matrices> {
 /// Reruns the call end to end, checking the batch against the recorded GPU inputs
 fn check_batch_end_to_end(
     set: &TraceSet,
-    tok: &TableTokenizer,
+    tok: &TokenizerDtw<'_>,
     call: &BatchCall<'_>,
 ) -> Result<()> {
     let slots = slots(call.fill)?;
@@ -275,7 +276,7 @@ fn check_batch_end_to_end(
 /// `_dtw_from_neg_matrix`, and that every recorded call is accounted for
 fn check_batch_chunks(
     set: &TraceSet,
-    tok: &TableTokenizer,
+    tok: &TokenizerDtw<'_>,
     call: &BatchCall<'_>,
     chunks: &mut usize,
 ) -> Result<()> {
@@ -339,7 +340,9 @@ fn replay(name: &str) {
     let Some(set) = TraceSet::open(name) else {
         return;
     };
-    let tok = TableTokenizer::load();
+    // the real tokenizer, so the replay also covers the DTW adapter over it
+    let tokenizer = Tokenizer::multilingual().expect("load the tokenizer");
+    let tok = TokenizerDtw::new(&tokenizer).expect("DTW tokenizer");
     let (mut neg_calls, mut band_calls, mut batches, mut chunk_mats) = (
         Tally::default(),
         Tally::default(),

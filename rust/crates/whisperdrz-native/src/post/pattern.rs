@@ -27,7 +27,11 @@ pub struct Caps<'t> {
 impl<'t> Caps<'t> {
     /// `m.group(i)`, or `None` when the group didn't take part
     pub fn get(&self, i: usize) -> Option<&'t str> {
-        self.spans.get(i).copied().flatten().map(|(a, b)| &self.text[a..b])
+        self.spans
+            .get(i)
+            .copied()
+            .flatten()
+            .map(|(a, b)| &self.text[a..b])
     }
 
     /// `m.group(i)` for a group the pattern always sets
@@ -123,7 +127,8 @@ fn translate(src: &str) -> String {
 impl PyRe {
     /// A pattern without lookaround or backreferences
     pub fn plain(src: &str) -> Self {
-        let re = regex::Regex::new(&translate(src)).unwrap_or_else(|e| panic!("bad pattern {src:?}: {e}"));
+        let re = regex::Regex::new(&translate(src))
+            .unwrap_or_else(|e| panic!("bad pattern {src:?}: {e}"));
         Self(Engine::Plain(re))
     }
 
@@ -142,14 +147,18 @@ impl PyRe {
         match &self.0 {
             Engine::Plain(re) => {
                 for c in re.captures_iter(text) {
-                    let spans = (0..c.len()).map(|i| c.get(i).map(|m| (m.start(), m.end()))).collect();
+                    let spans = (0..c.len())
+                        .map(|i| c.get(i).map(|m| (m.start(), m.end())))
+                        .collect();
                     out.push(Caps { text, spans });
                 }
             }
             Engine::Fancy(re) => {
                 for c in re.captures_iter(text) {
                     let c = c.wrap_err("regex match")?;
-                    let spans = (0..c.len()).map(|i| c.get(i).map(|m| (m.start(), m.end()))).collect();
+                    let spans = (0..c.len())
+                        .map(|i| c.get(i).map(|m| (m.start(), m.end())))
+                        .collect();
                     out.push(Caps { text, spans });
                 }
             }
@@ -169,12 +178,19 @@ impl PyRe {
         Ok(match &self.0 {
             Engine::Plain(re) => re.captures_at(text, pos).map(|c| Caps {
                 text,
-                spans: (0..c.len()).map(|i| c.get(i).map(|m| (m.start(), m.end()))).collect(),
+                spans: (0..c.len())
+                    .map(|i| c.get(i).map(|m| (m.start(), m.end())))
+                    .collect(),
             }),
-            Engine::Fancy(re) => re.captures_from_pos(text, pos).wrap_err("regex match")?.map(|c| Caps {
-                text,
-                spans: (0..c.len()).map(|i| c.get(i).map(|m| (m.start(), m.end()))).collect(),
-            }),
+            Engine::Fancy(re) => re
+                .captures_from_pos(text, pos)
+                .wrap_err("regex match")?
+                .map(|c| Caps {
+                    text,
+                    spans: (0..c.len())
+                        .map(|i| c.get(i).map(|m| (m.start(), m.end())))
+                        .collect(),
+                }),
         })
     }
 
@@ -198,7 +214,11 @@ impl PyRe {
     }
 
     /// `re.sub` whose replacement only fails as the Python function would raise
-    pub fn try_sub_with(&self, text: &str, mut repl: impl FnMut(&Caps) -> Result<String>) -> Result<String> {
+    pub fn try_sub_with(
+        &self,
+        text: &str,
+        mut repl: impl FnMut(&Caps) -> Result<String>,
+    ) -> Result<String> {
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
         for c in self.captures_all(text)? {

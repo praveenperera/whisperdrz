@@ -31,7 +31,8 @@ const PAIRED_TAGS: [&str; 15] = [
 ];
 
 static MULTI_SPACE: Lazy = Lazy::new(|| PyRe::plain(r"  +"));
-static TIMED_TAG: Lazy = Lazy::new(|| PyRe::plain(r"<\|(\d+\.?\d*)\|>\[([^\]]+)\]<\|(\d+\.?\d*)\|>"));
+static TIMED_TAG: Lazy =
+    Lazy::new(|| PyRe::plain(r"<\|(\d+\.?\d*)\|>\[([^\]]+)\]<\|(\d+\.?\d*)\|>"));
 static UNTIMED_RUN: Lazy = Lazy::new(|| PyRe::fancy(r"\[([a-zA-Z][a-zA-Z]*)\][ \t]+\[\1\]"));
 
 /// A literal under `re.IGNORECASE`: each ASCII letter becomes the class of every
@@ -70,7 +71,10 @@ static CLOSING_PAIRED: LazyLock<Vec<(&'static str, PyRe)>> = LazyLock::new(|| {
 });
 
 fn closing_for(tag: &str) -> Option<&'static PyRe> {
-    CLOSING_PAIRED.iter().find(|(t, _)| *t == tag).map(|(_, re)| re)
+    CLOSING_PAIRED
+        .iter()
+        .find(|(t, _)| *t == tag)
+        .map(|(_, re)| re)
 }
 
 /// `remove_orphan_paired_tags`: on each line, drops opening paired tags with no
@@ -87,7 +91,9 @@ pub fn remove_orphan_paired_tags(text: &str) -> Result<String> {
         let mut used_closings: Vec<usize> = Vec::new();
 
         for (m, name) in openings.iter().zip(&names) {
-            let Some(closing) = closing_for(name) else { continue };
+            let Some(closing) = closing_for(name) else {
+                continue;
+            };
             let mut found = false;
             for cm in closing.captures_all(line)? {
                 if cm.start() > m.end() && !used_closings.contains(&cm.start()) {
@@ -148,7 +154,12 @@ fn merge_timed_pass(txt: &str) -> Result<(String, bool)> {
             let between = &txt[m1.end()..m2.start()];
             if m1.group(2) == m2.group(2) && py::strip(between).is_empty() {
                 out.push_str(&txt[last_end..m1.start()]);
-                out.push_str(&format!("<|{}|>[{}]<|{}|>", m1.group(1), m1.group(2), m2.group(3)));
+                out.push_str(&format!(
+                    "<|{}|>[{}]<|{}|>",
+                    m1.group(1),
+                    m1.group(2),
+                    m2.group(3)
+                ));
                 last_end = m2.end();
                 i += 2;
                 changed = true;

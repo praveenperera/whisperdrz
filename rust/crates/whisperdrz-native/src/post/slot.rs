@@ -4,15 +4,16 @@
 use eyre::Result;
 
 use super::pattern::{Lazy, PyRe};
+use super::py;
 use super::speakers::{
-    BRACKET_DIGIT, fix_speaker_ids, merge_consecutive_speakers, remove_speaker_tags_not_after_newline,
+    BRACKET_DIGIT, fix_speaker_ids, merge_consecutive_speakers,
+    remove_speaker_tags_not_after_newline,
 };
 use super::tags::{consolidate_adjacent_tags, remove_orphan_paired_tags};
 use super::timings::{
-    fix_nonmonotonic_timestamps, reconcile_decoder_and_alignment_timings, remove_invalid_timing_pairs,
-    remove_short_nonspeech, remove_short_pauses,
+    fix_nonmonotonic_timestamps, reconcile_decoder_and_alignment_timings,
+    remove_invalid_timing_pairs, remove_short_nonspeech, remove_short_pauses,
 };
-use super::py;
 
 static DANGLING_QUOTE_BRACKET: Lazy = Lazy::new(|| PyRe::fancy(r#"\s*\["\s*(?=\n|$)"#));
 static DANGLING_BINARY_DIGIT: Lazy = Lazy::new(|| PyRe::fancy(r"\s+[01]\s*(?=\n|$)"));
@@ -22,7 +23,9 @@ static LONE_BANG: Lazy = Lazy::new(|| PyRe::fancy(r"(?<![a-zA-Z])!(?![a-zA-Z])")
 // `\bCouncill`: the word boundary is checked by hand against CPython's `\w`
 static COUNCILL: Lazy = Lazy::new(|| PyRe::plain(r"Councill(?:<\|[\d.]+\|>)?"));
 static TAG_ONLY_LINE: Lazy = Lazy::new(|| {
-    PyRe::plain(r"(?m)^\[(?:\d+|c)\]\s*(?:<\|[\d.]+\|>\s*)*(?:\[[a-zA-Z]+\]\s*(?:<\|[\d.]+\|>\s*)*)+\s*$")
+    PyRe::plain(
+        r"(?m)^\[(?:\d+|c)\]\s*(?:<\|[\d.]+\|>\s*)*(?:\[[a-zA-Z]+\]\s*(?:<\|[\d.]+\|>\s*)*)+\s*$",
+    )
 });
 static NEWLINE_RUN: Lazy = Lazy::new(|| PyRe::plain(r"\n{2,}"));
 static ORPHAN_TIMESTAMP: Lazy = Lazy::new(|| PyRe::plain(r"(\[\d+\] )<\|[\d.]+\|> (<\|[\d.]+\|>)"));
@@ -55,7 +58,10 @@ fn remove_councill(text: &str) -> Result<String> {
     let mut last = 0;
     let mut pos = 0;
     while let Some(m) = COUNCILL.search_from(text, pos)? {
-        let boundary = text[..m.start()].chars().next_back().is_none_or(|c| !py::is_word(c));
+        let boundary = text[..m.start()]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !py::is_word(c));
         if boundary {
             out.push_str(&text[last..m.start()]);
             last = m.end();
@@ -110,5 +116,8 @@ pub fn clean_chunk(sofar: &str, align_override_score: i64) -> Result<CleanedChun
         }
     }
 
-    Ok(CleanedChunk { text: fix_speaker_ids(&c)?, speaker_order })
+    Ok(CleanedChunk {
+        text: fix_speaker_ids(&c)?,
+        speaker_order,
+    })
 }

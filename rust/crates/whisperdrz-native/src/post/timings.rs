@@ -11,12 +11,16 @@ pub static TIMINGS_FORMAT: Lazy = Lazy::new(|| PyRe::plain(r"<\|(\d+\.\d+)\|>"))
 static SCORED_TIMING: Lazy = Lazy::new(|| PyRe::plain(r"<a\.(\d+)\|(\d+\.\d+)\|>"));
 static TIMED_WORD: Lazy = Lazy::new(|| PyRe::plain(r"<\|\d+\.\d+\|>([^\s<\[]+)<\|\d+\.\d+\|>"));
 static DECODER_ALIGN: Lazy = Lazy::new(|| {
-    PyRe::plain(r"(<\|\d+\.\d+\|>)(<a\.\d+\|\d+\.\d+\|>)(.*?)(<a\.\d+\|\d+\.\d+\|>)(<\|\d+\.\d+\|>)")
+    PyRe::plain(
+        r"(<\|\d+\.\d+\|>)(<a\.\d+\|\d+\.\d+\|>)(.*?)(<a\.\d+\|\d+\.\d+\|>)(<\|\d+\.\d+\|>)",
+    )
 });
 static ALIGN_SCORE: Lazy = Lazy::new(|| PyRe::plain(r"<a\.(\d+)\|"));
 static ALIGN_TIME: Lazy = Lazy::new(|| PyRe::plain(r"<a\.\d+\|(\d+\.\d+)\|>"));
-static SHORT_NONSPEECH: Lazy = Lazy::new(|| PyRe::plain(r"<\|([\d.]+)\|>\s*(\[[a-z]+\])\s*<\|([\d.]+)\|>"));
-static SHORT_PAUSE: Lazy = Lazy::new(|| PyRe::plain(r"<\|([\d.]+)\|>\s*\[pause\]\s*<\|([\d.]+)\|>"));
+static SHORT_NONSPEECH: Lazy =
+    Lazy::new(|| PyRe::plain(r"<\|([\d.]+)\|>\s*(\[[a-z]+\])\s*<\|([\d.]+)\|>"));
+static SHORT_PAUSE: Lazy =
+    Lazy::new(|| PyRe::plain(r"<\|([\d.]+)\|>\s*\[pause\]\s*<\|([\d.]+)\|>"));
 
 /// `parse_timing`: `float` of a marker with `<|` and `|>` removed
 pub fn parse_timing(t: &str) -> Result<f64> {
@@ -44,7 +48,10 @@ fn digits_at_least(digits: &str, threshold: i64) -> Result<bool> {
 /// `reconcile_decoder_and_alignment_timings`: in `<|d|><a.s|a|>word<a.s|a|><|d|>`,
 /// keeps the alignment times when the score reaches `confidence_threshold` and the
 /// decoder times otherwise; then rewrites every leftover `<a.s|t|>` as `<|t|>`
-pub fn reconcile_decoder_and_alignment_timings(text: &str, confidence_threshold: i64) -> Result<String> {
+pub fn reconcile_decoder_and_alignment_timings(
+    text: &str,
+    confidence_threshold: i64,
+) -> Result<String> {
     let result = DECODER_ALIGN.try_sub_with(text, |m| {
         let (decoder_start, align_start, word, align_end, decoder_end) =
             (m.group(1), m.group(2), m.group(3), m.group(4), m.group(5));
@@ -53,15 +60,23 @@ pub fn reconcile_decoder_and_alignment_timings(text: &str, confidence_threshold:
         };
 
         if digits_at_least(score.group(1), confidence_threshold)? {
-            let start = ALIGN_TIME.search(align_start)?.map(|c| c.group(1)).unwrap_or_default();
-            let end = ALIGN_TIME.search(align_end)?.map(|c| c.group(1)).unwrap_or_default();
+            let start = ALIGN_TIME
+                .search(align_start)?
+                .map(|c| c.group(1))
+                .unwrap_or_default();
+            let end = ALIGN_TIME
+                .search(align_end)?
+                .map(|c| c.group(1))
+                .unwrap_or_default();
             return Ok(format!("<|{start}|>{word}<|{end}|>"));
         }
 
         Ok(format!("{decoder_start}{word}{decoder_end}"))
     })?;
 
-    SCORED_TIMING.try_sub_with(&result, |m| Ok(format!("<|{}|>", py::fmt_2f(py::float(m.group(2))?))))
+    SCORED_TIMING.try_sub_with(&result, |m| {
+        Ok(format!("<|{}|>", py::fmt_2f(py::float(m.group(2))?)))
+    })
 }
 
 /// `round_to`: `round(x / step) * step`, where `round` returns an int
@@ -179,7 +194,11 @@ pub fn remove_short_nonspeech(text: &str, min_duration_s: f64) -> Result<String>
     SHORT_NONSPEECH.try_sub_with(text, |m| {
         let t1 = py::float(m.group(1))?;
         let t2 = py::float(m.group(3))?;
-        Ok(if t2 - t1 <= min_duration_s + 0.001 { String::new() } else { m.as_str().to_owned() })
+        Ok(if t2 - t1 <= min_duration_s + 0.001 {
+            String::new()
+        } else {
+            m.as_str().to_owned()
+        })
     })
 }
 
@@ -190,6 +209,10 @@ pub fn remove_short_pauses(text: &str, min_pause_ms: i64) -> Result<String> {
     SHORT_PAUSE.try_sub_with(text, |m| {
         let t1 = py::float(m.group(1))?;
         let t2 = py::float(m.group(2))?;
-        Ok(if t2 - t1 < min_pause_s { format!("<|{}|>", py::fmt_2f(t2)) } else { m.as_str().to_owned() })
+        Ok(if t2 - t1 < min_pause_s {
+            format!("<|{}|>", py::fmt_2f(t2))
+        } else {
+            m.as_str().to_owned()
+        })
     })
 }

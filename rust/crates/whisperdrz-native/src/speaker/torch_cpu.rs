@@ -206,7 +206,11 @@ fn euclidean_dist_mm(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
 
     let xa = pack(a, -2.0, false);
     let yb = pack(b, 1.0, true);
-    let chains = if (30..=64).contains(&xa.len().max(yb.len())) { 2 } else { 1 };
+    let chains = if (30..=64).contains(&xa.len().max(yb.len())) {
+        2
+    } else {
+        1
+    };
     let mut out = Vec::with_capacity(xa.len() * yb.len());
     for x in &xa {
         for y in &yb {

@@ -19,7 +19,9 @@ pub struct PyRandom {
 
 impl std::fmt::Debug for PyRandom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PyRandom").field("index", &self.index).finish_non_exhaustive()
+        f.debug_struct("PyRandom")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
     }
 }
 
@@ -32,7 +34,10 @@ impl PyRandom {
             key.push((seed >> 32) as u32);
         }
 
-        let mut r = Self { mt: [0; N], index: N + 1 };
+        let mut r = Self {
+            mt: [0; N],
+            index: N + 1,
+        };
         r.init_by_array(&key);
         r
     }
@@ -41,7 +46,9 @@ impl PyRandom {
         self.mt[0] = s;
         for i in 1..N {
             let prev = self.mt[i - 1];
-            self.mt[i] = 1_812_433_253u32.wrapping_mul(prev ^ (prev >> 30)).wrapping_add(i as u32);
+            self.mt[i] = 1_812_433_253u32
+                .wrapping_mul(prev ^ (prev >> 30))
+                .wrapping_add(i as u32);
         }
 
         self.index = N;
@@ -69,7 +76,8 @@ impl PyRandom {
 
         for _ in 0..N - 1 {
             let prev = self.mt[i - 1];
-            self.mt[i] = (self.mt[i] ^ (prev ^ (prev >> 30)).wrapping_mul(1_566_083_941)).wrapping_sub(i as u32);
+            self.mt[i] = (self.mt[i] ^ (prev ^ (prev >> 30)).wrapping_mul(1_566_083_941))
+                .wrapping_sub(i as u32);
             i += 1;
             if i >= N {
                 self.mt[0] = self.mt[N - 1];

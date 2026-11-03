@@ -49,7 +49,11 @@ pub enum Speaker {
 impl Speaker {
     /// Parses the `\d+|c` capture of a speaker tag
     pub fn parse(s: &str) -> Result<Self> {
-        if s == "c" { Ok(Self::Crowd) } else { py::int(s).map(Self::Id) }
+        if s == "c" {
+            Ok(Self::Crowd)
+        } else {
+            py::int(s).map(Self::Id)
+        }
     }
 }
 
@@ -124,7 +128,12 @@ pub fn parse_to_segments(text: &str) -> Result<Vec<Segment>> {
 
         let words = TIMINGS_FORMAT.sub(line, "")?;
         let text = WHITESPACE_RUN.sub(py::strip(&words), " ")?;
-        segments.push(Segment { speaker, start: py::round2(start), end: py::round2(end), text });
+        segments.push(Segment {
+            speaker,
+            start: py::round2(start),
+            end: py::round2(end),
+            text,
+        });
     }
 
     Ok(segments)

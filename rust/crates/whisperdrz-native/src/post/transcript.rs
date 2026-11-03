@@ -20,7 +20,11 @@ pub struct Transcript {
 pub fn join_predictions<'a>(predictions: impl IntoIterator<Item = &'a str>) -> String {
     predictions
         .into_iter()
-        .map(|p| p.replace("[CHOP]", "\n").trim_end_matches(super::py::is_space).to_owned())
+        .map(|p| {
+            p.replace("[CHOP]", "\n")
+                .trim_end_matches(super::py::is_space)
+                .to_owned()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -36,7 +40,10 @@ pub fn finish_text(combined: &str) -> Result<String> {
 /// The whole tail: `remap` is the per-line speaker remap
 /// ([`crate::speaker::remap_speakers_per_line`] bound to the file's audio, embedder
 /// and random state), or the identity when the remap model is off
-pub fn finish(predictions: &[&str], remap: impl FnOnce(String) -> Result<String>) -> Result<Transcript> {
+pub fn finish(
+    predictions: &[&str],
+    remap: impl FnOnce(String) -> Result<String>,
+) -> Result<Transcript> {
     let combined = remap(join_predictions(predictions.iter().copied()))?;
     let text = finish_text(&combined)?;
     let segments = parse_to_segments(&text)?;

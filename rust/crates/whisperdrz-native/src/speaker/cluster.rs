@@ -67,14 +67,24 @@ fn mean_rows(emb: &[Vec<f32>], rows: &[usize]) -> Vec<f32> {
 /// of each embedding in input order. The Python returns a dict keyed by
 /// `(segment, local_id)`; with distinct keys (as the remap passes) that dict is these
 /// labels in input order
-pub fn cluster_speakers(embeddings: &[Vec<f32>], threshold: f64, min_cluster_size: usize) -> Result<Clustering> {
+pub fn cluster_speakers(
+    embeddings: &[Vec<f32>],
+    threshold: f64,
+    min_cluster_size: usize,
+) -> Result<Clustering> {
     let n = embeddings.len();
     if n <= 1 {
-        return Ok(Clustering { labels: vec![0; n], steps: Vec::new() });
+        return Ok(Clustering {
+            labels: vec![0; n],
+            steps: Vec::new(),
+        });
     }
 
     let dim = embeddings[0].len();
-    ensure!(embeddings.iter().all(|e| e.len() == dim), "embeddings of different widths");
+    ensure!(
+        embeddings.iter().all(|e| e.len() == dim),
+        "embeddings of different widths"
+    );
 
     let mut emb: Vec<Vec<f32>> = embeddings.to_vec();
     for e in &mut emb {
@@ -92,7 +102,10 @@ pub fn cluster_speakers(embeddings: &[Vec<f32>], threshold: f64, min_cluster_siz
     while active.iter().filter(|&&a| a).count() > 1 {
         let idx: Vec<usize> = (0..n).filter(|&i| active[i]).collect();
         let r = idx.len();
-        let flat: Vec<f32> = idx.iter().flat_map(|&i| centroids[i].iter().copied()).collect();
+        let flat: Vec<f32> = idx
+            .iter()
+            .flat_map(|&i| centroids[i].iter().copied())
+            .collect();
         let mut dists = cdist(&flat, &flat, dim);
         for i in 0..r {
             dists[i * r + i] = f32::INFINITY;
@@ -109,7 +122,12 @@ pub fn cluster_speakers(embeddings: &[Vec<f32>], threshold: f64, min_cluster_siz
             })
             .map(|p| dists[p])
             .fold(f32::INFINITY, f32::min);
-        steps.push(MergeStep { active: r, min: min_val, runner_up, matmul: r > 25 });
+        steps.push(MergeStep {
+            active: r,
+            min: min_val,
+            runner_up,
+            matmul: r > 25,
+        });
 
         if min_val > threshold_f32 {
             break;
@@ -146,14 +164,17 @@ pub fn cluster_speakers(embeddings: &[Vec<f32>], threshold: f64, min_cluster_siz
     // cluster is large enough and this whole block is skipped
     let min_size = min_cluster_size.min((0.1 * n as f64).round_ties_even().max(1.0) as usize);
     let n_labels = clusters.iter().max().map_or(0, |m| m + 1);
-    let counts: Vec<usize> = (0..n_labels).map(|l| clusters.iter().filter(|&&c| c == l).count()).collect();
+    let counts: Vec<usize> = (0..n_labels)
+        .map(|l| clusters.iter().filter(|&&c| c == l).count())
+        .collect();
     let large: Vec<usize> = (0..n_labels).filter(|&l| counts[l] >= min_size).collect();
     let small: Vec<usize> = (0..n_labels).filter(|&l| counts[l] < min_size).collect();
 
     if large.is_empty() {
         clusters.iter_mut().for_each(|c| *c = 0);
     } else if !small.is_empty() {
-        let members = |cl: &[usize], l: usize| -> Vec<usize> { (0..n).filter(|&i| cl[i] == l).collect() };
+        let members =
+            |cl: &[usize], l: usize| -> Vec<usize> { (0..n).filter(|&i| cl[i] == l).collect() };
         let mut large_centroids = Vec::new();
         for &l in &large {
             let mut c = mean_rows(&emb, &members(&clusters, l));
@@ -165,7 +186,14 @@ pub fn cluster_speakers(embeddings: &[Vec<f32>], threshold: f64, min_cluster_siz
             let mut c = mean_rows(&emb, &members(&clusters, s));
             normalize(&mut c);
             let d = cdist(&c, &large_centroids, dim);
-            let nearest = d.iter().enumerate().fold((0, f32::INFINITY), |b, (k, &v)| if v < b.1 { (k, v) } else { b }).0;
+            let nearest = d
+                .iter()
+                .enumerate()
+                .fold(
+                    (0, f32::INFINITY),
+                    |b, (k, &v)| if v < b.1 { (k, v) } else { b },
+                )
+                .0;
             let target = large[nearest];
             for c in clusters.iter_mut() {
                 if *c == s {
@@ -177,5 +205,8 @@ pub fn cluster_speakers(embeddings: &[Vec<f32>], threshold: f64, min_cluster_siz
         renumber(&mut clusters);
     }
 
-    Ok(Clustering { labels: clusters.into_iter().map(|c| c as i64).collect(), steps })
+    Ok(Clustering {
+        labels: clusters.into_iter().map(|c| c as i64).collect(),
+        steps,
+    })
 }

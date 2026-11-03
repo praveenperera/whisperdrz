@@ -248,6 +248,11 @@ impl Tokenizer {
         self.specials.get(name).copied()
     }
 
+    /// Rank (token id) of an ordinary token's bytes
+    pub fn rank(&self, bytes: &[u8]) -> Option<Token> {
+        self.ranks.get(bytes).copied()
+    }
+
     /// `encoding.encode_single_token(text)` for an ordinary token
     pub fn single_token(&self, text: &str) -> Option<Token> {
         self.ranks
