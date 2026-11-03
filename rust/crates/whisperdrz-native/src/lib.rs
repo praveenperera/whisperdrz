@@ -8,3 +8,6 @@
 //! the `cuda` feature and are tested against logged Python inputs and outputs
 
 pub mod text;
+
+#[cfg(feature = "cuda")]
+pub mod cuda;

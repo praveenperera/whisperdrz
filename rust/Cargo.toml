@@ -24,7 +24,7 @@ fancy-regex = "0.19"
 regex = "1"
 base64 = "0.22"
 libloading = "0.8"
-cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "dynamic-loading", "cuda-12080"] }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cublas", "cublaslt", "dynamic-loading", "cuda-12080"] }
 
 [profile.release]
 debug = 1
