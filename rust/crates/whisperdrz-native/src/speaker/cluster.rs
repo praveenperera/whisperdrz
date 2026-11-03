@@ -3,7 +3,7 @@
 
 use eyre::{Result, ensure};
 
-use super::torch_cpu::{cdist, normalize};
+use super::torch_cpu::{cdist, column_sum, normalize};
 
 /// How close one merge decision came to going another way
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,39 +61,6 @@ fn mean_rows(emb: &[Vec<f32>], rows: &[usize]) -> Vec<f32> {
     }
 
     out
-}
-
-/// `sum(0)` down one column: `cascade_sum`'s outer reduction, which adds rows in
-/// order into a first-level accumulator and folds it up a level every 16 rows
-fn column_sum(col: &[f32]) -> f32 {
-    const LEVEL_STEP: usize = 16;
-
-    let mut acc = [0f32; 4];
-    let mut i = 0;
-    while i + LEVEL_STEP <= col.len() {
-        for &v in &col[i..i + LEVEL_STEP] {
-            acc[0] += v;
-        }
-
-        i += LEVEL_STEP;
-        for j in 1..4 {
-            acc[j] += acc[j - 1];
-            acc[j - 1] = 0.0;
-            if i & (0xF << (j * 4)) != 0 {
-                break;
-            }
-        }
-    }
-
-    for &v in &col[i..] {
-        acc[0] += v;
-    }
-
-    for j in 1..4 {
-        acc[0] += acc[j];
-    }
-
-    acc[0]
 }
 
 /// `cluster_speakers(embeddings, threshold, min_cluster_size)`, returning the label

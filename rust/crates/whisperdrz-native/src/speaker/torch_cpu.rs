@@ -119,6 +119,39 @@ pub fn sum(x: &[f32]) -> f32 {
     total
 }
 
+/// `sum(0)` down one column: `cascade_sum`'s outer reduction, which adds rows in
+/// order into a first-level accumulator and folds it up a level every 16 rows
+pub fn column_sum(col: &[f32]) -> f32 {
+    const LEVEL_STEP: usize = 16;
+
+    let mut acc = [0f32; 4];
+    let mut i = 0;
+    while i + LEVEL_STEP <= col.len() {
+        for &v in &col[i..i + LEVEL_STEP] {
+            acc[0] += v;
+        }
+
+        i += LEVEL_STEP;
+        for j in 1..4 {
+            acc[j] += acc[j - 1];
+            acc[j - 1] = 0.0;
+            if i & (0xF << (j * 4)) != 0 {
+                break;
+            }
+        }
+    }
+
+    for &v in &col[i..] {
+        acc[0] += v;
+    }
+
+    for j in 1..4 {
+        acc[0] += acc[j];
+    }
+
+    acc[0]
+}
+
 /// `torch.cdist(a, b)` (p = 2) between row sets of width `dim`, row-major `[ra, rb]`
 pub fn cdist(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
     let (ra, rb) = (a.len() / dim, b.len() / dim);
