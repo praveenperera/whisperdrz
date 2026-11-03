@@ -147,13 +147,20 @@ impl TraceSet {
             path.exists(),
             "blob {blob} was not saved (trace run without --save-blobs?)"
         );
-        let array = read_npy(&path)?;
+        // blobs are keyed by `sha256(tobytes())` alone, so a blob first saved by another
+        // call can carry that call's shape (`[1500, 1280]` for a recorded `[1, 1500,
+        // 1280]`); the bytes are the same C-order data, so take the recorded shape when
+        // the dtype and element count agree
+        let mut array = read_npy(&path)?;
         ensure!(
-            array.shape == shape,
-            "blob {blob} shape {:?} != recorded {:?}",
+            array.dtype == dtype
+                && array.shape.iter().product::<usize>() == shape.iter().product::<usize>(),
+            "blob {blob} is {} {:?}, recorded as {dtype} {:?}",
+            array.dtype,
             array.shape,
             shape
         );
+        array.shape = shape;
         Ok(array)
     }
 
