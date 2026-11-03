@@ -9,6 +9,8 @@
 
 pub mod decode;
 pub mod dtw;
+pub mod post;
+pub mod speaker;
 pub mod text;
 
 #[cfg(feature = "cuda")]
