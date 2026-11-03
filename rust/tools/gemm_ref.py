@@ -36,7 +36,9 @@ def main():
     for kind, n_in, n_out in LINEARS:
         w = (torch.randn(n_out, n_in, device=dev) / n_in**0.5).half()
         b = (torch.randn(n_out, device=dev) * 0.1).half()
-        weights[(n_in, n_out)] = (save(f"w{n_in}x{n_out}", w), w, save(f"b{n_out}", b), b)
+        # named per case kind too: two linears share each shape
+        tag = f"{kind}{n_in}x{n_out}"
+        weights[(kind, n_in, n_out)] = (save(f"w_{tag}", w), w, save(f"b_{tag}", b), b)
     emb = (torch.randn(VOCAB, 1280, device=dev) * 0.02).half()
     emb_t = emb.t().contiguous()
     emb_t_file = save("emb_t", emb_t)
@@ -45,7 +47,7 @@ def main():
         x_in = {n: torch.randn(rows, n, device=dev).half() for n in (1280, 5120)}
         x_file = {n: save(f"x{rows}x{n}", x) for n, x in x_in.items()}
         for kind, n_in, n_out in LINEARS:
-            w_file, w, b_file, b = weights[(n_in, n_out)]
+            w_file, w, b_file, b = weights[(kind, n_in, n_out)]
             x = x_in[n_in]
             y = F.linear(x, w, b) if kind == "bias" else F.linear(x, w)
             name = f"{kind}{rows}x{n_in}x{n_out}"

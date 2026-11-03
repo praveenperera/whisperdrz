@@ -17,4 +17,4 @@ export WHISPERDRZ_CUBLAS_DIR="${WHISPERDRZ_CUBLAS_DIR:-$("$python" -I -c 'import
 
 "$python" -I "$root/tools/gemm_ref.py" "$ref"
 cd "$root"
-cargo test --release --features cuda -p whisperdrz-native --test gpu_blas --test gpu_weights "$@" -- --nocapture --test-threads 1
+cargo test --release --features cuda --no-fail-fast -p whisperdrz-native --test gpu_blas --test gpu_weights "$@" -- --nocapture --test-threads 1
