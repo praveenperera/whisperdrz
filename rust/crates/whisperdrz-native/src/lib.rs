@@ -12,6 +12,7 @@ pub mod dtw;
 pub mod post;
 pub mod speaker;
 pub mod text;
+pub mod transcriber;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
