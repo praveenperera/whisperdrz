@@ -32,6 +32,19 @@ reruns measured:
 | vox24 | 21.98 | 23.23 | 1.0% | 6.0% |
 | e21 | 27.47 | 27.97 | 0.1% | 0.3% |
 
+Word timings are gated too, since the text metrics strip timestamps and DER reads only
+segments. Words are aligned over the timestamp-free word sequence; a boundary's error is
+taken where both runs time the same aligned word. The timed-word share may fall at most
+0.5 points below the reference's (every rerun stayed within 0.13), and the mean boundary
+error and the share of boundaries moved over 0.2 s may reach 1.5x the worst rerun:
+
+| Workload | Timed words (reference) | Mean boundary error limit | Moved > 0.2 s limit |
+| --- | --- | --- | --- |
+| vox24 | 96.83% | 0.313 s (worst rerun 0.209) | 4.39% (worst rerun 2.93) |
+| e21 | 98.75% | 0.266 s (worst rerun 0.178) | 4.44% (worst rerun 2.96) |
+
+Dropping every interior timestamp of a line, or shifting every timestamp by 0.5 s, fails.
+
 It first fails on malformed output (missing or reordered files, empty text, no segments,
 non-finite times), and prints the first divergence of each differing file to localize
 bugs. Every perturbation arm passes, and the reference passes against itself

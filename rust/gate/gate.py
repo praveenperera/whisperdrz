@@ -7,13 +7,15 @@ Byte identity with the Python reference isn't the bar: rerunning the reference w
 change that is exact in real arithmetic (f64 mel, memory-efficient encoder SDPA,
 cross-attention without split-KV) changed words or speakers on 10-17 of 24 vox24 files
 and on e21, so the gate passes a run whose distance from the reference and whose DER
-against the RTTMs stay inside the band those reruns measured. It still prints whether
+against the RTTMs stay inside the band those reruns measured, and whose word timings
+(coverage, mean boundary error, share moved over 0.2 s) stay inside that band too. It still prints whether
 the run is byte-identical, and the first divergence per file, to localize bugs
 
 Run with the whisperdrz venv (pyannote.metrics, jiwer, meeteval)
 """
 
 import contextlib
+import difflib
 import hashlib
 import io
 import json
@@ -39,10 +41,56 @@ RTTM = "/home/praveen/code/speakrs/fixtures/datasets/{ds}/rttm/{uri}.rttm"
 # (mel64); e21: DER 27.47, arms 27.42-27.47, edits up to 0.042% and 0.146%. Each limit is
 # the worst arm with headroom, since three arms sample the noise thinly
 LIMITS = {
-    "vox24": {"ds": "voxconverse-dev", "der": 21.98 + 1.25, "word_edit": 1.0, "cp_edit": 6.0},
-    "e21": {"ds": "earnings21", "der": 27.47 + 0.5, "word_edit": 0.1, "cp_edit": 0.3},
+    # timing limits are 1.5x the worst of the mel64, enc-eff and cross-ns1 reference
+    # reruns: mean boundary error vox24 0.209 s, e21 0.178 s; boundaries moved over
+    # 0.2 s vox24 2.93%, e21 2.96%. The timed-word fraction of every rerun stayed within
+    # 0.13 points of the reference
+    "vox24": {"ds": "voxconverse-dev", "der": 21.98 + 1.25, "word_edit": 1.0, "cp_edit": 6.0,
+              "timed_drop": 0.5, "t_mean": 0.313, "t_over": 4.39},
+    "e21": {"ds": "earnings21", "der": 27.47 + 0.5, "word_edit": 0.1, "cp_edit": 0.3,
+            "timed_drop": 0.5, "t_mean": 0.266, "t_over": 4.44},
 }
 TIMESTAMP = re.compile(r"<\|[0-9.]+\|>")
+# a word with the timestamps written right against it, `<|s|>word<|e|>`
+TIMED_WORD = re.compile(r"(?:<\|([0-9.]+)\|>)?([^\s<]+)(?:<\|([0-9.]+)\|>)?")
+SPEAKER_TAG = re.compile(r"\[\d+\]")
+# boundaries moving more than this count toward `t_over`
+TIMING_SLACK = 0.2
+
+
+def timed_words(text):
+    """(word, start or None, end or None) for each word, speaker tags dropped"""
+    out = []
+    for s, w, e in TIMED_WORD.findall(text):
+        if not SPEAKER_TAG.fullmatch(w):
+            out.append((w, float(s) if s else None, float(e) if e else None))
+    return out
+
+
+def timing(ref, new):
+    """Word-timing coverage and error: the text metrics strip timestamps and DER reads
+    only segments, so without this a run that drops or shifts word timings passes.
+    Words are aligned over the whole timestamp-free word sequence, and a boundary's error
+    is taken where both runs time the same aligned word"""
+    errors, words_ref, words_new, timed_ref, timed_new = [], 0, 0, 0, 0
+    for k in ref:
+        a, b = timed_words(ref[k]["text"]), timed_words(new[k]["text"])
+        words_ref += len(a)
+        words_new += len(b)
+        timed_ref += sum(w[1] is not None for w in a)
+        timed_new += sum(w[1] is not None for w in b)
+        sm = difflib.SequenceMatcher(None, [w[0] for w in a], [w[0] for w in b], autojunk=False)
+        for blk in sm.get_matching_blocks():
+            for i in range(blk.size):
+                x, y = a[blk.a + i], b[blk.b + i]
+                errors += [abs(x[j] - y[j]) for j in (1, 2) if x[j] is not None and y[j] is not None]
+    frac_ref = 100 * timed_ref / max(words_ref, 1)
+    frac_new = 100 * timed_new / max(words_new, 1)
+    if not errors:
+        return frac_ref, frac_new, math.inf, 100.0
+    mean = sum(errors) / len(errors)
+    over = 100 * sum(e > TIMING_SLACK for e in errors) / len(errors)
+    return frac_ref, frac_new, mean, over
 
 
 def gate_hash(out):
@@ -142,13 +190,18 @@ def main():
 
     der_ref, der_new = 100 * abs(metric_ref), 100 * abs(metric_new)
     word_edit, cp_edit = 100 * edits / words, 100 * cp_edits / words
+    frac_ref, frac_new, t_mean, t_over = timing(ref, new)
     checks = [
         ("der", der_new, limits["der"]),
         ("word_edit", word_edit, limits["word_edit"]),
         ("cp_edit", cp_edit, limits["cp_edit"]),
+        ("timed_drop", frac_ref - frac_new, limits["timed_drop"]),
+        ("t_mean", t_mean, limits["t_mean"]),
+        ("t_over", t_over, limits["t_over"]),
     ]
     print(f"{workload}: byte-identical={identical} files_differ={differ}/{len(ref)} DER ref {der_ref:.2f} new {der_new:.2f}")
     print(f"{workload}: word edits {edits}/{words} = {word_edit:.3f}%, cp edits {cp_edits} = {cp_edit:.3f}%")
+    print(f"{workload}: timed words ref {frac_ref:.2f}% new {frac_new:.2f}%, boundary error mean {t_mean:.3f} s, {t_over:.2f}% moved > {TIMING_SLACK} s")
     failed = [f"{name} {value:.3f} > {limit:.3f}" for name, value, limit in checks if value > limit]
     print(f"GATE {'FAIL' if failed else 'PASS'} {workload}" + (f": {', '.join(failed)}" if failed else ""))
     return 1 if failed else 0
