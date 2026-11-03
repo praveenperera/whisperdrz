@@ -182,9 +182,11 @@ fn cdist_direct(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
 }
 
 /// `_euclidean_dist`: `[-2x, |x|^2, 1] @ [y, 1, |y|^2]^T`, clamped at 0, `sqrt`.
-/// The product models MKL `sgemm` as FMA chains over k: one chain up to 29 rows,
-/// two interleaved chains (even and odd k) summed above that. Exact for 28, 31 and
-/// 33 rows in the probe; elsewhere a few elements per matrix differ by an ulp or two
+/// The product models MKL `sgemm` as FMA chains over k: two interleaved chains (even
+/// and odd k, summed) for 30 to 64 rows, one chain otherwise. Against MKL on the
+/// reference CPU it is exact at 28, 31 and 33 rows and elsewhere differs on up to 5%
+/// of the off-diagonal elements by an ulp or two (probed at 26 to 150 rows); MKL
+/// picks its kernels by size and thread split, so no fixed chain order is exact
 fn euclidean_dist_mm(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
     let pack = |rows: &[f32], scale: f32, norm_last: bool| -> Vec<Vec<f32>> {
         rows.chunks_exact(dim)
@@ -204,7 +206,7 @@ fn euclidean_dist_mm(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
 
     let xa = pack(a, -2.0, false);
     let yb = pack(b, 1.0, true);
-    let chains = if xa.len().max(yb.len()) <= 29 { 1 } else { 2 };
+    let chains = if (30..=64).contains(&xa.len().max(yb.len())) { 2 } else { 1 };
     let mut out = Vec::with_capacity(xa.len() * yb.len());
     for x in &xa {
         for y in &yb {
