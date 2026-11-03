@@ -1,0 +1,13 @@
+[package]
+name = "whisperdrz-fixtures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Readers for the Python reference traces the native runtime is tested against (dev-dependency only)"
+publish = false
+
+[dependencies]
+eyre.workspace = true
+half.workspace = true
+serde_json.workspace = true

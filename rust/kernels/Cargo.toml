@@ -1,0 +1,23 @@
+[package]
+name = "whisperdrz-kernels"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "cuda-oxide device kernels for whisperdrz, compiled offline to the PTX the whisperdrz-native crate embeds"
+license = "Apache-2.0"
+
+# standalone: cuda-oxide needs its pinned toolchain with rustc-dev and Linux with CUDA, so
+# this crate stays out of the host workspace and only scripts/build-ptx.sh builds it
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# cuda-oxide from the praveenperera/cuda-rust fork (upstream main plus fixes with PRs
+# pending: generic #[device] inlining, hoisted scratch allocas, partial unroll of
+# runtime-step loops, f32::max as max.f32, BlockRows). Pinned by rev so Cargo.lock and the
+# cargo-oxide that scripts/build-ptx.sh installs name the same commit; move back to
+# NVIDIA/cuda-rust main once the fixes merge
+cuda-device = { git = "https://github.com/praveenperera/cuda-rust.git", rev = "780d471fcfdcf21553032ed67adb198d5560a591" }
+libm = "0.2"

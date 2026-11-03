@@ -1,0 +1,26 @@
+[package]
+name = "whisperdrz-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Rust runtime for whisperdrz: mel, encoder, constrained decoding, DTW word timing and ECAPA2 speaker linking"
+
+[features]
+default = []
+# GPU runtime: cudarc driver API, embedded cuda-oxide PTX, cuBLAS/cuBLASLt loaded at run time
+cuda = ["dep:cudarc", "dep:libloading"]
+
+[dependencies]
+eyre.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+safetensors.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+fancy-regex.workspace = true
+regex.workspace = true
+base64.workspace = true
+cudarc = { workspace = true, optional = true }
+libloading = { workspace = true, optional = true }
