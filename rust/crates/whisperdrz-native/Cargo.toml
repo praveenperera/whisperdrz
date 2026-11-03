@@ -25,6 +25,7 @@ base64.workspace = true
 unicode_names2.workspace = true
 unicode-general-category.workspace = true
 realfft.workspace = true
+rayon.workspace = true
 cudarc = { workspace = true, optional = true }
 libloading = { workspace = true, optional = true }
 

@@ -4,13 +4,14 @@
 use std::sync::Arc;
 
 use eyre::{Result, ensure, eyre};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 use super::align::ChunkResult;
 use super::graphs::DecodeStep;
 use super::model::{Logits, MelBatch, Model, N_FRAMES};
 use super::probe::Event;
 use super::pyset::PySet;
-use super::slot::Chunk;
+use super::slot::{Chunk, Slot};
 use super::{Transcriber, build_init_tokens};
 use crate::decode::{Decision, Decoder, Status};
 
@@ -271,13 +272,30 @@ impl<M: Model> Transcriber<M> {
         );
         let tables = self.tables.clone();
         let decoder = Decoder::new(&tables, self.config.decode)?;
-        let mut decisions: Vec<Decision> = Vec::with_capacity(slots.len());
-        for (r, &slot_idx) in slots.iter().enumerate() {
-            let state = &mut self.slots[slot_idx].state;
-            let window = Decoder::repetition_window(state.token_count)
-                .map(|range| &self.all_tokens[slot_idx][range]);
-            decisions.push(decoder.decode_row(logits.row(r), state, window)?);
-        }
+        // rows are independent, each reading only its own logits and slot, so they
+        // decode in parallel; at 52 rows the serial loop was 20 ms of host time a step
+        let mut by_slot: Vec<Option<&mut Slot>> = self.slots.iter_mut().map(Some).collect();
+        let rows = slots
+            .iter()
+            .map(|&s| {
+                by_slot
+                    .get_mut(s)
+                    .and_then(Option::take)
+                    .map(|slot| (s, slot))
+                    .ok_or_else(|| eyre!("slot {s} missing or listed twice"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let all_tokens = &self.all_tokens;
+        let decisions: Vec<Decision> = rows
+            .into_par_iter()
+            .enumerate()
+            .map(|(r, (slot_idx, slot))| {
+                let state = &mut slot.state;
+                let window = Decoder::repetition_window(state.token_count)
+                    .map(|range| &all_tokens[slot_idx][range]);
+                decoder.decode_row(logits.row(r), state, window)
+            })
+            .collect::<Result<_>>()?;
 
         emit!(
             self,
