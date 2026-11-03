@@ -1,4 +1,5 @@
-//! Bidirectional multi-head attention on FP16, FlashAttention-2 style (the encoder; the
+//! Multi-head attention on FP16, FlashAttention-2 style: bidirectional for the encoder and
+//! the decoder's cross-attention, causal for the decoder's full-sequence DTW forward (the
 //! decode-step attention over KV caches is in `attention`)
 //!
 //! The math is FlashAttention-2's forward pass, which torch's SDPA flash backend runs for
@@ -13,7 +14,9 @@
 //! walks the keys in tiles of `BN = 64`. The schedule is FlashAttention-2's: the V tile's
 //! copy overlaps Q K^T, and the next K tile's copy overlaps the softmax and P @ V, both
 //! through `cp.async` into one K and one V buffer. Keys past `lk` in the last tile are
-//! zero-filled and masked to -inf; query rows past `lq` are zero-filled and never stored
+//! zero-filled and masked to -inf; query rows past `lq` are zero-filled and never stored.
+//! The causal kernel also masks keys past each query's own index and stops at the tile
+//! holding the block's last query row, as FlashAttention-2 does
 //!
 //! q, k, v and o are strided views: element `d` of head `h` of row `i` of batch entry `b`
 //! is at `b * stride + i * ld + h * 64 + d`. Each block checks every row it will touch
@@ -90,14 +93,16 @@ unsafe fn stage<const ROWS: usize>(dst: SharedTile<LD>, src: *const u16, ld: usi
     unsafe { cp_async_commit() };
 }
 
-/// Attention over head dim 64: `o = softmax(q k^T * scale) v` per (batch, head), with
-/// `scale_log2 = scale * log2(e)`
+/// The body of both attention kernels over the tiles the kernel declared; with `CAUSAL`,
+/// query `i` attends to keys `0..=i` only (`lq == lk`, checked)
 ///
-/// Grid `(ceil(lq / 128), heads, batch)`, 256 threads. Every `ld` and `stride` is a
-/// multiple of 8 and every base address 16-byte aligned (the host checks), `lk >= 1`
-#[kernel]
-#[launch_contract(domain = 3, block = (256, 1, 1))]
-pub fn flash_attn_f16_d64(
+/// # Safety
+/// Every thread of the block calls it, and `qs`, `ks` and `vs` are the calling kernel's own
+/// 16-byte aligned shared tiles of `BM`, `BN` and `BN` rows
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn flash_body<const CAUSAL: bool>(
+    (qs, ks, vs): (SharedTile<LD>, SharedTile<LD>, SharedTile<LD>),
     mut o: DisjointSlice<u16>,
     o_ld: u32,
     o_stride: u32,
@@ -114,18 +119,6 @@ pub fn flash_attn_f16_d64(
     lk: u32,
     scale_log2: f32,
 ) {
-    static mut QS: SharedArray<u16, { BM * LD }, 16> = SharedArray::UNINIT;
-    static mut KS: SharedArray<u16, { BN * LD }, 16> = SharedArray::UNINIT;
-    static mut VS: SharedArray<u16, { BN * LD }, 16> = SharedArray::UNINIT;
-    // SAFETY: each array is this kernel's own, 16-byte aligned and sized for its rows
-    let (qs, ks, vs) = unsafe {
-        (
-            SharedTile::<LD>::new(addr_of_mut!(QS) as *mut u16),
-            SharedTile::<LD>::new(addr_of_mut!(KS) as *mut u16),
-            SharedTile::<LD>::new(addr_of_mut!(VS) as *mut u16),
-        )
-    };
-
     let (h, b) = (blockIdx_y() as usize, blockIdx_z() as usize);
     let q0 = blockIdx_x() * BM as u32;
     let tid = threadIdx_x() as usize;
@@ -138,7 +131,9 @@ pub fn flash_attn_f16_d64(
     let nq = if q0 < lq { (lq - q0).min(BM as u32) } else { 0 };
     let geometry = ((q_ld | k_ld | v_ld | o_ld | q_stride | k_stride | v_stride | o_stride) % 8
         == 0)
-        & (lk >= 1);
+        & (lk >= 1)
+        // causal attention is square here, where top-left and bottom-right alignment agree
+        & (!CAUSAL | (lq == lk));
     require(
         geometry
             & rows_fit(q.len(), b * q_stride as usize, q0, nq, q_ld, col + D)
@@ -156,7 +151,12 @@ pub fn flash_attn_f16_d64(
     let kp = k.as_ptr().wrapping_add(b * k_stride as usize + col);
     let vp = v.as_ptr().wrapping_add(b * v_stride as usize + col);
     let (k_ld, v_ld) = (k_ld as usize, v_ld as usize);
-    let tiles = lk.div_ceil(BN as u32);
+    // a causal block's last query row sees keys up to its own index only, so later tiles
+    // would be masked out entirely
+    let mut tiles = lk.div_ceil(BN as u32);
+    if CAUSAL {
+        tiles = tiles.min((q0 + nq).div_ceil(BN as u32));
+    }
 
     // SAFETY: the rows were checked above; the waits and barriers below order every copy
     // before its readers and every reader before the next copy into the same buffer
@@ -168,8 +168,8 @@ pub fn flash_attn_f16_d64(
     sync_threads();
 
     let mut qa = [FragA::ZERO; KK];
-    #[unroll]
     for kk in 0..KK {
+        __unroll_config::<0>();
         // SAFETY: the whole warp runs this with warp-uniform offsets inside the tile
         qa[kk] = unsafe { qs.frag_a(wr, kk * 16) };
     }
@@ -198,10 +198,10 @@ pub fn flash_attn_f16_d64(
         };
 
         let mut s = [[0.0f32; 4]; SJ];
-        #[unroll]
         for jp in 0..SJ / 2 {
-            #[unroll]
+            __unroll_config::<0>();
             for kk in 0..KK {
+                __unroll_config::<0>();
                 // SAFETY: warp-uniform offsets inside the tile, after the barrier above
                 unsafe {
                     let kb = ks.frag_b_pair_nk(jp * 16, kk * 16);
@@ -227,14 +227,20 @@ pub fn flash_attn_f16_d64(
             };
         }
 
-        // keys past lk in the last tile: their zero-filled scores become -inf. The tile
-        // starts below lk, so every row keeps a finite max
-        if k0 + BN as u32 > lk {
-            #[unroll]
+        // keys past lk in the last tile: their zero-filled scores become -inf, and with
+        // CAUSAL so do keys past each query row's own index. Tile 0 holds key 0, which
+        // every row may see, so every row keeps a finite max; a row whose keys in a later
+        // tile are all masked gets a correction of 1 and zero weights from it
+        // tested per warp (its first row is q0 + wr), so the branch stays warp-uniform
+        let row0 = q0 + (wr + g) as u32;
+        if (k0 + BN as u32 > lk) | (CAUSAL & (k0 + BN as u32 > q0 + wr as u32 + 1)) {
             for j in 0..SJ {
-                #[unroll]
+                __unroll_config::<0>();
                 for e in 0..4 {
-                    if k0 + (j * 8 + t * 2 + (e & 1)) as u32 >= lk {
+                    __unroll_config::<0>();
+                    let key = k0 + (j * 8 + t * 2 + (e & 1)) as u32;
+                    let row = row0 + 8 * (e / 2) as u32;
+                    if (key >= lk) | (CAUSAL & (key > row)) {
                         s[j][e] = f32::NEG_INFINITY;
                     }
                 }
@@ -242,14 +248,14 @@ pub fn flash_attn_f16_d64(
         }
 
         let mut mx = [f32::NEG_INFINITY; 2];
-        #[unroll]
         for j in 0..SJ {
+            __unroll_config::<0>();
             mx[0] = mx[0].max(s[j][0].max(s[j][1]));
             mx[1] = mx[1].max(s[j][2].max(s[j][3]));
         }
         let mut corr = [0.0f32; 2];
-        #[unroll]
         for r in 0..2 {
+            __unroll_config::<0>();
             // the four lanes of a quad hold one row's 64 scores between them
             mx[r] = mx[r].max(warp::shuffle_xor_f32(mx[r], 1));
             mx[r] = mx[r].max(warp::shuffle_xor_f32(mx[r], 2));
@@ -259,28 +265,28 @@ pub fn flash_attn_f16_d64(
             m[r] = scaled;
             l[r] *= corr[r];
         }
-        #[unroll]
         for j in 0..SJ {
-            #[unroll]
+            __unroll_config::<0>();
             for e in 0..4 {
+                __unroll_config::<0>();
                 let p = ex2_approx_ftz_f32(fma_rn_f32(s[j][e], scale_log2, -m[e / 2]));
                 s[j][e] = p;
                 l[e / 2] += p;
             }
         }
-        #[unroll]
         for dj in 0..DJ {
+            __unroll_config::<0>();
             acc[dj][0] *= corr[0];
             acc[dj][1] *= corr[0];
             acc[dj][2] *= corr[1];
             acc[dj][3] *= corr[1];
         }
 
-        #[unroll]
         for kk in 0..BN / 16 {
+            __unroll_config::<0>();
             let pa = FragA::from_acc_pair(s[2 * kk], s[2 * kk + 1]);
-            #[unroll]
             for djp in 0..DJ / 2 {
+                __unroll_config::<0>();
                 // SAFETY: warp-uniform offsets inside the tile, after the barrier above
                 unsafe {
                     let vb = vs.frag_b_pair_kn(kk * 16, djp * 16);
@@ -292,8 +298,8 @@ pub fn flash_attn_f16_d64(
         tile += 1;
     }
 
-    #[unroll]
     for r in 0..2 {
+        __unroll_config::<0>();
         l[r] += warp::shuffle_xor_f32(l[r], 1);
         l[r] += warp::shuffle_xor_f32(l[r], 2);
         // every row saw at least one real key, so l >= 1
@@ -305,18 +311,108 @@ pub fn flash_attn_f16_d64(
     let op = o
         .as_mut_ptr()
         .wrapping_add(b * o_stride as usize + q0 as usize * o_ld as usize + col);
-    #[unroll]
     for r in 0..2 {
+        __unroll_config::<0>();
         let row = wr + g + r * 8;
         if (row as u32) < nq {
             let out = op.wrapping_add(row * o_ld as usize);
-            #[unroll]
             for dj in 0..DJ {
+                __unroll_config::<0>();
                 let pair = pack_f16(acc[dj][2 * r] * l[r], acc[dj][2 * r + 1] * l[r]);
                 // SAFETY: row < nq and the columns lie inside the checked width; o_ld,
                 // the stride and 2t + 8dj are even, so the pair is 4-byte aligned
                 unsafe { *(out.add(dj * 8 + t * 2) as *mut u32) = pair };
             }
         }
+    }
+}
+
+/// Attention over head dim 64: `o = softmax(q k^T * scale) v` per (batch, head), with
+/// `scale_log2 = scale * log2(e)`
+///
+/// Grid `(ceil(lq / 128), heads, batch)`, 256 threads. Every `ld` and `stride` is a
+/// multiple of 8 and every base address 16-byte aligned (the host checks), `lk >= 1`
+#[kernel]
+#[launch_contract(domain = 3, block = (256, 1, 1))]
+pub fn flash_attn_f16_d64(
+    o: DisjointSlice<u16>,
+    o_ld: u32,
+    o_stride: u32,
+    q: &[u16],
+    q_ld: u32,
+    q_stride: u32,
+    k: &[u16],
+    k_ld: u32,
+    k_stride: u32,
+    v: &[u16],
+    v_ld: u32,
+    v_stride: u32,
+    lq: u32,
+    lk: u32,
+    scale_log2: f32,
+) {
+    static mut QS: SharedArray<u16, { BM * LD }, 16> = SharedArray::UNINIT;
+    static mut KS: SharedArray<u16, { BN * LD }, 16> = SharedArray::UNINIT;
+    static mut VS: SharedArray<u16, { BN * LD }, 16> = SharedArray::UNINIT;
+    // SAFETY: each array is this kernel's own, 16-byte aligned and sized for its rows
+    let (qs, ks, vs) = unsafe {
+        (
+            SharedTile::<LD>::new(addr_of_mut!(QS) as *mut u16),
+            SharedTile::<LD>::new(addr_of_mut!(KS) as *mut u16),
+            SharedTile::<LD>::new(addr_of_mut!(VS) as *mut u16),
+        )
+    };
+
+    // SAFETY: the tiles are this kernel's own, and every thread of the block runs this
+    unsafe {
+        flash_body::<false>(
+            (qs, ks, vs),
+            o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v, v_ld, v_stride, lq, lk,
+            scale_log2,
+        )
+    }
+}
+
+/// Causal attention over head dim 64, as torch's SDPA flash backend runs `is_causal=True`:
+/// query `i` attends to keys `0..=i`. Square only (`lq == lk`, which the decoder's DTW
+/// forward over its own tokens is); otherwise as [`flash_attn_f16_d64`]
+#[kernel]
+#[launch_contract(domain = 3, block = (256, 1, 1))]
+pub fn flash_attn_causal_f16_d64(
+    o: DisjointSlice<u16>,
+    o_ld: u32,
+    o_stride: u32,
+    q: &[u16],
+    q_ld: u32,
+    q_stride: u32,
+    k: &[u16],
+    k_ld: u32,
+    k_stride: u32,
+    v: &[u16],
+    v_ld: u32,
+    v_stride: u32,
+    lq: u32,
+    lk: u32,
+    scale_log2: f32,
+) {
+    static mut QS: SharedArray<u16, { BM * LD }, 16> = SharedArray::UNINIT;
+    static mut KS: SharedArray<u16, { BN * LD }, 16> = SharedArray::UNINIT;
+    static mut VS: SharedArray<u16, { BN * LD }, 16> = SharedArray::UNINIT;
+    // SAFETY: each array is this kernel's own, 16-byte aligned and sized for its rows
+    let (qs, ks, vs) = unsafe {
+        (
+            SharedTile::<LD>::new(addr_of_mut!(QS) as *mut u16),
+            SharedTile::<LD>::new(addr_of_mut!(KS) as *mut u16),
+            SharedTile::<LD>::new(addr_of_mut!(VS) as *mut u16),
+        )
+    };
+
+    // SAFETY: the tiles are this kernel's own, and every thread of the block runs this
+    unsafe {
+        flash_body::<true>(
+            (qs, ks, vs),
+            o, o_ld, o_stride, q, q_ld, q_stride, k, k_ld, k_stride, v, v_ld, v_stride, lq, lk,
+            scale_log2,
+        )
     }
 }
