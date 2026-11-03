@@ -7,6 +7,7 @@
 //! constraint state machine, post-processing, DTW path search, clustering) build without
 //! the `cuda` feature and are tested against logged Python inputs and outputs
 
+pub mod dtw;
 pub mod text;
 
 #[cfg(feature = "cuda")]

@@ -505,6 +505,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "whisperdrz-fixtures",
 ]
 
 [[package]]
