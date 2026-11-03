@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use eyre::{Result, bail, ensure, eyre};
 use numerics::Err;
-use parity::{MAX_RATIO, Row, f16_bits, f64s, report, trace_array};
+use parity::{Check, MAX_RATIO, Row, f16_bits, f64s, report};
 use serde_json::Value;
 use whisperdrz_fixtures::{ArrayData, Event, TraceSet};
 use whisperdrz_native::cuda::decoder::{ALIGNMENT_HEADS, DtwCapture, DtwScores, N_AUDIO_CTX};
@@ -90,7 +90,7 @@ fn usizes(v: &Value) -> Result<Vec<usize>> {
 
 /// An FP16 array on the device
 fn upload16(gpu: &Gpu, set: &TraceSet, v: &Value) -> Result<(Vec<usize>, Buf)> {
-    let a = trace_array(set, v)?;
+    let a = set.array(v)?;
     let ArrayData::F16(data) = a.data else {
         bail!("array is not float16")
     };
@@ -197,7 +197,7 @@ fn dtw_matches_torch() -> Result<()> {
         )?;
         let name = format!("{stem}#{}", fwd.seq);
 
-        let x = trace_array(set, fwd.arg("x")?)?;
+        let x = set.array(fwd.arg("x")?)?;
         let [rows, t] = x.shape[..] else {
             bail!("{name}: x shape {:?}", x.shape)
         };
@@ -216,14 +216,14 @@ fn dtw_matches_torch() -> Result<()> {
             audio_caps: usizes(prep.arg("audio_caps")?)?,
             slots: (0..rows).collect(),
         };
-        let torch_scores = trace_array(set, prep.arg("full_weights")?)?;
+        let torch_scores = set.array(prep.arg("full_weights")?)?;
         ensure!(
             torch_scores.shape == [rows, heads, t, N_AUDIO_CTX],
             "{name}: scores shape {:?}",
             torch_scores.shape
         );
         let torch_scores = torch_scores.to_f32()?;
-        let recorded = trace_array(set, prep.ret()?)?;
+        let recorded = set.array(prep.ret()?)?;
         let recorded_m = recorded.to_f32()?;
 
         // raw scores before the prep
@@ -325,11 +325,15 @@ fn dtw_matches_torch() -> Result<()> {
     }
     ensure!(capture_checked, "no capture case in the manifest");
 
-    let mut failed = report("DTW raw scores (truth: FP32 forward)", &score_rows, true);
+    let mut failed = report(
+        "DTW raw scores (truth: FP32 forward)",
+        &score_rows,
+        Check::Full,
+    );
     failed.extend(report(
         "DTW prepped matrices (truth: FP32 forward and prep)",
         &matrix_rows,
-        true,
+        Check::Full,
     ));
     ensure!(
         failed.is_empty(),
@@ -410,7 +414,7 @@ fn dtw_word_timings_match_reference() -> Result<()> {
             let ptrs: Vec<u64> = batch.slots.iter().map(|&si| xa[si].ptr()).collect();
             let ours = decoder.dtw_prep(gpu, blas, batch, &ptrs)?;
             prepared.check_matrices(&ours)?;
-            let rec = trace_array(set, prep.ret()?)?;
+            let rec = set.array(prep.ret()?)?;
             let recorded = Matrices {
                 shape: [rec.shape[0], rec.shape[1], rec.shape[2]],
                 data: rec.to_f32()?,

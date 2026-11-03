@@ -3,9 +3,8 @@
 
 use std::path::Path;
 
-use eyre::{Result, bail, ensure, eyre};
-use serde_json::Value;
-use whisperdrz_fixtures::{Array, ArrayData, TraceSet, read_npy};
+use eyre::{Result, bail};
+use whisperdrz_fixtures::{ArrayData, read_npy};
 use whisperdrz_native::cuda::{Buf, Gpu};
 
 use crate::numerics::{Err, f16_to_f64};
@@ -20,34 +19,6 @@ pub fn f16_bits(path: &Path) -> Result<(Vec<usize>, Vec<u16>)> {
         bail!("{} is not float16", path.display())
     };
     Ok((a.shape, v.iter().map(|h| h.to_bits()).collect()))
-}
-
-/// An array argument or result of a trace event in its recorded shape. Blobs are stored by
-/// content, so a blob first saved by another call with the same bytes (a slot's `[1500,
-/// 1280]` encoder output under a `[1, 1500, 1280]` batch) carries that call's shape, which
-/// `TraceSet::array` refuses; this takes the recorded shape when the element counts agree
-pub fn trace_array(set: &TraceSet, v: &Value) -> Result<Array> {
-    let Some(blob) = v.get("blob").and_then(Value::as_str) else {
-        return set.array(v);
-    };
-    let shape = v["shape"]
-        .as_array()
-        .ok_or_else(|| eyre!("array without shape"))?
-        .iter()
-        .map(|d| {
-            d.as_u64()
-                .map(|d| d as usize)
-                .ok_or_else(|| eyre!("bad dim {d}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut a = read_npy(&set.blob_path(blob))?;
-    ensure!(
-        a.shape.iter().product::<usize>() == shape.iter().product::<usize>(),
-        "blob {blob} shape {:?} holds a different count than recorded {shape:?}",
-        a.shape
-    );
-    a.shape = shape;
-    Ok(a)
 }
 
 /// Any float `.npy` widened to f64
@@ -101,14 +72,36 @@ impl Row {
 
     /// Exact agreement on both sides counts as a pass, as 0 <= 1.5 * 0
     pub fn passes(&self) -> bool {
-        self.ours.max_abs <= MAX_RATIO * self.max_bar
-            && self.ours.mean_abs <= MAX_RATIO * self.torch.mean_abs
+        self.ours.max_abs <= MAX_RATIO * self.max_bar && self.passes_mean()
+    }
+
+    pub fn passes_mean(&self) -> bool {
+        self.ours.mean_abs <= MAX_RATIO * self.torch.mean_abs
+    }
+
+    fn passes_check(&self, check: Check) -> bool {
+        match check {
+            Check::Full => self.passes(),
+            Check::Mean => self.passes_mean(),
+            Check::Off => true,
+        }
     }
 }
 
-/// Prints a table and returns the names of the rows that fail; a table that is not
-/// `checked` prints no failure marks and returns none
-pub fn report(title: &str, rows: &[Row], checked: bool) -> Vec<String> {
+/// Which bars a [`report`] table asserts
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    /// Max-abs and mean-abs
+    Full,
+    /// Mean-abs only; max-abs is printed for reading
+    Mean,
+    /// Neither: a yardstick table
+    Off,
+}
+
+/// Prints a table and returns the names of the rows that fail `check`; failing rows are
+/// marked, and a [`Check::Off`] table marks and returns none
+pub fn report(title: &str, rows: &[Row], check: Check) -> Vec<String> {
     println!("\n{title}");
     println!(
         "{:<12} {:>11} {:>11} {:>11} {:>6} {:>11} {:>11} {:>6}",
@@ -125,11 +118,11 @@ pub fn report(title: &str, rows: &[Row], checked: bool) -> Vec<String> {
             r.ours.mean_abs,
             r.torch.mean_abs,
             r.ours.mean_abs / r.torch.mean_abs,
-            if !checked || r.passes() { "" } else { "  FAIL" }
+            if r.passes_check(check) { "" } else { "  FAIL" }
         );
     }
     rows.iter()
-        .filter(|r| checked && !r.passes())
+        .filter(|r| !r.passes_check(check))
         .map(|r| format!("{title}: {}", r.name))
         .collect()
 }
