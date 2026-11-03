@@ -17,7 +17,7 @@ use std::cell::Cell;
 use eyre::{Result, bail, ensure, eyre};
 use serde_json::Value;
 use support::{TableTokenizer, bits, opt_usize, strings, token_groups};
-use whisperdrz_fixtures::{Array, Event, TraceSet, plain, read_npy};
+use whisperdrz_fixtures::{Event, TraceSet, plain};
 use whisperdrz_native::dtw::{
     DtwOptions, Matrices, NegMatrix, PreparedBatch, TagAnchor, WordAnchor, apply_anchor_bands,
     dtw_from_neg_matrix, fill_word_timings_batch,
@@ -50,21 +50,8 @@ impl Tally {
     }
 }
 
-/// `TraceSet::array`, but also looking in the set's own `blobs/`, where the tracer
-/// writes them (`TraceSet::blob_path` looks one directory up)
-fn array(set: &TraceSet, v: &Value) -> Result<Array> {
-    if let Some(sha) = v.get("blob").and_then(Value::as_str) {
-        let path = set.dir().join("blobs").join(format!("{sha}.npy"));
-        if path.exists() {
-            return read_npy(&path);
-        }
-    }
-
-    set.array(v)
-}
-
 fn matrix(set: &TraceSet, v: &Value) -> Result<NegMatrix> {
-    let a = array(set, v)?;
+    let a = set.array(v)?;
     ensure!(a.shape.len() == 2, "matrix shape {:?}", a.shape);
     NegMatrix::new(a.shape[0], a.shape[1], a.to_f32()?)
 }
@@ -217,7 +204,7 @@ fn slots(fill: &Event) -> Result<Vec<(String, i64)>> {
 }
 
 fn recorded_matrices(set: &TraceSet, prep: &Event) -> Result<Matrices> {
-    let a = array(set, prep.ret()?)?;
+    let a = set.array(prep.ret()?)?;
     ensure!(a.shape.len() == 3, "prep shape {:?}", a.shape);
     Ok(Matrices {
         shape: [a.shape[0], a.shape[1], a.shape[2]],
@@ -251,7 +238,7 @@ fn check_batch_end_to_end(
             prep.arg("audio_caps")?
         );
         if let Some(forward) = call.forward {
-            let x = array(set, forward.arg("x")?)?;
+            let x = set.array(forward.arg("x")?)?;
             let want = x.to_i64()?;
             let have: Vec<i64> = batch.full_tokens.iter().map(|&t| t as i64).collect();
             ensure!(

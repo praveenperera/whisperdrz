@@ -143,10 +143,14 @@ struct Libs {
 impl Libs {
     fn open() -> Result<Self> {
         let dir = std::env::var_os("WHISPERDRZ_CUBLAS_DIR").map(PathBuf::from);
-        let path = |soname: &str| dir.as_ref().map_or_else(|| PathBuf::from(soname), |d| d.join(soname));
+        let path = |soname: &str| {
+            dir.as_ref()
+                .map_or_else(|| PathBuf::from(soname), |d| d.join(soname))
+        };
         let open = |soname: &str| {
             let p = path(soname);
-            unsafe { Library::new(&p) }.wrap_err_with(|| format!("open {} (set WHISPERDRZ_CUBLAS_DIR)", p.display()))
+            unsafe { Library::new(&p) }
+                .wrap_err_with(|| format!("open {} (set WHISPERDRZ_CUBLAS_DIR)", p.display()))
         };
 
         // libcublas binds libcublasLt by soname, so opening Lt first makes it use this copy
@@ -160,7 +164,11 @@ impl Libs {
             "cuBLASLt {version} loaded; parity with torch 2.8.0+cu128 needs exactly {CUBLAS_VERSION} \
              (pip nvidia-cublas-cu12==12.8.4.1)"
         );
-        Ok(Self { blas, lt, _libs: [blas_lib, lt_lib] })
+        Ok(Self {
+            blas,
+            lt,
+            _libs: [blas_lib, lt_lib],
+        })
     }
 }
 
@@ -228,15 +236,33 @@ impl Blas {
         check_lt(unsafe { (libs.lt.create)(&mut lt) }, "cublasLtCreate")?;
         let mut handle = std::ptr::null_mut();
         check_blas(unsafe { (libs.blas.create)(&mut handle) }, "cublasCreate")?;
-        let this = Self { libs, lt, handle, stream: gpu.cu_stream(), lt_workspace, _blas_workspace: blas_workspace, plans: RefCell::default() };
+        let this = Self {
+            libs,
+            lt,
+            handle,
+            stream: gpu.cu_stream(),
+            lt_workspace,
+            _blas_workspace: blas_workspace,
+            plans: RefCell::default(),
+        };
 
         let fns = &this.libs.blas;
         unsafe {
-            check_blas((fns.set_stream)(handle, gpu.cu_stream() as _), "cublasSetStream")?;
-            // torch runs with allow_fp16_reduced_precision_reduction=True, which is default math
-            check_blas((fns.set_math_mode)(handle, blas::cublasMath_t::CUBLAS_DEFAULT_MATH), "cublasSetMathMode")?;
             check_blas(
-                (fns.set_workspace)(handle, this._blas_workspace.ptr() as *mut c_void, BLAS_WORKSPACE),
+                (fns.set_stream)(handle, gpu.cu_stream() as _),
+                "cublasSetStream",
+            )?;
+            // torch runs with allow_fp16_reduced_precision_reduction=True, which is default math
+            check_blas(
+                (fns.set_math_mode)(handle, blas::cublasMath_t::CUBLAS_DEFAULT_MATH),
+                "cublasSetMathMode",
+            )?;
+            check_blas(
+                (fns.set_workspace)(
+                    handle,
+                    this._blas_workspace.ptr() as *mut c_void,
+                    BLAS_WORKSPACE,
+                ),
                 "cublasSetWorkspace",
             )?;
         }
@@ -246,8 +272,20 @@ impl Blas {
 
     /// `y[rows, n_out] = x[rows, n_in] @ w[n_out, n_in]^T + bias`, all FP16 row-major, as
     /// torch's `addmm` runs it: cuBLASLt with a bias epilogue and FP32 compute
-    pub fn linear_bias(&self, x: u64, w: u64, bias: u64, y: u64, (rows, n_in, n_out): (usize, usize, usize)) -> Result<()> {
-        let key = LinearKey { rows, n_in, n_out, align: [alignment(w), alignment(x), alignment(y), alignment(y)] };
+    pub fn linear_bias(
+        &self,
+        x: u64,
+        w: u64,
+        bias: u64,
+        y: u64,
+        (rows, n_in, n_out): (usize, usize, usize),
+    ) -> Result<()> {
+        let key = LinearKey {
+            rows,
+            n_in,
+            n_out,
+            align: [alignment(w), alignment(x), alignment(y), alignment(y)],
+        };
         let mut plans = self.plans.borrow_mut();
         let plan = match plans.entry(key) {
             Entry::Occupied(e) => e.into_mut(),
@@ -297,25 +335,42 @@ impl Blas {
         unsafe {
             let mut desc = std::ptr::null_mut();
             check_lt(
-                (f.desc_create)(&mut desc, lt::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt::cudaDataType_t::CUDA_R_32F),
+                (f.desc_create)(
+                    &mut desc,
+                    lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    lt::cudaDataType_t::CUDA_R_32F,
+                ),
                 "cublasLtMatmulDescCreate",
             )?;
             let set = |attr, value: i32| {
-                check_lt((f.desc_set)(desc, attr, (&value as *const i32).cast(), size_of::<i32>()), "desc attribute")
+                check_lt(
+                    (f.desc_set)(desc, attr, (&value as *const i32).cast(), size_of::<i32>()),
+                    "desc attribute",
+                )
             };
-            set(lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA, blas::cublasOperation_t::CUBLAS_OP_T as i32)?;
-            set(lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB, blas::cublasOperation_t::CUBLAS_OP_N as i32)?;
+            set(
+                lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                blas::cublasOperation_t::CUBLAS_OP_T as i32,
+            )?;
+            set(
+                lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                blas::cublasOperation_t::CUBLAS_OP_N as i32,
+            )?;
             set(
                 lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
                 lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS as i32,
             )?;
 
             // column-major views of the row-major operands, as torch builds them
-            let layout = |rows: usize, cols: usize, ld: usize| -> Result<lt::cublasLtMatrixLayout_t> {
-                let mut l = std::ptr::null_mut();
-                check_lt((f.layout_create)(&mut l, f16, rows as u64, cols as u64, ld as i64), "layout")?;
-                Ok(l)
-            };
+            let layout =
+                |rows: usize, cols: usize, ld: usize| -> Result<lt::cublasLtMatrixLayout_t> {
+                    let mut l = std::ptr::null_mut();
+                    check_lt(
+                        (f.layout_create)(&mut l, f16, rows as u64, cols as u64, ld as i64),
+                        "layout",
+                    )?;
+                    Ok(l)
+                };
             let w = layout(key.n_in, key.n_out, key.n_in)?;
             let x = layout(key.n_in, key.rows, key.n_in)?;
             let y = layout(key.n_out, key.rows, key.n_out)?;
@@ -339,7 +394,10 @@ impl Blas {
                 lt::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES,
             ];
             for (attr, a) in attrs.into_iter().zip(key.align) {
-                check_lt((f.pref_set)(pref, attr, (&a as *const u32).cast(), size_of::<u32>()), "alignment preference")?;
+                check_lt(
+                    (f.pref_set)(pref, attr, (&a as *const u32).cast(), size_of::<u32>()),
+                    "alignment preference",
+                )?;
             }
 
             let mut result: lt::cublasLtMatmulHeuristicResult_t = std::mem::zeroed();
@@ -347,8 +405,20 @@ impl Blas {
             let status = (f.heuristic)(self.lt, desc, w, x, y, y, pref, 1, &mut result, &mut found);
             (f.pref_destroy)(pref);
             check_lt(status, "cublasLtMatmulAlgoGetHeuristic")?;
-            ensure!(found > 0, "no cuBLASLt algorithm for linear {}x{} -> {}", key.rows, key.n_in, key.n_out);
-            Ok(LinearPlan { desc, w, x, y, algo: result.algo })
+            ensure!(
+                found > 0,
+                "no cuBLASLt algorithm for linear {}x{} -> {}",
+                key.rows,
+                key.n_in,
+                key.n_out
+            );
+            Ok(LinearPlan {
+                desc,
+                w,
+                x,
+                y,
+                algo: result.algo,
+            })
         }
     }
 
@@ -363,7 +433,13 @@ impl Blas {
         b: (u64, usize),
         c: (u64, usize),
     ) -> Result<()> {
-        let op = |t: bool| if t { blas::cublasOperation_t::CUBLAS_OP_T } else { blas::cublasOperation_t::CUBLAS_OP_N };
+        let op = |t: bool| {
+            if t {
+                blas::cublasOperation_t::CUBLAS_OP_T
+            } else {
+                blas::cublasOperation_t::CUBLAS_OP_N
+            }
+        };
         let f16 = blas::cudaDataType::CUDA_R_16F;
         let (alpha, beta) = (1f32, 0f32);
         let dim = |v: usize| c_int::try_from(v).wrap_err("GEMM dimension overflows int");
@@ -397,8 +473,21 @@ impl Blas {
 
     /// `y[rows, n_out] = x[rows, n_in] @ w[n_out, n_in]^T` without bias, as torch's `mm`
     /// runs a bias-free `nn.Linear`
-    pub fn linear(&self, x: u64, w: u64, y: u64, (rows, n_in, n_out): (usize, usize, usize)) -> Result<()> {
-        self.gemm_ex_f16(true, false, (n_out, rows, n_in), (w, n_in), (x, n_in), (y, n_out))
+    pub fn linear(
+        &self,
+        x: u64,
+        w: u64,
+        y: u64,
+        (rows, n_in, n_out): (usize, usize, usize),
+    ) -> Result<()> {
+        self.gemm_ex_f16(
+            true,
+            false,
+            (n_out, rows, n_in),
+            (w, n_in),
+            (x, n_in),
+            (y, n_out),
+        )
     }
 }
 

@@ -19,7 +19,10 @@ use eyre::{Result, WrapErr, bail, ensure, eyre};
 /// Kernels from the cuda-oxide crate `rust/kernels` as compute_80 PTX, the first tier with
 /// FP16 `mma.sync` at m16n8k16. The driver JIT-compiles it for the GPU it runs on;
 /// `rust/scripts/build-ptx.sh` regenerates it and `check-ptx.sh` pins its inputs
-static PTX_SM80: &str = concat!(include_str!("../../../../kernels/ptx/whisperdrz.sm80.ptx"), "\0");
+static PTX_SM80: &str = concat!(
+    include_str!("../../../../kernels/ptx/whisperdrz.sm80.ptx"),
+    "\0"
+);
 
 /// Oldest driver API that cuBLAS 12.8 runs on, as `cuDriverGetVersion` reports it
 const MIN_DRIVER: i32 = 12080;
@@ -204,15 +207,23 @@ unsafe impl Send for Gpu {}
 impl Gpu {
     pub fn new(ordinal: usize) -> Result<Self> {
         check_driver()?;
-        let ctx = CudaContext::new(ordinal).wrap_err_with(|| format!("open CUDA device {ordinal}"))?;
+        let ctx =
+            CudaContext::new(ordinal).wrap_err_with(|| format!("open CUDA device {ordinal}"))?;
         let (major, minor) = ctx.compute_capability()?;
-        ensure!(major >= 8, "GPU {ordinal} has compute capability {major}.{minor}; whisperdrz needs 8.0 or newer");
-        let sms = ctx.attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize;
+        ensure!(
+            major >= 8,
+            "GPU {ordinal} has compute capability {major}.{minor}; whisperdrz needs 8.0 or newer"
+        );
+        let sms = ctx.attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
+            as usize;
 
         // a single stream, so cudarc's cross-stream event tracking is pure overhead
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
-        let device = Arc::new(Device { pool: create_pool(&ctx)?, stream });
+        let device = Arc::new(Device {
+            pool: create_pool(&ctx)?,
+            stream,
+        });
         let module = unsafe { cur::module::load_data(PTX_SM80.as_ptr().cast()) }
             .wrap_err("JIT-compile the whisperdrz kernels")?;
         Ok(Self {
@@ -243,10 +254,17 @@ impl Gpu {
     pub fn alloc(&self, bytes: usize) -> Result<Buf> {
         let mut ptr = 0;
         if bytes > 0 {
-            unsafe { cu::cuMemAllocFromPoolAsync(&mut ptr, bytes, self.device.pool, self.cu_stream()).result() }
-                .wrap_err_with(|| format!("allocate {bytes} bytes on the GPU"))?;
+            unsafe {
+                cu::cuMemAllocFromPoolAsync(&mut ptr, bytes, self.device.pool, self.cu_stream())
+                    .result()
+            }
+            .wrap_err_with(|| format!("allocate {bytes} bytes on the GPU"))?;
         }
-        Ok(Buf { ptr, bytes, device: self.device.clone() })
+        Ok(Buf {
+            ptr,
+            bytes,
+            device: self.device.clone(),
+        })
     }
 
     pub fn zeros(&self, bytes: usize) -> Result<Buf> {
@@ -272,7 +290,8 @@ impl Gpu {
         }
 
         unsafe { cur::memcpy_htod_async(buf.ptr, bytes, self.cu_stream())? };
-        self.pending_bytes.set(self.pending_bytes.get() + bytes.len());
+        self.pending_bytes
+            .set(self.pending_bytes.get() + bytes.len());
         self.pending.borrow_mut().push(Box::new(host));
         if self.pending_bytes.get() > PENDING_LIMIT {
             self.synchronize()?;
@@ -303,7 +322,9 @@ impl Gpu {
     pub fn download_into<T: Pod>(&self, src: &Buf, offset: usize, host: &mut [T]) -> Result<()> {
         let host: &mut [u8] = bytemuck::cast_slice_mut(host);
         ensure!(
-            offset.checked_add(host.len()).is_some_and(|end| end <= src.bytes),
+            offset
+                .checked_add(host.len())
+                .is_some_and(|end| end <= src.bytes),
             "download of {} bytes at {offset} from a {} byte buffer",
             host.len(),
             src.bytes
@@ -332,7 +353,10 @@ impl Gpu {
         let cname = CString::new(name)?;
         let f = unsafe { cur::module::get_function(self.module, cname) }
             .wrap_err_with(|| format!("kernel {name} missing from the PTX module"))?;
-        let kernel = Kernel { f, params: entry_params(PTX_SM80, name)? };
+        let kernel = Kernel {
+            f,
+            params: entry_params(PTX_SM80, name)?,
+        };
         kernel.check(name, args)?;
         functions.insert(name, kernel);
         Ok(f)
@@ -349,7 +373,10 @@ impl Gpu {
     ) -> Result<()> {
         let f = self.function(name, args)?;
         // the elementwise kernels' 32-bit thread index is exact only up to here
-        ensure!(grid.0 as u64 * block.0 as u64 <= 1 << 32, "launch {name}: more than 2^32 threads along x");
+        ensure!(
+            grid.0 as u64 * block.0 as u64 <= 1 << 32,
+            "launch {name}: more than 2^32 threads along x"
+        );
         if grid.0 == 0 || grid.1 == 0 || grid.2 == 0 {
             return Ok(());
         }
@@ -358,7 +385,10 @@ impl Gpu {
         for a in args {
             match a {
                 Arg::Slice(ptr, len) => {
-                    params.extend([ptr as *const u64 as *mut c_void, len as *const u64 as *mut c_void]);
+                    params.extend([
+                        ptr as *const u64 as *mut c_void,
+                        len as *const u64 as *mut c_void,
+                    ]);
                 }
                 Arg::U32(v) => params.push(v as *const u32 as *mut c_void),
                 Arg::I32(v) => params.push(v as *const i32 as *mut c_void),
@@ -397,14 +427,21 @@ impl Drop for Gpu {
 /// The params of kernel `name` in `ptx`, in order, read from the PTX text
 fn entry_params(ptx: &str, name: &str) -> Result<Vec<Param>> {
     let entry = format!(".entry {name}(");
-    let start = ptx.find(&entry).ok_or_else(|| eyre!("kernel {name} missing from the PTX"))? + entry.len();
-    let end = ptx[start..].find(')').ok_or_else(|| eyre!("kernel {name}: unterminated PTX param list"))?;
+    let start = ptx
+        .find(&entry)
+        .ok_or_else(|| eyre!("kernel {name} missing from the PTX"))?
+        + entry.len();
+    let end = ptx[start..]
+        .find(')')
+        .ok_or_else(|| eyre!("kernel {name}: unterminated PTX param list"))?;
     ptx[start..start + end]
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(|line| {
-            let ty = line.strip_prefix(".param ").and_then(|rest| rest.split_whitespace().next());
+            let ty = line
+                .strip_prefix(".param ")
+                .and_then(|rest| rest.split_whitespace().next());
             match (ty, line.contains(" .ptr ")) {
                 (Some(".u64"), true) => Ok(Param::Ptr),
                 (Some(".u64"), false) => Ok(Param::U64),
