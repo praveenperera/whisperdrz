@@ -1,4 +1,4 @@
-cuda-oxide: https://github.com/praveenperera/cuda-rust.git 780d471fcfdcf21553032ed67adb198d5560a591
+cuda-oxide: https://github.com/praveenperera/cuda-rust.git 4c0182cd59feacd1070faf51bef4cef0ad3b5c46
 rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13)
 llc: LLVM version 23.1.1-rust-1.99.1-stable
 opt: LLVM version 23.1.1-rust-1.99.1-stable

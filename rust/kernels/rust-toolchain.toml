@@ -1,4 +1,4 @@
-# the toolchain the pinned cuda-oxide commit (praveenperera/cuda-rust 780d471fc) pins in
+# the toolchain the pinned cuda-oxide commit (praveenperera/cuda-rust 4c0182cd5) pins in
 # its own cuda-oxide/rust-toolchain.toml
 [toolchain]
 channel = "1.99.1"

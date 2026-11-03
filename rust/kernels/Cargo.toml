@@ -14,10 +14,8 @@ license = "Apache-2.0"
 path = "src/lib.rs"
 
 [dependencies]
-# cuda-oxide from the praveenperera/cuda-rust fork (upstream main plus fixes with PRs
-# pending: generic #[device] inlining, hoisted scratch allocas, partial unroll of
-# runtime-step loops, f32::max as max.f32, BlockRows). Pinned by rev so Cargo.lock and the
-# cargo-oxide that scripts/build-ptx.sh installs name the same commit; move back to
-# NVIDIA/cuda-rust main once the fixes merge
-cuda-device = { git = "https://github.com/praveenperera/cuda-rust.git", rev = "780d471fcfdcf21553032ed67adb198d5560a591" }
+# cuda-oxide from praveenperera/cuda-rust master. Pinned by rev so Cargo.lock and the
+# cargo-oxide that scripts/build-ptx.sh installs name the same commit; a move rebuilds
+# every kernel, so it lands in its own change
+cuda-device = { git = "https://github.com/praveenperera/cuda-rust.git", rev = "4c0182cd59feacd1070faf51bef4cef0ad3b5c46" }
 libm = "0.2"
