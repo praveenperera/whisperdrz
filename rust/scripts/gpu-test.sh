@@ -45,7 +45,14 @@ export WHISPERDRZ_GPU=1
 export WHISPERDRZ_ENCODER_REF="${WHISPERDRZ_ENCODER_REF:-$HOME/.cache/whisperdrz/encoder-ref}"
 "$python" -I "$root/tools/encoder_layers.py" --src "$ref_src" --model "$WHISPERDRZ_WEIGHTS" "$WHISPERDRZ_ENCODER_REF"
 
+# decoder: torch per layer on the traced prefill and two decode steps, and the DTW forward
+# and prep on every recorded call (skips when its output is already there)
+export WHISPERDRZ_DECODER_REF="${WHISPERDRZ_DECODER_REF:-$HOME/.cache/whisperdrz/decoder-ref}"
+"$python" -I "$root/tools/decoder_layers.py" --src "$ref_src" --model "$WHISPERDRZ_WEIGHTS" \
+  --trace "$traces/short3" "$WHISPERDRZ_DECODER_REF"
+
 # every GPU test binary runs even after one fails
 cargo test --release --features cuda --no-fail-fast -p whisperdrz-native \
   --test gpu_blas --test gpu_weights --test gpu_decoder_attn --test gpu_ops --test gpu_encoder --test gpu_ecapa2 \
+  --test gpu_decoder --test gpu_dtw \
   "$@" -- --nocapture --test-threads 1

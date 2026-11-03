@@ -251,3 +251,47 @@ pub fn attention(
         ],
     )
 }
+
+/// Causal multi-head self-attention, head dim 64: as [`attention`] with query `i`
+/// attending to keys `0..=i` only, torch's SDPA flash backend under `is_causal=True` (the
+/// decoder's full-sequence forward for DTW). Square: `lq == lk == len`
+pub fn attention_causal(
+    gpu: &Gpu,
+    o: HeadView,
+    (q, k, v): (HeadView, HeadView, HeadView),
+    (batch, heads, len): (usize, usize, usize),
+    scale: f32,
+) -> Result<()> {
+    ensure!(len >= 1, "attention over no keys");
+    ensure!(
+        batch <= 65535 && heads <= 65535,
+        "attention grid of {heads} heads x {batch} batch entries"
+    );
+    let [o0, o1, o2] = o.args("o")?;
+    let [q0, q1, q2] = q.args("q")?;
+    let [k0, k1, k2] = k.args("k")?;
+    let [v0, v1, v2] = v.args("v")?;
+    gpu.launch(
+        "flash_attn_causal_f16_d64",
+        (blocks(len, 128), heads as u32, batch as u32),
+        (256, 1, 1),
+        0,
+        &[
+            o0,
+            o1,
+            o2,
+            q0,
+            q1,
+            q2,
+            k0,
+            k1,
+            k2,
+            v0,
+            v1,
+            v2,
+            len.into(),
+            len.into(),
+            (scale * std::f32::consts::LOG2_E).into(),
+        ],
+    )
+}

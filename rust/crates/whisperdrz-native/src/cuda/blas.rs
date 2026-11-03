@@ -107,6 +107,26 @@ entry_points!(BlasFns -> blas::cublasStatus_t {
         blas::cublasComputeType_t,
         blas::cublasGemmAlgo_t,
     );
+    sgemm_strided_batched = "cublasSgemmStridedBatched": fn(
+        blas::cublasHandle_t,
+        blas::cublasOperation_t,
+        blas::cublasOperation_t,
+        c_int,
+        c_int,
+        c_int,
+        *const f32,
+        *const f32,
+        c_int,
+        i64,
+        *const f32,
+        c_int,
+        i64,
+        *const f32,
+        *mut f32,
+        c_int,
+        i64,
+        c_int,
+    );
 });
 
 entry_points!(LtFns -> lt::cublasStatus_t {
@@ -606,6 +626,48 @@ impl Blas {
             (x, n_in),
             (y, n_out),
         )
+    }
+
+    /// FP32 batched `c_i[rows, n] = a_i[rows, k] @ b_i[n, k]^T` over `batch` row-major
+    /// matrices `a_i = a + i * rows * k`, `b_i = b + i * n * k`, `c_i = c + i * rows * n`,
+    /// as torch's `bmm` runs `Q @ K.transpose(-1, -2)` on contiguous FP32 operands:
+    /// `cublasSgemmStridedBatched` (transa T, transb N) in default math, so FP32 without
+    /// TF32 (`allow_tf32` is off)
+    pub fn sgemm_nt_batched(
+        &self,
+        (a, b, c): (u64, u64, u64),
+        (rows, n, k): (usize, usize, usize),
+        batch: usize,
+    ) -> Result<()> {
+        let dim = |v: usize| c_int::try_from(v).wrap_err("GEMM dimension overflows int");
+        let stride = |v: usize| i64::try_from(v).wrap_err("GEMM stride overflows i64");
+        let (alpha, beta) = (1f32, 0f32);
+        // column-major: c_i^T [n, rows] = (b_i viewed [k, n])^T @ (a_i viewed [k, rows])
+        unsafe {
+            check_blas(
+                (self.libs.blas.sgemm_strided_batched)(
+                    self.handle,
+                    blas::cublasOperation_t::CUBLAS_OP_T,
+                    blas::cublasOperation_t::CUBLAS_OP_N,
+                    dim(n)?,
+                    dim(rows)?,
+                    dim(k)?,
+                    &alpha,
+                    b as *const f32,
+                    dim(k)?,
+                    stride(n * k)?,
+                    a as *const f32,
+                    dim(k)?,
+                    stride(rows * k)?,
+                    &beta,
+                    c as *mut f32,
+                    dim(n)?,
+                    stride(rows * n)?,
+                    dim(batch)?,
+                ),
+                "cublasSgemmStridedBatched",
+            )
+        }
     }
 
     /// `y[rows, n] = x[rows, k] @ b[k, n]`, all FP16 row-major, as torch's `mm` runs the
