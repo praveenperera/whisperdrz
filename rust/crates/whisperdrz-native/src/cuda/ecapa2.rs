@@ -997,13 +997,18 @@ impl Ecapa2 {
         // the largest trunk buffer, and the largest stacked conv product, any block makes
         let f16 = self.precision == Precision::F16Convs;
         let align = if f16 { 8 } else { 4 };
-        let (mut grid_len, mut product_len, mut height) =
-            (Grid::trunk_aligned(BINS, 1, frames, align).len(), 0, BINS);
+        let (mut grid_len, mut product_len, mut row_len, mut height) = (
+            Grid::trunk_aligned(BINS, 1, frames, align).len(),
+            0,
+            0,
+            BINS,
+        );
         for block in &self.trunk {
             let co = block.convs[0].co;
             height /= block.stride;
             let o = Grid::trunk_aligned(height, co, frames, align);
             grid_len = grid_len.max(o.len());
+            row_len = row_len.max(3 * co * o.cols);
             product_len = product_len.max(height * 3 * co * o.cols);
         }
         let bufs: Vec<Buf> = (0..4)
@@ -1011,7 +1016,8 @@ impl Ecapa2 {
             .collect::<Result<_>>()?;
         let [mut cur, mut next, t1, t2]: [Buf; 4] =
             bufs.try_into().map_err(|_| eyre!("four buffers"))?;
-        let scratch = gpu.alloc(product_len.min(CONV_SCRATCH / 4) * 4)?;
+        // at least one product row, so inputs past about 145 s still run, in more memory
+        let scratch = gpu.alloc(product_len.min((CONV_SCRATCH / 4).max(row_len)) * 4)?;
         // FP16 copies for the FP16-input convs: of `cur`/`next` for each block's first
         // conv, and the first two convs' outputs, which only the next conv reads
         let halves: Vec<Buf> = (0..if f16 { 4 } else { 0 })

@@ -83,6 +83,12 @@ fn nan(gpu: &Gpu, n: usize) -> Result<Buf> {
     gpu.upload(vec![f32::NAN; n])
 }
 
+/// A NaN-filled device buffer of `n` FP16 values; an FP32 NaN read as two halves has a
+/// zero low half, which would pass a skipped write of zero
+fn nan_f16(gpu: &Gpu, n: usize) -> Result<Buf> {
+    gpu.upload(vec![half::f16::NAN.to_bits(); n])
+}
+
 fn slice(buf: &Buf, n: usize) -> Arg {
     Arg::slice(buf.ptr(), n)
 }
@@ -403,7 +409,11 @@ fn kernels_match_f64() -> Result<()> {
         let (b_buf, bn_buf) = (gpu.upload(bias.clone())?, gpu.upload(bn.clone())?);
         let ho = h / stride;
         let og = Grid::trunk_aligned(ho, co, w, 8);
-        let y_buf = nan(&gpu, og.len())?;
+        let y_buf = if out_f16 {
+            nan_f16(&gpu, og.len())?
+        } else {
+            nan(&gpu, og.len())?
+        };
         let scratch = nan(&gpu, ho * 3 * co * og.cols)?;
         let got_g = steps.conv3x3(
             F32Math::F16Inputs,
@@ -943,9 +953,9 @@ fn layers_match_torch_fp32() -> Result<()> {
                     ratio.1,
                     if ok { "ok" } else { "OVER" }
                 );
-                // the gate applies to the mode the runtime ships (FP32); the TF32 mode
-                // is reported beside it
-                if !ok && precision == Precision::Fp32 {
+                // the gate applies to FP32 and to the mode the runtime ships (FP16
+                // inputs); the TF32 mode is reported beside them
+                if !ok && precision != Precision::Reference {
                     failed.push(format!("{seg} {}", tap.name));
                 }
             }
@@ -1005,7 +1015,7 @@ fn embeddings_match_recorded() -> Result<()> {
     let gpu = Gpu::new(0)?;
     let blas = Blas::new(&gpu)?;
     let mut out = BTreeMap::new();
-    let mut fp32_min_truth = 0.0;
+    let mut min_truth = f64::INFINITY;
     for precision in [Precision::Fp32, Precision::Reference, Precision::F16Convs] {
         let model = Ecapa2::load(&gpu, &weights, precision)?;
         let mut ours = BTreeMap::new();
@@ -1055,9 +1065,7 @@ fn embeddings_match_recorded() -> Result<()> {
             t.0,
             t.1
         );
-        if precision == Precision::Fp32 {
-            fp32_min_truth = t.0;
-        }
+        min_truth = min_truth.min(t.0);
         out.insert(
             match precision {
                 Precision::Fp32 => "fp32",
@@ -1073,11 +1081,11 @@ fn embeddings_match_recorded() -> Result<()> {
         .unwrap_or_else(|| dir.join("ours.json"));
     std::fs::write(&path, serde_json::to_vec(&out)?)?;
     println!("wrote {}", path.display());
-    // a sanity floor, not the gate: FP32 against the FP32 truth sits within float noise,
-    // so anything this far off is a broken layer
+    // a sanity floor, not the gate: every mode sits within 1e-6 of the FP32 truth, so
+    // anything this far off is a broken layer
     ensure!(
-        fp32_min_truth > 0.9999,
-        "FP32 embeddings off the FP32 truth: min cos {fp32_min_truth}"
+        min_truth > 0.9999,
+        "embeddings off the FP32 truth: min cos {min_truth}"
     );
     Ok(())
 }
