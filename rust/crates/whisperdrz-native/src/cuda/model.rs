@@ -10,6 +10,7 @@
 //! as the reference passes `xa` straight from `model.encoder` to `prefill_flash`, so the
 //! cross K/V GEMMs see torch's row count
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,10 +22,14 @@ use super::decoder_attn::{Batch, DecoderAttn, KvCaches, XA_BYTES};
 use super::ecapa2::Precision;
 use super::embedder::Embedder;
 use super::encoder::{N_FRAMES, N_MELS, Workspace};
-use super::{Blas, Buf, Encoder, Gpu, Priority, Weights, nvtx};
+use super::{Blas, Buf, Encoder, Event, Gpu, HostBuf, Priority, Weights, nvtx};
 use crate::dtw::{DtwBatch, Matrices};
 use crate::speaker::EMBED_DIM;
-use crate::transcriber::{DecodeStep, Logits, MelBatch, Model};
+use crate::transcriber::{DecodeStep, Logits, MelBatch, Model, StepLogits};
+
+/// Logits rows per download chunk of a decode step: the host starts on the first rows
+/// while the rest copy, and a chunk copies in less time than its rows take to decode
+const STEP_CHUNK_ROWS: usize = 4;
 
 /// The batch a prefill most recently encoded: its slots, whose outputs sit contiguously
 /// in `GpuModel::xa_batch` in this order
@@ -53,6 +58,10 @@ pub struct GpuModel {
     slot_ids: Buf,
     /// ECAPA2 on its own thread and background stream
     embedder: Embedder,
+    /// Page-locked `[MAX_ROWS, N_VOCAB]` FP16 for a decode step's logits, and an event
+    /// per [`STEP_CHUNK_ROWS`] rows of it
+    step_host: HostBuf,
+    step_events: Vec<Event>,
 }
 
 impl GpuModel {
@@ -92,6 +101,10 @@ impl GpuModel {
             encoded: Encoded::default(),
             mel: gpu.alloc(max_batch * N_MELS * N_FRAMES * 2)?,
             slot_ids: gpu.alloc((slots + 1) * 4)?,
+            step_host: gpu.alloc_host(MAX_ROWS * N_VOCAB * 2)?,
+            step_events: (0..MAX_ROWS.div_ceil(STEP_CHUNK_ROWS))
+                .map(|_| gpu.event())
+                .collect::<Result<_>>()?,
             embedder,
             encoder,
             blas,
@@ -206,6 +219,42 @@ impl GpuModel {
     /// `BucketedCUDAGraphs.forward`: one step over the padded batch, returning the real
     /// rows' logits. Padding rows write to the trash slot, which the step resets after
     pub fn decode_step(&mut self, step: &DecodeStep) -> Result<Logits> {
+        self.queue_step(step)?;
+        self.logits(step.rows, 1)
+    }
+
+    /// [`Self::decode_step`] without waiting: the step's kernels, then its logits
+    /// queued for download into page-locked memory in chunks of [`STEP_CHUNK_ROWS`] rows
+    pub fn launch_step(&mut self, step: &DecodeStep) -> Result<InFlight<'_>> {
+        self.queue_step(step)?;
+        let row_bytes = N_VOCAB * 2;
+        let logits = self.dec_ws.logits();
+        let chunks = step.rows.div_ceil(STEP_CHUNK_ROWS);
+        ensure!(
+            chunks <= self.step_events.len(),
+            "{} rows for {} download chunks",
+            step.rows,
+            self.step_events.len()
+        );
+        // one token a row, so the rows sit contiguously from the start of the logits
+        for (c, done) in self.step_events[..chunks].iter().enumerate() {
+            let first = c * STEP_CHUNK_ROWS;
+            let rows = STEP_CHUNK_ROWS.min(step.rows - first);
+            let at = first * row_bytes;
+            self.gpu
+                .download_async(logits, at, &self.step_host, at, rows * row_bytes, done)?;
+        }
+
+        Ok(InFlight {
+            host: &self.step_host,
+            events: &self.step_events[..chunks],
+            rows: step.rows,
+            synced: Cell::new(0),
+        })
+    }
+
+    /// Stages and queues one decode step, leaving its logits on the GPU
+    fn queue_step(&mut self, step: &DecodeStep) -> Result<()> {
         ensure!(
             step.trash_slot == self.caches.trash(),
             "step pads into slot {}, the trash slot is {}",
@@ -234,8 +283,7 @@ impl GpuModel {
             &self.caches,
             &mut self.dec_ws,
             batch,
-        )?;
-        self.logits(step.rows, 1)
+        )
     }
 
     /// The GPU half of `fill_word_timings_batch`, row `i` attending to
@@ -284,6 +332,18 @@ impl Model for GpuModel {
         GpuModel::decode_step(self, step)
     }
 
+    fn launch_step<'a>(
+        &'a mut self,
+        step: &DecodeStep,
+        during: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Box<dyn StepLogits + 'a>> {
+        let range = nvtx::Range::new("decode_step");
+        let logits = GpuModel::launch_step(self, step)?;
+        drop(range);
+        during()?;
+        Ok(Box::new(logits))
+    }
+
     fn dtw_prep(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Matrices> {
         let _range = nvtx::Range::new("dtw_prep");
         GpuModel::dtw_prep(self, batch, xa_slots)
@@ -311,5 +371,50 @@ impl Model for GpuModel {
     ) -> Result<[f32; EMBED_DIM]> {
         let _range = nvtx::Range::new("embed");
         self.embedder.embed_crop(audio, start, len)
+    }
+}
+
+/// A decode step's logits on their way into page-locked memory, from
+/// [`GpuModel::launch_step`]. It borrows the model, so no later step can overwrite them
+pub struct InFlight<'a> {
+    host: &'a HostBuf,
+    /// One per chunk of [`STEP_CHUNK_ROWS`] rows, recorded after its copy
+    events: &'a [Event],
+    rows: usize,
+    /// Chunks known to have landed, a prefix
+    synced: Cell<usize>,
+}
+
+impl InFlight<'_> {
+    fn row_unchecked(&self, r: usize) -> Result<&[f16]> {
+        // SAFETY: row `r`'s chunk has landed (callers check `synced`), and the borrow of
+        // the model keeps any later copy from starting while the slice lives
+        unsafe { self.host.slice(r * N_VOCAB * 2, N_VOCAB) }
+    }
+}
+
+impl StepLogits for InFlight<'_> {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn row(&self, r: usize) -> Result<&[f16]> {
+        ensure!(r < self.rows, "logits row {r} of {}", self.rows);
+        let chunk = r / STEP_CHUNK_ROWS;
+        while self.synced.get() <= chunk {
+            let _range = nvtx::Range::new("logits_wait");
+            self.events[self.synced.get()].synchronize()?;
+            self.synced.set(self.synced.get() + 1);
+        }
+
+        self.row_unchecked(r)
+    }
+
+    fn landed(&self) -> Result<usize> {
+        while self.synced.get() < self.events.len() && self.events[self.synced.get()].query()? {
+            self.synced.set(self.synced.get() + 1);
+        }
+
+        Ok((self.synced.get() * STEP_CHUNK_ROWS).min(self.rows))
     }
 }

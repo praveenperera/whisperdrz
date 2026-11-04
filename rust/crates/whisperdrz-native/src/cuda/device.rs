@@ -598,6 +598,157 @@ fn check_driver() -> Result<()> {
     Ok(())
 }
 
+/// Page-locked host memory from [`Gpu::alloc_host`]. The copy engine writes it
+/// directly, so a download into it is queued like a kernel and lands while the host
+/// works, where a pageable download returns only once its stream drains
+pub struct HostBuf {
+    ptr: *mut u8,
+    bytes: usize,
+    device: Arc<Device>,
+}
+
+// the pointer is page-locked memory owned by this buffer alone
+unsafe impl Send for HostBuf {}
+
+impl HostBuf {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// `len` `T`s starting `offset` bytes in
+    ///
+    /// # Safety
+    ///
+    /// No copy into those bytes may be in flight, or start while the slice lives
+    pub unsafe fn slice<T: Pod>(&self, offset: usize, len: usize) -> Result<&[T]> {
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .and_then(|b| b.checked_add(offset))
+            .filter(|&end| end <= self.bytes);
+        ensure!(
+            bytes.is_some() && offset.is_multiple_of(align_of::<T>()),
+            "{len} elements at {offset} of a {} byte host buffer",
+            self.bytes
+        );
+        // SAFETY: in bounds and aligned (the allocation is page aligned), and the caller
+        // rules out concurrent device writes
+        Ok(unsafe { std::slice::from_raw_parts(self.ptr.add(offset).cast::<T>(), len) })
+    }
+}
+
+impl Drop for HostBuf {
+    fn drop(&mut self) {
+        if self.device.bind().is_ok() {
+            // SAFETY: allocated by `cuMemHostAlloc`; a copy into it can't outlive the
+            // owner that queued it, which syncs or drops the stream first
+            unsafe {
+                let _ = self.device.stream.synchronize();
+                let _ = cur::free_host(self.ptr.cast());
+            }
+        }
+    }
+}
+
+/// A CUDA event without timing, recorded on a [`Gpu`]'s stream
+pub struct Event {
+    event: cu::CUevent,
+    device: Arc<Device>,
+}
+
+// a driver handle, usable from any thread with the context current
+unsafe impl Send for Event {}
+
+impl Event {
+    /// Waits until the work queued before the last record has finished
+    pub fn synchronize(&self) -> Result<()> {
+        // SAFETY: the event belongs to this handle and lives until it drops
+        unsafe { cur::event::synchronize(self.event)? };
+        Ok(())
+    }
+
+    /// Whether the work queued before the last record has finished, without waiting
+    pub fn query(&self) -> Result<bool> {
+        // SAFETY: as in `synchronize`
+        match unsafe { cur::event::query(self.event) } {
+            Ok(()) => Ok(true),
+            Err(e) if e.0 == cu::CUresult::CUDA_ERROR_NOT_READY => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        if self.device.bind().is_ok() {
+            // SAFETY: created by `Gpu::event` and not used after this
+            unsafe {
+                let _ = cur::event::destroy(self.event);
+            }
+        }
+    }
+}
+
+impl Gpu {
+    /// `bytes` of page-locked host memory
+    pub fn alloc_host(&self, bytes: usize) -> Result<HostBuf> {
+        ensure!(bytes > 0, "empty host buffer");
+        // SAFETY: the context is current on this thread and the size is non-zero
+        let ptr = unsafe { cur::malloc_host(bytes, 0) }
+            .wrap_err_with(|| format!("allocate {bytes} bytes of page-locked host memory"))?;
+        Ok(HostBuf {
+            ptr: ptr.cast(),
+            bytes,
+            device: self.device.clone(),
+        })
+    }
+
+    pub fn event(&self) -> Result<Event> {
+        let event = cur::event::create(cu::CUevent_flags::CU_EVENT_DISABLE_TIMING)?;
+        Ok(Event {
+            event,
+            device: self.device.clone(),
+        })
+    }
+
+    /// Queues a copy of `bytes` bytes from `offset` in `src` to `dst_offset` in `dst`,
+    /// then records `done`; nothing waits. `dst` must not be read there until `done`
+    /// completes
+    pub fn download_async(
+        &self,
+        src: &Buf,
+        offset: usize,
+        dst: &HostBuf,
+        dst_offset: usize,
+        bytes: usize,
+        done: &Event,
+    ) -> Result<()> {
+        let fits = |at: usize, len: usize| at.checked_add(bytes).is_some_and(|end| end <= len);
+        ensure!(
+            fits(offset, src.bytes) && fits(dst_offset, dst.bytes),
+            "async download of {bytes} bytes from {offset} of {} to {dst_offset} of {}",
+            src.bytes,
+            dst.bytes
+        );
+        // SAFETY: both ranges are in bounds, the destination is page-locked, and the
+        // event belongs to this context
+        unsafe {
+            if bytes > 0 {
+                cu::cuMemcpyDtoHAsync_v2(
+                    dst.ptr.add(dst_offset).cast::<c_void>(),
+                    src.ptr + offset as u64,
+                    bytes,
+                    self.cu_stream(),
+                )
+                .result()?;
+            }
+
+            cur::event::record(done.event, self.cu_stream())?;
+        }
+
+        Ok(())
+    }
+}
+
 /// Grid size for `n` items with `block` threads each
 pub fn blocks(n: usize, block: u32) -> u32 {
     u32::try_from(n.div_ceil(block as usize)).expect("grid too large")

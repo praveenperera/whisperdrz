@@ -211,58 +211,8 @@ impl<'a> MaskedRow<'a> {
             "skip ids must be sorted and unique"
         );
 
-        let mut top = Top2::default();
-        let mut raw_max = f32::NEG_INFINITY;
-        let mut nan = false;
-        let mut wide = [0f32; CHUNK];
-        let mut skip_at = 0;
-        for (c, (chunk, &word)) in values.chunks(CHUNK).zip(blocked.words()).enumerate() {
-            let base = c * CHUNK;
-            let wide = &mut wide[..chunk.len()];
-            chunk.convert_to_f32_slice(wide);
-
-            let mut eligible = !word;
-            while skip_at < skip.len() && (skip[skip_at] as usize) < base + CHUNK {
-                eligible &= !(1u64 << (skip[skip_at] as usize - base));
-                skip_at += 1;
-            }
-
-            // the raw max and NaN flag over every entry, branch-free so they vectorize (a
-            // compare-select is `maxps`; NaN is tracked apart). The raw max bounds the
-            // eligible max, so a chunk below the runner-up is skipped without its bits
-            let mut raw = [f32::NEG_INFINITY; LANES];
-            let mut any_nan = [false; LANES];
-            let (lanes, tail) = wide.as_chunks::<LANES>();
-            for c in lanes {
-                for l in 0..LANES {
-                    let v = c[l];
-                    raw[l] = if v > raw[l] { v } else { raw[l] };
-                    any_nan[l] |= v.is_nan();
-                }
-            }
-
-            for (l, &v) in tail.iter().enumerate() {
-                raw[l] = if v > raw[l] { v } else { raw[l] };
-                any_nan[l] |= v.is_nan();
-            }
-
-            let chunk_max = raw.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            raw_max = raw_max.max(chunk_max);
-            nan |= any_nan.iter().any(|&b| b);
-
-            // later ids lose ties, so a chunk can only matter if it beats the runner-up
-            if eligible == 0 || top.second.is_some_and(|(_, sv)| chunk_max <= sv) {
-                continue;
-            }
-
-            let mut bits = eligible & (u64::MAX >> (CHUNK - wide.len()));
-            while bits != 0 {
-                let j = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                top.push(base + j, wide[j]);
-            }
-        }
-
+        let scan = scan(values, blocked, skip);
+        let (top, raw_max, nan) = (scan.top, scan.raw_max, scan.nan);
         let blocked_bound = f16::from_f32(raw_max + MASK_FILL).to_f32();
         Self {
             values,
@@ -342,6 +292,141 @@ impl<'a> MaskedRow<'a> {
 
         argmax_wide(&row, &row_wide)
     }
+}
+
+/// What [`MaskedRow::new`]'s scan finds: the eligible top two, the raw max over every
+/// entry and whether any entry is NaN
+struct Scan {
+    top: Top2,
+    raw_max: f32,
+    nan: bool,
+}
+
+/// The scan with the chunk statistics on AVX2 and F16C where the CPU has them. Both
+/// paths compute the same raw max and NaN flag, so they pick the same chunks
+fn scan(values: &[f16], blocked: &TokenMask, skip: &[Token]) -> Scan {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("f16c") {
+        // SAFETY: the CPU supports both features, checked just above
+        return unsafe { scan_avx2(values, blocked, skip) };
+    }
+
+    scan_with(values, blocked, skip, chunk_stats)
+}
+
+/// [`scan_with`] compiled for AVX2 and F16C, so [`chunk_stats_avx2`] inlines into it
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn scan_avx2(values: &[f16], blocked: &TokenMask, skip: &[Token]) -> Scan {
+    scan_with(values, blocked, skip, |chunk| {
+        // SAFETY: this function only runs where both features are present
+        unsafe { chunk_stats_avx2(chunk) }
+    })
+}
+
+/// The raw max and NaN flag of one scan chunk, branch-free so the max reduction
+/// vectorizes (a compare-select is `maxps`; NaN is tracked apart)
+fn chunk_stats(chunk: &[f16]) -> (f32, bool) {
+    let mut wide = [0f32; CHUNK];
+    let wide = &mut wide[..chunk.len()];
+    chunk.convert_to_f32_slice(wide);
+
+    let mut raw = [f32::NEG_INFINITY; LANES];
+    let mut any_nan = [false; LANES];
+    let (lanes, tail) = wide.as_chunks::<LANES>();
+    for c in lanes {
+        for l in 0..LANES {
+            let v = c[l];
+            raw[l] = if v > raw[l] { v } else { raw[l] };
+            any_nan[l] |= v.is_nan();
+        }
+    }
+
+    for (l, &v) in tail.iter().enumerate() {
+        raw[l] = if v > raw[l] { v } else { raw[l] };
+        any_nan[l] |= v.is_nan();
+    }
+
+    let max = raw.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    (max, any_nan.iter().any(|&b| b))
+}
+
+/// [`chunk_stats`] on a full chunk with `vcvtph2ps` and `vmaxps`, without storing the
+/// widened values. `max_ps(v, acc)` is `v > acc ? v : acc`, the scalar select, so a
+/// NaN never enters the max; the partial last chunk takes the scalar path
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,f16c")]
+unsafe fn chunk_stats_avx2(chunk: &[f16]) -> (f32, bool) {
+    use std::arch::x86_64::{
+        __m128i, _CMP_UNORD_Q, _mm_loadu_si128, _mm256_cmp_ps, _mm256_cvtph_ps, _mm256_max_ps,
+        _mm256_movemask_ps, _mm256_or_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    };
+
+    if chunk.len() != CHUNK {
+        return chunk_stats(chunk);
+    }
+
+    let p = chunk.as_ptr().cast::<__m128i>();
+    let mut acc = [_mm256_set1_ps(f32::NEG_INFINITY); 4];
+    let mut nan = _mm256_setzero_ps();
+    for k in 0..CHUNK / 8 {
+        // SAFETY: the chunk holds CHUNK f16s, so all eight 16-byte loads are in bounds
+        let v = _mm256_cvtph_ps(unsafe { _mm_loadu_si128(p.add(k)) });
+        acc[k % 4] = _mm256_max_ps(v, acc[k % 4]);
+        nan = _mm256_or_ps(nan, _mm256_cmp_ps::<_CMP_UNORD_Q>(v, v));
+    }
+
+    let m = _mm256_max_ps(_mm256_max_ps(acc[0], acc[1]), _mm256_max_ps(acc[2], acc[3]));
+    let mut lanes = [0f32; 8];
+    // SAFETY: `lanes` holds eight f32s
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), m) };
+    let max = lanes.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    (max, _mm256_movemask_ps(nan) != 0)
+}
+
+/// The scan behind [`MaskedRow::new`], with `stats` giving each chunk's raw max and NaN
+/// flag. The raw max bounds the eligible max, so a chunk at or below the runner-up is
+/// skipped without widening it or walking its bits
+#[inline(always)]
+fn scan_with(
+    values: &[f16],
+    blocked: &TokenMask,
+    skip: &[Token],
+    stats: impl Fn(&[f16]) -> (f32, bool),
+) -> Scan {
+    let mut top = Top2::default();
+    let mut raw_max = f32::NEG_INFINITY;
+    let mut nan = false;
+    let mut wide = [0f32; CHUNK];
+    let mut skip_at = 0;
+    for (c, (chunk, &word)) in values.chunks(CHUNK).zip(blocked.words()).enumerate() {
+        let base = c * CHUNK;
+        let mut eligible = !word;
+        while skip_at < skip.len() && (skip[skip_at] as usize) < base + CHUNK {
+            eligible &= !(1u64 << (skip[skip_at] as usize - base));
+            skip_at += 1;
+        }
+
+        let (chunk_max, chunk_nan) = stats(chunk);
+        raw_max = raw_max.max(chunk_max);
+        nan |= chunk_nan;
+
+        // later ids lose ties, so a chunk can only matter if it beats the runner-up
+        if eligible == 0 || top.second.is_some_and(|(_, sv)| chunk_max <= sv) {
+            continue;
+        }
+
+        let wide = &mut wide[..chunk.len()];
+        chunk.convert_to_f32_slice(wide);
+        let mut bits = eligible & (u64::MAX >> (CHUNK - wide.len()));
+        while bits != 0 {
+            let j = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            top.push(base + j, wide[j]);
+        }
+    }
+
+    Scan { top, raw_max, nan }
 }
 
 #[cfg(test)]
@@ -465,6 +550,39 @@ mod tests {
                 assert!(same(g.1, w.1), "case {case}");
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_chunk_stats_match_scalar() {
+        use super::{CHUNK, chunk_stats, chunk_stats_avx2};
+
+        if !(std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("f16c"))
+        {
+            eprintln!("skipping: no AVX2 and F16C");
+            return;
+        }
+
+        // every fp16 bit pattern in order, then strided so NaNs, infinities and signed
+        // zeros share chunks with ordinary values
+        let ordered: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
+        let strided: Vec<f16> = (0..=u16::MAX)
+            .map(|i| f16::from_bits(i.wrapping_mul(40_503)))
+            .collect();
+        let mut nans = 0;
+        for values in [ordered, strided] {
+            for chunk in values.chunks(CHUNK) {
+                let want = chunk_stats(chunk);
+                // SAFETY: both features were detected above
+                let got = unsafe { chunk_stats_avx2(chunk) };
+                assert_eq!(got.0.to_bits(), want.0.to_bits(), "{chunk:?}");
+                assert_eq!(got.1, want.1, "{chunk:?}");
+                nans += usize::from(want.1);
+            }
+        }
+
+        assert!(nans > 0);
     }
 
     #[test]

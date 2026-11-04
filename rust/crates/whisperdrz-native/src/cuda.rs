@@ -15,6 +15,6 @@ pub mod weights;
 pub use blas::{Blas, F32Math, Operand};
 pub use decoder::Decoder;
 pub use decoder_attn::{DecoderAttn, KvCaches};
-pub use device::{Arg, Buf, Gpu, Priority, blocks};
+pub use device::{Arg, Buf, Event, Gpu, HostBuf, Priority, blocks};
 pub use encoder::Encoder;
 pub use weights::{Tensor, Weights};

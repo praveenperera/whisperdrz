@@ -28,6 +28,7 @@ mod graphs;
 mod model;
 mod probe;
 mod pyset;
+mod rows;
 mod schedule;
 mod slot;
 mod trace;
@@ -40,7 +41,7 @@ use eyre::{Result, ensure, eyre};
 
 pub use align::{AlignItem, ChunkResult, Phase};
 pub use graphs::{CUDA_GRAPH_BUCKETS, DecodeStep, captured_buckets, get_bucket};
-pub use model::{Logits, MEL_PAD, Mel, MelBatch, Model, N_FRAMES, PrefillEvent};
+pub use model::{Logits, MEL_PAD, Mel, MelBatch, Model, N_FRAMES, PrefillEvent, StepLogits};
 pub use probe::{Event, Probe};
 pub use pyset::PySet;
 pub use slot::{Chunk, Meta, SAMPLE_RATE, Slot};

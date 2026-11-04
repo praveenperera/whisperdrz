@@ -4,23 +4,81 @@
 use std::sync::Arc;
 
 use eyre::{Result, ensure, eyre};
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 use super::align::ChunkResult;
 use super::graphs::DecodeStep;
-use super::model::{Logits, MelBatch, Model, N_FRAMES};
+use super::model::{Logits, MelBatch, Model, N_FRAMES, StepLogits};
 use super::probe::Event;
 use super::pyset::PySet;
+use super::rows::Pending;
 use super::slot::{Chunk, Slot};
 use super::trace;
 use super::{Transcriber, build_init_tokens};
-use crate::decode::{Decision, Decoder, Status};
+use crate::decode::{Decision, Decoder, Prepared, Status};
+use crate::text::Token;
 
 /// Mel frames per second (`FRAMES_PER_SECOND`)
 const FRAMES_PER_SECOND: f64 = 100.0;
 
 /// Continuous-batching fallback: refill when at least this many slots are empty
 const MIN_REFILL_BATCH: usize = 1;
+
+/// `slots`' entries of `all`, in order, each listed once
+fn rows_of<'s>(all: &'s mut [Slot], slots: &[usize]) -> Result<Vec<(usize, &'s mut Slot)>> {
+    let mut by_slot: Vec<Option<&mut Slot>> = all.iter_mut().map(Some).collect();
+    slots
+        .iter()
+        .map(|&s| {
+            by_slot
+                .get_mut(s)
+                .and_then(Option::take)
+                .map(|slot| (s, slot))
+                .ok_or_else(|| eyre!("slot {s} missing or listed twice"))
+        })
+        .collect()
+}
+
+/// [`Decoder::prepare`] on each row, in order: the plan and mask, which read no logits
+fn prepare_rows(
+    decoder: &Decoder,
+    rows: &mut [(usize, &mut Slot)],
+    all_tokens: &[Vec<Token>],
+) -> Result<Vec<Prepared>> {
+    let _range = trace::Range::new("prepare");
+    rows.iter_mut()
+        .map(|(slot_idx, slot)| {
+            let state = &mut slot.state;
+            let window = Decoder::repetition_window(state.token_count)
+                .map(|range| &all_tokens[*slot_idx][range]);
+            decoder.prepare(state, window)
+        })
+        .collect()
+}
+
+/// The prepared rows' argmaxes and corrections over `logits` as they land
+fn finish_rows(
+    decoder: &Decoder,
+    rows: Vec<(usize, &mut Slot)>,
+    prepared: Vec<Prepared>,
+    logits: &dyn StepLogits,
+) -> Result<Vec<Decision>> {
+    let _range = trace::Range::new("rows");
+    ensure!(
+        prepared.len() == rows.len(),
+        "{} rows prepared of {}",
+        prepared.len(),
+        rows.len()
+    );
+    let pending = rows
+        .into_iter()
+        .zip(prepared)
+        .map(|((_, slot), prepared)| Pending {
+            state: &mut slot.state,
+            prepared,
+        })
+        .collect();
+    super::rows::finish(decoder, pending, logits)
+}
 
 impl<M: Model> Transcriber<M> {
     fn is_active(&self, slot: usize) -> bool {
@@ -257,13 +315,16 @@ impl<M: Model> Transcriber<M> {
     /// main decode loop, which also applies the non-English early exit
     fn decode_and_update(&mut self, logits: &Logits, slots: &[usize], step: bool) -> Result<()> {
         let _range = trace::Range::new("host_decode");
-        ensure!(
-            logits.rows == slots.len(),
-            "{} logits rows for {} slots",
-            logits.rows,
-            slots.len()
-        );
+        self.emit_decode_before(slots);
+        let tables = self.tables.clone();
+        let decoder = Decoder::new(&tables, self.config.decode)?;
+        let mut rows = rows_of(&mut self.slots, slots)?;
+        let prepared = prepare_rows(&decoder, &mut rows, &self.all_tokens)?;
+        let decisions = finish_rows(&decoder, rows, prepared, logits)?;
+        self.update_after_decode(slots, &decisions, step)
+    }
 
+    fn emit_decode_before(&mut self, slots: &[usize]) {
         emit!(
             self,
             Event::DecodeBefore {
@@ -272,48 +333,27 @@ impl<M: Model> Transcriber<M> {
                 tokens: &self.all_tokens,
             }
         );
-        let tables = self.tables.clone();
-        let decoder = Decoder::new(&tables, self.config.decode)?;
-        // rows are independent, each reading only its own logits and slot, so they
-        // decode in parallel; at 52 rows the serial loop was 20 ms of host time a step
-        let mut by_slot: Vec<Option<&mut Slot>> = self.slots.iter_mut().map(Some).collect();
-        let rows = slots
-            .iter()
-            .map(|&s| {
-                by_slot
-                    .get_mut(s)
-                    .and_then(Option::take)
-                    .map(|slot| (s, slot))
-                    .ok_or_else(|| eyre!("slot {s} missing or listed twice"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let all_tokens = &self.all_tokens;
-        let par = trace::Range::new("rows");
-        let decisions: Vec<Decision> = rows
-            .into_par_iter()
-            .enumerate()
-            .map(|(r, (slot_idx, slot))| {
-                let _row = trace::Range::new("row");
-                let state = &mut slot.state;
-                let window = Decoder::repetition_window(state.token_count)
-                    .map(|range| &all_tokens[slot_idx][range]);
-                decoder.decode_row(logits.row(r), state, window)
-            })
-            .collect::<Result<_>>()?;
-        drop(par);
+    }
 
+    /// The decisions' `update_state_after_decode` and token writes, in row order
+    fn update_after_decode(
+        &mut self,
+        slots: &[usize],
+        decisions: &[Decision],
+        step: bool,
+    ) -> Result<()> {
         emit!(
             self,
             Event::DecodeAfter {
                 slots,
-                decisions: &decisions,
+                decisions,
                 all: &self.slots,
             }
         );
 
         let max_seq_len = self.config.max_tokens;
         let detect = self.config.lang.is_none();
-        for (&slot_idx, d) in slots.iter().zip(&decisions) {
+        for (&slot_idx, d) in slots.iter().zip(decisions) {
             let s = &mut self.slots[slot_idx];
             s.state.update_after_decode(&d.text, d.token, false)?;
             let new_len = s.state.token_count;
@@ -349,7 +389,8 @@ impl<M: Model> Transcriber<M> {
     }
 
     /// One decode step over `decode_slots`: their last tokens at their KV
-    /// positions, padded to a bucket
+    /// positions, padded to a bucket. The rows are planned and masked while the GPU
+    /// runs the step, since neither reads its logits, and finished as the logits land
     fn decode_step(&mut self, decode_slots: &[usize]) -> Result<()> {
         let mut tokens = Vec::with_capacity(decode_slots.len());
         let mut positions = Vec::with_capacity(decode_slots.len());
@@ -372,12 +413,40 @@ impl<M: Model> Transcriber<M> {
             self.kv_lens[trash] = 0;
         }
 
-        let logits = self.model.decode_step(&step)?;
+        let host = trace::Range::new("host_decode");
+        let tables = self.tables.clone();
+        let decoder = Decoder::new(&tables, self.config.decode)?;
+        let all_tokens = &self.all_tokens;
+        let probe = &mut self.probe;
+        // moved into `rows` inside the callback, after the step is queued: the probe's
+        // before-decode event follows the model call, as python's decode_batch does
+        let mut all = Some(&mut self.slots[..]);
+        let mut rows = Vec::new();
+        let mut prepared = Vec::new();
+        let logits = self.model.launch_step(&step, &mut || {
+            let all = all.take().ok_or_else(|| eyre!("step callback ran twice"))?;
+            if let Some(probe) = probe.as_mut() {
+                probe(&Event::DecodeBefore {
+                    slots: decode_slots,
+                    all,
+                    tokens: all_tokens,
+                });
+            }
+
+            rows = rows_of(all, decode_slots)?;
+            prepared = prepare_rows(&decoder, &mut rows, all_tokens)?;
+            Ok(())
+        })?;
+        let decisions = finish_rows(&decoder, rows, prepared, &*logits)?;
+        drop(logits);
+        drop(host);
+
         for &s in decode_slots {
             self.kv_lens[s] += 1;
         }
 
-        self.decode_and_update(&logits, decode_slots, true)
+        let _range = trace::Range::new("host_update");
+        self.update_after_decode(decode_slots, &decisions, true)
     }
 
     /// Takes the next pending chunk into `slot_idx`

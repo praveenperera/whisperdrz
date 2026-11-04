@@ -7,6 +7,8 @@
 //! the same mask. The ops below run in python's order, which matters where a step
 //! overwrites a whole row (`batch_mask[rows] = True`)
 
+use std::sync::Arc;
+
 use eyre::{Result, ensure, eyre};
 use half::f16;
 
@@ -118,6 +120,22 @@ pub struct Decoder<'t> {
     config: DecodeConfig,
 }
 
+/// A row [`Decoder::prepare`] planned and masked, waiting for its logits
+pub struct Prepared {
+    plan: Plan,
+    /// `None` for a forced token, which reads no logits
+    masks: Option<Masks>,
+}
+
+/// Phase 2's output for a sampled row
+struct Masks {
+    /// The language's base mask, which Phase 4 starts its resample masks from
+    base: Arc<TokenMask>,
+    mask: TokenMask,
+    /// The mask is the valid timing range, so no repetition penalty applies
+    special_timing: bool,
+}
+
 /// What Phase 1 decided for a row
 enum Plan {
     Fixed(String, Token),
@@ -206,26 +224,21 @@ impl<'t> Decoder<'t> {
         state: &mut SlotState,
         window: Option<&[Token]>,
     ) -> Result<Decision> {
-        let ds = self.tables;
-        ensure!(
-            logits.len() == ds.n_vocab(),
-            "logits row has {} entries, vocab is {}",
-            logits.len(),
-            ds.n_vocab()
-        );
+        self.check_row(logits)?;
+        let prepared = self.prepare(state, window)?;
+        self.finish(prepared, Some(logits), state)
+    }
 
+    /// The half of [`Self::decode_row`] that reads no logits: Phase 1's plan and
+    /// Phase 2's mask. It may change `state` as the plan does, so call it once per row
+    /// and step, then [`Self::finish`] with the row's logits. Splitting the row lets
+    /// this half run while the GPU computes the step
+    pub fn prepare(&self, state: &mut SlotState, window: Option<&[Token]>) -> Result<Prepared> {
+        let ds = self.tables;
         let plan = self.plan(state, window)?;
-        let normal = match &plan {
-            Plan::Fixed(text, token) => {
-                return Ok(Decision {
-                    text: text.clone(),
-                    token: *token,
-                    samples: Vec::new(),
-                });
-            }
-            Plan::Normal(n) => Some(n.as_ref()),
-            _ => None,
-        };
+        if matches!(plan, Plan::Fixed(..)) {
+            return Ok(Prepared { plan, masks: None });
+        }
 
         let base = ds.base_blocked(&state.language);
         let mut mask = (*base).clone();
@@ -258,6 +271,54 @@ impl<'t> Decoder<'t> {
                 n.special_timing
             }
             Plan::Fixed(..) => unreachable!(),
+        };
+
+        Ok(Prepared {
+            plan,
+            masks: Some(Masks {
+                base,
+                mask,
+                special_timing,
+            }),
+        })
+    }
+
+    /// Whether [`Self::finish`] reads the row's logits; a forced token doesn't
+    pub fn needs_logits(prepared: &Prepared) -> bool {
+        prepared.masks.is_some()
+    }
+
+    /// The rest of [`Self::decode_row`] for a row [`Self::prepare`] planned, on the
+    /// same `state`: Phase 3's argmax and Phase 4's corrections. `logits` may be `None`
+    /// only when [`Self::needs_logits`] is false
+    pub fn finish(
+        &self,
+        prepared: Prepared,
+        logits: Option<&[f16]>,
+        state: &mut SlotState,
+    ) -> Result<Decision> {
+        let ds = self.tables;
+        let Prepared { plan, masks } = prepared;
+        let Some(Masks {
+            base,
+            mask,
+            special_timing,
+        }) = masks
+        else {
+            let Plan::Fixed(text, token) = plan else {
+                unreachable!("only a fixed plan has no mask")
+            };
+            return Ok(Decision {
+                text,
+                token,
+                samples: Vec::new(),
+            });
+        };
+        let logits = logits.ok_or_else(|| eyre!("a sampled row needs its logits"))?;
+        self.check_row(logits)?;
+        let normal = match &plan {
+            Plan::Normal(n) => Some(n.as_ref()),
+            _ => None,
         };
 
         // Phase 3: additive mask, repetition penalty on non-timing rows, argmax
@@ -314,6 +375,16 @@ impl<'t> Decoder<'t> {
         }
 
         Ok(decision)
+    }
+
+    fn check_row(&self, logits: &[f16]) -> Result<()> {
+        ensure!(
+            logits.len() == self.tables.n_vocab(),
+            "logits row has {} entries, vocab is {}",
+            logits.len(),
+            self.tables.n_vocab()
+        );
+        Ok(())
     }
 
     /// Phase 1 for one row

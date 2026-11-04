@@ -85,6 +85,33 @@ impl Logits {
     }
 }
 
+/// A decode step's logits on their way to the host, row by row in order
+pub trait StepLogits {
+    /// Rows the step returns, `step.rows`
+    fn rows(&self) -> usize;
+
+    /// Row `r`, `[vocab]`, once it has landed; waits for it if it hasn't
+    fn row(&self, r: usize) -> Result<&[f16]>;
+
+    /// How many leading rows have landed so far, without waiting
+    fn landed(&self) -> Result<usize>;
+}
+
+impl StepLogits for Logits {
+    fn rows(&self) -> usize {
+        self.rows
+    }
+
+    fn row(&self, r: usize) -> Result<&[f16]> {
+        ensure!(r < self.rows, "logits row {r} of {}", self.rows);
+        Ok(Logits::row(self, r))
+    }
+
+    fn landed(&self) -> Result<usize> {
+        Ok(self.rows)
+    }
+}
+
 /// Handle for an asynchronous prefill (a CUDA event recorded on the prefill stream)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PrefillEvent(pub u64);
@@ -112,6 +139,20 @@ pub trait Model {
     /// one position to its slot's KV; padding rows go to the trash slot, whose KV
     /// length the caller expects reset to zero before the step
     fn decode_step(&mut self, step: &DecodeStep) -> Result<Logits>;
+
+    /// [`Model::decode_step`] with host work overlapped: queues the step and its
+    /// logits download, runs `during` while the GPU computes, and returns the logits
+    /// in flight. The step's outputs are the same; a model that can't overlap runs
+    /// the step first
+    fn launch_step<'a>(
+        &'a mut self,
+        step: &DecodeStep,
+        during: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Box<dyn StepLogits + 'a>> {
+        let logits = self.decode_step(step)?;
+        during()?;
+        Ok(Box::new(logits))
+    }
 
     /// The GPU half of `fill_word_timings_batch`: the decoder forward over
     /// `batch.full_tokens` with row `i` attending to `xa_cache[xa_slots[i]]`,

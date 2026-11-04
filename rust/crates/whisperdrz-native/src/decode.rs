@@ -12,7 +12,7 @@ pub mod state;
 pub mod tables;
 pub mod text_rules;
 
-pub use fsm::{Decision, DecodeConfig, Decoder, Sample, Stage};
+pub use fsm::{Decision, DecodeConfig, Decoder, Prepared, Sample, Stage};
 pub use mask::TokenMask;
 pub use state::{SlotState, Status};
 pub use tables::DecoderTables;
