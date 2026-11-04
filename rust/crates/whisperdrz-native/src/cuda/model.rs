@@ -417,4 +417,12 @@ impl StepLogits for InFlight<'_> {
 
         Ok((self.synced.get() * STEP_CHUNK_ROWS).min(self.rows))
     }
+
+    fn complete(&self) -> Result<()> {
+        if let Some(last) = self.rows.checked_sub(1) {
+            self.row(last)?;
+        }
+
+        Ok(())
+    }
 }

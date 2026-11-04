@@ -712,7 +712,7 @@ impl Gpu {
 
     /// Queues a copy of `bytes` bytes from `offset` in `src` to `dst_offset` in `dst`,
     /// then records `done`; nothing waits. `dst` must not be read there until `done`
-    /// completes
+    /// completes. `src`, `dst` and `done` must all belong to this handle
     pub fn download_async(
         &self,
         src: &Buf,
@@ -722,6 +722,14 @@ impl Gpu {
         bytes: usize,
         done: &Event,
     ) -> Result<()> {
+        // the copy runs on this handle's stream, so a buffer another handle owns could be
+        // freed and reused on that handle's stream while the copy still reads or writes it
+        ensure!(
+            Arc::ptr_eq(&src.device, &self.device)
+                && Arc::ptr_eq(&dst.device, &self.device)
+                && Arc::ptr_eq(&done.device, &self.device),
+            "async download across GPU handles"
+        );
         let fits = |at: usize, len: usize| at.checked_add(bytes).is_some_and(|end| end <= len);
         ensure!(
             fits(offset, src.bytes) && fits(dst_offset, dst.bytes),

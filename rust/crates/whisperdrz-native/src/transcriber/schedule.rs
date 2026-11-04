@@ -438,6 +438,9 @@ impl<M: Model> Transcriber<M> {
             Ok(())
         })?;
         let decisions = finish_rows(&decoder, rows, prepared, &*logits)?;
+        // the step's GPU errors surface before its state changes, as with the old
+        // synchronous download
+        logits.complete()?;
         drop(logits);
         drop(host);
 

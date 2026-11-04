@@ -95,6 +95,10 @@ pub trait StepLogits {
 
     /// How many leading rows have landed so far, without waiting
     fn landed(&self) -> Result<usize>;
+
+    /// Waits for every row, surfacing any error from the step's GPU work; a step whose
+    /// rows were all forced reads no logits, so nothing else would wait for it
+    fn complete(&self) -> Result<()>;
 }
 
 impl StepLogits for Logits {
@@ -109,6 +113,10 @@ impl StepLogits for Logits {
 
     fn landed(&self) -> Result<usize> {
         Ok(self.rows)
+    }
+
+    fn complete(&self) -> Result<()> {
+        Ok(())
     }
 }
 

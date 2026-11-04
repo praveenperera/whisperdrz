@@ -97,6 +97,9 @@ fn finish_with(
         error: None,
     };
     rayon::in_place_scope(|scope| {
+        // a panic on this thread must still stop helpers waiting for unpublished rows,
+        // or the scope waits for them forever
+        let _abort = AbortOnExit(&shared.abort);
         let mut spawned = false;
         while let Some(i) = shared.take() {
             if shared.needs[i] && !publisher.publish_through(i) {
@@ -217,6 +220,15 @@ impl Shared<'_, '_, '_> {
     }
 }
 
+/// Tells the helpers to stop waiting for logits when dropped
+struct AbortOnExit<'a>(&'a AtomicBool);
+
+impl Drop for AbortOnExit<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Counts one finished row when dropped
 struct Done<'a>(&'a AtomicUsize);
 
@@ -302,6 +314,45 @@ mod tests {
             self.landed.set(n);
             Ok(n)
         }
+
+        fn complete(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// [`Trickle`] whose row `panic_at` panics when read, like a model whose logits
+    /// are shorter than its row count
+    struct PanicAt(Trickle, usize);
+
+    impl StepLogits for PanicAt {
+        fn rows(&self) -> usize {
+            self.0.rows()
+        }
+
+        fn row(&self, r: usize) -> Result<&[f16]> {
+            assert_ne!(r, self.1, "row {r} has no logits");
+            self.0.row(r)
+        }
+
+        fn landed(&self) -> Result<usize> {
+            self.0.landed()
+        }
+
+        fn complete(&self) -> Result<()> {
+            self.0.complete()
+        }
+    }
+
+    fn noise(n: usize, vocab: usize) -> Vec<f16> {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        (0..n * vocab)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                f16::from_f32((seed % 4000) as f32 / 100.0 - 20.0)
+            })
+            .collect()
     }
 
     /// States whose plans mix forced tokens (not started, the transcribe token) with
@@ -327,15 +378,7 @@ mod tests {
         let tables = DecoderTables::new(Tokenizer::multilingual()?)?;
         let decoder = Decoder::new(&tables, DecodeConfig::default())?;
         let (n, vocab) = (40, tables.n_vocab());
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let data: Vec<f16> = (0..n * vocab)
-            .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                f16::from_f32((seed % 4000) as f32 / 100.0 - 20.0)
-            })
-            .collect();
+        let data = noise(n, vocab);
 
         let mut runs = Vec::new();
         for helpers in [0, 4, 9] {
@@ -368,5 +411,54 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    /// A panic while the calling thread publishes rows must reach the caller, not leave
+    /// the helpers waiting for rows that will never land
+    #[test]
+    fn publisher_panic_stops_the_helpers() -> Result<()> {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let run = || -> Result<()> {
+                let tables = DecoderTables::new(Tokenizer::multilingual()?)?;
+                let decoder = Decoder::new(&tables, DecodeConfig::default())?;
+                let (n, vocab) = (40, tables.n_vocab());
+                let mut states = states(n);
+                let rows = states
+                    .iter_mut()
+                    .map(|state| {
+                        let prepared = decoder.prepare(state, None)?;
+                        Ok(Pending { state, prepared })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                // the second row that reads logits, so the helpers have started
+                let panic_at = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| Decoder::needs_logits(&r.prepared))
+                    .nth(1)
+                    .map(|(i, _)| i)
+                    .ok_or_else(|| eyre::eyre!("fewer than two sampled rows"))?;
+                let logits = PanicAt(
+                    Trickle {
+                        data: noise(n, vocab),
+                        vocab,
+                        rows: n,
+                        landed: Cell::new(0),
+                    },
+                    panic_at,
+                );
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    finish_with(&decoder, rows, &logits, 4)
+                }));
+                eyre::ensure!(caught.is_err(), "the row panic was swallowed");
+                Ok(())
+            };
+            let _ = done_tx.send(run());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .map_err(|_| eyre::eyre!("finish hung after a publisher panic"))?
     }
 }
