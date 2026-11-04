@@ -17,5 +17,5 @@ path = "src/lib.rs"
 # cuda-oxide from praveenperera/cuda-rust master. Pinned by rev so Cargo.lock and the
 # cargo-oxide that scripts/build-ptx.sh installs name the same commit; a move rebuilds
 # every kernel, so it lands in its own change
-cuda-device = { git = "https://github.com/praveenperera/cuda-rust.git", rev = "4c0182cd59feacd1070faf51bef4cef0ad3b5c46" }
+cuda-device = { git = "https://github.com/praveenperera/cuda-rust.git", rev = "4e267d0ee72d940d363c677ae47b039757939065" }
 libm = "0.2"
