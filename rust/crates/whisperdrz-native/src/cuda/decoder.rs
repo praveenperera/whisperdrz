@@ -43,8 +43,10 @@
 //!
 //! [`Decoder::dtw_prep`] is the GPU half of `fill_word_timings_batch`: the causal
 //! decoder forward over each row's padded tokens with the timing embedding added, row
-//! `i` attending to the encoder output at `xa[i]`, stopped after the last alignment
-//! layer's cross-attention projections (nothing later reaches the capture). The capture
+//! `i` attending to the encoder output of its slot through the cross keys and values the
+//! slot's prefill cached (the same bits the reference's projection gives; see
+//! [`Decoder::dtw_scores`]), stopped after the last alignment layer's cross query
+//! (nothing later reaches the capture). The capture
 //! is `(q * 64^-0.25) . (k * 64^-0.25)` in FP32 per alignment head, from the FP16 query
 //! and key projections the reference's hooks see, then the masked softmax, per-column
 //! normalization over the real text rows, width-7 median filter and mean over heads
@@ -840,37 +842,46 @@ impl Decoder {
     }
 
     /// The GPU half of `fill_word_timings_batch` for the CPU port's `prep` closure: the
-    /// decoder forward over `batch.full_tokens`, row `i` attending to the FP16 encoder
-    /// output `[1500, 1280]` at device address `xa[i]` (rows may share one), the
-    /// alignment-head capture and `_dtw_prep_batch`. Returns `[rows, t_pad,
-    /// max_audio_cap]`. Allocates its buffers per call from the stream pool and
-    /// synchronizes to download the result
+    /// decoder forward over `batch.full_tokens`, row `i` attending to the encoder output of
+    /// slot `slots[i]` (rows may share one), the alignment-head capture and
+    /// `_dtw_prep_batch`. Returns `[rows, t_pad, max_audio_cap]`. Allocates its buffers per
+    /// call from the stream pool and synchronizes to download the result
     pub fn dtw_prep(
         &self,
         gpu: &Gpu,
         blas: &Blas,
+        caches: &KvCaches,
         batch: &DtwBatch,
-        xa: &[u64],
+        slots: &[usize],
     ) -> Result<Matrices> {
-        let scores = self.dtw_scores(gpu, blas, batch, xa)?;
+        let scores = self.dtw_scores(gpu, blas, caches, batch, slots)?;
         scores.prep(gpu, batch)
     }
 
     /// The capture alone: raw FP32 scores `q . k` of every alignment head before the
     /// softmax (`CrossAttnCapture.compute_attention`)
+    ///
+    /// The cross keys and values are the ones the slots' prefill cached
+    /// ([`Decoder::fill_cross`]) rather than a projection of each row's encoder output.
+    /// The reference projects them again over the rows stacked, a GEMM with another row
+    /// count, but cuBLAS runs both on non-split-K kernels whose FP32 sums take K in the same
+    /// order whatever the tile, so each slot's values come out bit for bit the same (checked
+    /// by `gpu_dtw`'s `dtw_cached_kv_matches_projection` and the byte-identical benches).
+    /// Errors unless every slot's cache holds the prefill of its current encoder output
     pub fn dtw_scores(
         &self,
         gpu: &Gpu,
         blas: &Blas,
+        caches: &KvCaches,
         batch: &DtwBatch,
-        xa: &[u64],
+        slots: &[usize],
     ) -> Result<DtwScores> {
         let (rows, t) = (batch.rows(), batch.t_pad);
         ensure!(rows >= 1, "DTW forward over no rows");
         ensure!(
-            xa.len() == rows,
-            "{} encoder outputs for {rows} DTW rows",
-            xa.len()
+            slots.len() == rows,
+            "{} slots for {rows} DTW rows",
+            slots.len()
         );
         ensure!(
             (1..=N_TEXT_CTX).contains(&t) && batch.full_tokens.len() == rows * t,
@@ -884,9 +895,16 @@ impl Decoder {
                 .all(|&tok| (tok as usize) < N_VOCAB),
             "DTW token past the vocabulary"
         );
+        let last = ALIGNMENT_HEADS.iter().map(|&(l, _)| l).max().unwrap_or(0);
+        for &s in slots {
+            ensure!(
+                s < caches.slots() && caches.cross_from_xa(s, last + 1),
+                "DTW row on slot {s}, whose cross keys and values aren't the prefill of its \
+                 current encoder output"
+            );
+        }
 
         let n = rows * t;
-        let audio = rows * N_AUDIO_CTX;
         let tok = i32s(batch.full_tokens.iter().map(|&x| x as usize), "token")?;
         let tokens = gpu.upload(tok)?;
         let positions = gpu.upload(i32s((0..rows).flat_map(|_| 0..t), "position")?)?;
@@ -898,23 +916,11 @@ impl Decoder {
         );
         let qkv = gpu.alloc(n * 3 * D_MODEL * 2)?;
         let f = gpu.alloc(n * D_MLP * 2)?;
-        // the reference stacks each row's encoder output into one batch, and its key and
-        // value GEMMs run on all rows at once
-        let xa_rows = gpu.alloc(audio * D_MODEL * 2)?;
-        let slot_bytes = N_AUDIO_CTX * D_MODEL * 2;
-        for (i, &p) in xa.iter().enumerate() {
-            ensure!(p.is_multiple_of(16), "xa[{i}] at {p:#x} is misaligned");
-            gpu.copy_dtod(p, xa_rows.at(i * slot_bytes), slot_bytes)?;
-        }
-        let (ck, cv) = (
-            gpu.alloc(audio * D_MODEL * 2)?,
-            gpu.alloc(audio * D_MODEL * 2)?,
-        );
         let mut capture = DtwCapture::new(gpu, rows, t)?;
+        let runs = slot_runs(slots);
 
         self.embed_rows(gpu, x.ptr(), (tokens.ptr(), positions.ptr()), n, true)?;
         self.blocks[0].attn_ln.apply(gpu, x.ptr(), h.ptr(), n)?;
-        let last = ALIGNMENT_HEADS.iter().map(|&(l, _)| l).max().unwrap_or(0);
         for (li, blk) in self.blocks.iter().enumerate().take(last + 1) {
             blas.linear_bias(
                 h.ptr(),
@@ -940,26 +946,39 @@ impl Decoder {
 
             // the cross query lands in the packed buffer's first `n * 1280` values
             blk.cross_q.apply(blas, h.ptr(), qkv.ptr(), n)?;
-            blk.cross_k.apply(blas, xa_rows.ptr(), ck.ptr(), audio)?;
             for (s, &(l, head)) in ALIGNMENT_HEADS.iter().enumerate() {
                 if l == li {
-                    capture.gather(gpu, s, (qkv.ptr(), ck.ptr()), head)?;
+                    let keys = slots
+                        .iter()
+                        .map(|&slot| caches.cross_slot(li, slot).map(|(k, _)| k))
+                        .collect::<Result<Vec<_>>>()?;
+                    capture.gather(gpu, s, qkv.ptr(), &keys, head)?;
                 }
             }
             if li == last {
                 break;
             }
 
-            blk.cross_v.apply(blas, xa_rows.ptr(), cv.ptr(), audio)?;
-            ops::attention(
-                gpu,
-                HeadView::rows(o.ptr(), (rows, t, D_MODEL), 0),
-                HeadView::rows(qkv.ptr(), (rows, t, D_MODEL), 0),
-                HeadView::rows(ck.ptr(), (rows, N_AUDIO_CTX, D_MODEL), 0),
-                HeadView::rows(cv.ptr(), (rows, N_AUDIO_CTX, D_MODEL), 0),
-                (rows, N_HEAD, t, N_AUDIO_CTX),
-                ATTN_SCALE,
-            )?;
+            for run in &runs {
+                let (k, v) = caches.cross_slot(li, slots[run.first])?;
+                let cached = |ptr: u64| HeadView {
+                    ptr,
+                    len: (run.rows - 1) * run.stride * SLOT_ELEMS + SLOT_ELEMS,
+                    ld: D_MODEL,
+                    batch_stride: run.stride * SLOT_ELEMS,
+                };
+                let at = (run.first * t * D_MODEL * 2) as u64;
+                let tokens = (run.rows, t, D_MODEL);
+                ops::attention(
+                    gpu,
+                    HeadView::rows(o.ptr() + at, tokens, 0),
+                    HeadView::rows(qkv.ptr() + at, tokens, 0),
+                    cached(k),
+                    cached(v),
+                    (run.rows, N_HEAD, t, N_AUDIO_CTX),
+                    ATTN_SCALE,
+                )?;
+            }
             blk.cross_out.apply(blas, o.ptr(), ao.ptr(), n)?;
             blk.mlp_ln.add_apply(gpu, x.ptr(), ao.ptr(), h.ptr(), n)?;
             blk.fc1.apply(blas, h.ptr(), f.ptr(), n)?;
@@ -972,6 +991,41 @@ impl Decoder {
 
         capture.scores(gpu, blas)
     }
+}
+
+/// FP16 values of one slot's cross keys (or values) in one layer, `[1500, 1280]`
+const SLOT_ELEMS: usize = N_AUDIO_CTX * D_MODEL;
+
+/// Consecutive DTW rows `first..first + rows` whose slots step by a fixed `stride >= 0`,
+/// so one attention launch reads their cached keys and values with that batch stride
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotRun {
+    first: usize,
+    rows: usize,
+    stride: usize,
+}
+
+/// Splits the rows into the fewest such runs, greedily: a row starts a new run when its
+/// slot is below the previous one's or breaks the run's stride
+fn slot_runs(slots: &[usize]) -> Vec<SlotRun> {
+    let mut runs: Vec<SlotRun> = Vec::new();
+    for (i, &s) in slots.iter().enumerate() {
+        if let Some(r) = runs.last_mut() {
+            let prev = slots[i - 1];
+            let fits = s >= prev && (r.rows == 1 || s - prev == r.stride);
+            if fits {
+                r.stride = s - prev;
+                r.rows += 1;
+                continue;
+            }
+        }
+        runs.push(SlotRun {
+            first: i,
+            rows: 1,
+            stride: 0,
+        });
+    }
+    runs
 }
 
 /// The FP32 query and key heads the capture multiplies, `[heads, rows, t, 64]` and
@@ -999,17 +1053,28 @@ impl DtwCapture {
     }
 
     /// Gathers head `head` of alignment entry `s` from the FP16 cross-attention query
-    /// `[rows * t_pad, 1280]` and key `[rows * 1500, 1280]` projections, scaled by
-    /// `64^-0.25` in FP32 as `compute_attention` scales them
-    pub fn gather(&mut self, gpu: &Gpu, s: usize, (q, k): (u64, u64), head: usize) -> Result<()> {
+    /// `[rows * t_pad, 1280]` and each row's key projection `keys[b]` (`[1500, 1280]`),
+    /// scaled by `64^-0.25` in FP32 as `compute_attention` scales them
+    pub fn gather(&mut self, gpu: &Gpu, s: usize, q: u64, keys: &[u64], head: usize) -> Result<()> {
         ensure!(
             s < ALIGNMENT_HEADS.len() && head < N_HEAD,
             "alignment entry {s}, head {head}"
         );
-        for (src, dst, n_rows) in [
-            (q, &self.q, self.rows * self.t_pad),
-            (k, &self.k, self.rows * N_AUDIO_CTX),
-        ] {
+        ensure!(
+            keys.len() == self.rows,
+            "{} key projections for {} rows",
+            keys.len(),
+            self.rows
+        );
+        let q_rows = self.rows * self.t_pad;
+        let k_head = N_AUDIO_CTX * HEAD_DIM;
+        let k_base = s * self.rows * k_head;
+        let parts = std::iter::once((q, self.q.at(s * q_rows * HEAD_DIM * 4), q_rows)).chain(
+            keys.iter()
+                .enumerate()
+                .map(|(b, &k)| (k, self.k.at((k_base + b * k_head) * 4), N_AUDIO_CTX)),
+        );
+        for (src, dst, n_rows) in parts {
             let n = n_rows * HEAD_DIM;
             gpu.launch(
                 "dtw_gather_head_f32",
@@ -1017,7 +1082,7 @@ impl DtwCapture {
                 (256, 1, 1),
                 0,
                 &[
-                    Arg::slice(dst.at(s * n * 4), n),
+                    Arg::slice(dst, n),
                     Arg::slice(src, n_rows * D_MODEL),
                     D_MODEL.into(),
                     (head * HEAD_DIM).into(),

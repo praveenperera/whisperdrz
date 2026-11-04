@@ -37,6 +37,8 @@
 //! decode step can be captured into a CUDA graph per bucket. The path and the split count
 //! depend only on the row count, the tokens per row and the SM count, which a bucket fixes
 
+use std::cell::Cell;
+
 use eyre::{Result, ensure};
 
 use super::Blas;
@@ -295,6 +297,13 @@ pub struct KvCaches {
     /// stays zero unless a test poisons it
     xa: Buf,
     lens: Buf,
+    /// Per slot, the [`KvCaches::store_xa`] that last wrote its encoder output (0: none)
+    xa_gen: Vec<Cell<u64>>,
+    /// Per layer and slot, the `xa_gen` its cross keys and values were computed from, so
+    /// the DTW forward can check it reads the prefill of the window it aligns
+    cross_gen: Vec<Cell<u64>>,
+    /// Last generation handed out
+    next_gen: Cell<u64>,
 }
 
 /// Bytes of one slot's encoder output
@@ -315,6 +324,9 @@ impl KvCaches {
             cross_v: gpu.zeros(cross_bytes)?,
             xa: gpu.zeros(n * XA_BYTES)?,
             lens: gpu.zeros(n * 4)?,
+            xa_gen: vec![Cell::new(0); n],
+            cross_gen: vec![Cell::new(0); layers * n],
+            next_gen: Cell::new(0),
         })
     }
 
@@ -430,7 +442,9 @@ impl KvCaches {
         let consecutive = slots.windows(2).all(|w| w[1] == w[0] + 1);
         if consecutive {
             blas.linear(xa, wk, k0, (rows, STATE, STATE))?;
-            return blas.linear_bias(xa, wv, bv, v0, (rows, STATE, STATE));
+            blas.linear_bias(xa, wv, bv, v0, (rows, STATE, STATE))?;
+            self.mark_cross(layer, slots);
+            return Ok(());
         }
 
         let scratch = scratch.ok_or_else(|| {
@@ -459,7 +473,17 @@ impl KvCaches {
             )?;
         }
 
+        self.mark_cross(layer, slots);
         Ok(())
+    }
+
+    /// Records that `layer`'s cross keys and values of `slots` come from their current
+    /// encoder outputs: `fill_cross` takes its `xa` to be what `store_xa` last wrote there,
+    /// as `Decoder::fill_cross` guarantees by storing it first
+    fn mark_cross(&self, layer: usize, slots: &[usize]) {
+        for &s in slots {
+            self.cross_gen[layer * (self.slots + 1) + s].set(self.xa_gen[s].get());
+        }
     }
 
     /// Device address of slot `slot`'s encoder output `[CROSS_LEN, STATE]`, the trash slot
@@ -479,9 +503,22 @@ impl KvCaches {
         );
         for (i, &s) in slots.iter().enumerate() {
             gpu.copy_dtod(xa + (i * XA_BYTES) as u64, self.xa_slot(s)?, XA_BYTES)?;
+            self.next_gen.set(self.next_gen.get() + 1);
+            self.xa_gen[s].set(self.next_gen.get());
         }
 
         Ok(())
+    }
+
+    /// Whether every layer below `layers` holds cross keys and values of `slot` computed by
+    /// [`KvCaches::fill_cross`] from the encoder output [`KvCaches::store_xa`] last wrote
+    /// there, so that reading them is the same as projecting the slot's `xa`
+    pub fn cross_from_xa(&self, slot: usize, layers: usize) -> bool {
+        let n = self.slots + 1;
+        let g = self.xa_gen.get(slot).map_or(0, Cell::get);
+        g != 0
+            && layers <= self.layers
+            && (0..layers).all(|l| self.cross_gen[l * n + slot].get() == g)
     }
 
     /// Sets the cache length of each row's slot to 0, before a prefill's layers run

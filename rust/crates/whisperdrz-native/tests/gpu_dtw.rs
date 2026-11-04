@@ -12,9 +12,17 @@
 //! own query and key projections, and prints our prep alone on torch's scores.
 //! `dtw_word_timings_match_reference` runs every `fill_word_timings_batch` call through
 //! the CPU DTW with our matrices and with the recorded ones, and counts the words whose
-//! start or end moves and by how many 0.02 s frames. Skips unless `WHISPERDRZ_WEIGHTS` and
-//! `WHISPERDRZ_DECODER_REF` are set; run through the GPU queue with
-//! `rust/scripts/gpu-test.sh`
+//! start or end moves and by how many 0.02 s frames. Both read the recorded encoder
+//! outputs through cross keys and values a prefill cached, as the transcriber does. They
+//! skip unless `WHISPERDRZ_WEIGHTS` and `WHISPERDRZ_DECODER_REF` are set
+//!
+//! The forward reads the cross keys and values each slot's prefill cached, where the
+//! reference projects them again over the DTW rows. `cross_kv_bits_ignore_row_count` checks
+//! that cuBLAS gives a window the same bits at every row count either GEMM runs at, and
+//! `dtw_cached_kv_matches_projection` runs the whole forward and prep on cached keys and
+//! values against the reference's projection, bit for bit, over slot patterns that
+//! exercise every launch grouping (`WHISPERDRZ_GPU=1`, the second also
+//! `WHISPERDRZ_WEIGHTS`). Run through the GPU queue with `rust/scripts/gpu-test.sh`
 #![cfg(feature = "cuda")]
 
 #[allow(dead_code)]
@@ -27,12 +35,15 @@ mod parity;
 use std::path::PathBuf;
 
 use eyre::{Result, bail, ensure, eyre};
-use numerics::Err;
+use numerics::{Err, NAN16, Rng};
 use parity::{Check, MAX_RATIO, Row, f16_bits, f64s, report};
 use serde_json::Value;
 use whisperdrz_fixtures::{ArrayData, Event, TraceSet};
-use whisperdrz_native::cuda::decoder::{ALIGNMENT_HEADS, DtwCapture, DtwScores, N_AUDIO_CTX};
-use whisperdrz_native::cuda::{Blas, Buf, Decoder, Gpu, Weights};
+use whisperdrz_native::cuda::decoder::{
+    ALIGNMENT_HEADS, D_MODEL, DtwCapture, DtwScores, N_AUDIO_CTX, N_LAYER, Workspace,
+};
+use whisperdrz_native::cuda::decoder_attn::XA_BYTES;
+use whisperdrz_native::cuda::{Blas, Buf, Decoder, Gpu, KvCaches, Weights};
 use whisperdrz_native::dtw::{DtwBatch, DtwOptions, Matrices, PreparedBatch, TokenizerDtw};
 use whisperdrz_native::text::Tokenizer;
 
@@ -160,6 +171,20 @@ fn f64v(v: &[f32]) -> Vec<f64> {
     v.iter().map(|&x| f64::from(x)).collect()
 }
 
+/// [`Decoder::fill_cross`] of the windows stacked at `xa` (FP16 `[slots.len() * 1500,
+/// 1280]`) into `slots`, as a prefill of those windows fills them: the cross keys and
+/// values the DTW forward reads
+fn prefill(
+    (gpu, blas, decoder): (&Gpu, &Blas, &Decoder),
+    caches: &KvCaches,
+    xa: u64,
+    slots: &[usize],
+) -> Result<()> {
+    let ws = Workspace::new(gpu, 1, 1, slots.len())?;
+    decoder.fill_cross(gpu, blas, caches, &ws, xa, slots)?;
+    gpu.synchronize()
+}
+
 #[test]
 fn dtw_matches_torch() -> Result<()> {
     let Some(env) = env()? else { return Ok(()) };
@@ -206,9 +231,10 @@ fn dtw_matches_torch() -> Result<()> {
             xa_shape == [rows, N_AUDIO_CTX, 1280],
             "{name}: xa shape {xa_shape:?}"
         );
-        let ptrs: Vec<u64> = (0..rows)
-            .map(|i| xa.at(i * N_AUDIO_CTX * 1280 * 2))
-            .collect();
+        // one GEMM over the stacked rows, the row count the reference's projection runs at
+        let caches = KvCaches::new(gpu, N_LAYER, rows)?;
+        let slots: Vec<usize> = (0..rows).collect();
+        prefill((gpu, blas, decoder), &caches, xa.ptr(), &slots)?;
         let batch = DtwBatch {
             full_tokens: x.to_i64()?.into_iter().map(|v| v as u32).collect(),
             t_pad: t,
@@ -227,7 +253,7 @@ fn dtw_matches_torch() -> Result<()> {
         let recorded_m = recorded.to_f32()?;
 
         // raw scores before the prep
-        let scores = decoder.dtw_scores(gpu, blas, &batch, &ptrs)?;
+        let scores = decoder.dtw_scores(gpu, blas, &caches, &batch, &slots)?;
         ensure!(
             scores.shape() == [heads, rows, t, N_AUDIO_CTX],
             "{name}: our scores {:?}",
@@ -295,7 +321,8 @@ fn dtw_matches_torch() -> Result<()> {
                     "capture shapes {qs:?} {ks:?}"
                 );
                 let (qd, kd) = (gpu.upload(q)?, gpu.upload(k)?);
-                capture.gather(gpu, s, (qd.ptr(), kd.ptr()), head)?;
+                let keys: Vec<u64> = (0..rows).map(|b| kd.at(b * XA_BYTES)).collect();
+                capture.gather(gpu, s, qd.ptr(), &keys, head)?;
                 gpu.synchronize()?;
                 keep.push((qd, kd));
             }
@@ -411,8 +438,12 @@ fn dtw_word_timings_match_reference() -> Result<()> {
                 continue;
             };
             let prep = prep.ok_or_else(|| eyre!("{stem} #{}: no recorded prep", fill.seq))?;
-            let ptrs: Vec<u64> = batch.slots.iter().map(|&si| xa[si].ptr()).collect();
-            let ours = decoder.dtw_prep(gpu, blas, batch, &ptrs)?;
+            // slot i holds slot_data[i]'s prefill, one window per GEMM
+            let caches = KvCaches::new(gpu, N_LAYER, xa.len())?;
+            for (i, w) in xa.iter().enumerate() {
+                prefill((gpu, blas, decoder), &caches, w.ptr(), &[i])?;
+            }
+            let ours = decoder.dtw_prep(gpu, blas, &caches, batch, &batch.slots)?;
             prepared.check_matrices(&ours)?;
             let rec = set.array(prep.ret()?)?;
             let recorded = Matrices {
@@ -483,5 +514,274 @@ fn dtw_word_timings_match_reference() -> Result<()> {
         "{calls} calls, {words} words: {moved} with a moved start or end; largest move per word (frames: words) {hist:?}; {texts_differ} slot texts differ from the recorded output"
     );
     ensure!(calls > 0 && words > 0, "no DTW calls in the trace");
+    Ok(())
+}
+
+/// The GPU and cuBLAS handle, when `WHISPERDRZ_GPU=1`
+fn gpu_only() -> Result<Option<(Gpu, Blas)>> {
+    if std::env::var("WHISPERDRZ_GPU").as_deref() != Ok("1") {
+        eprintln!("skipping: WHISPERDRZ_GPU=1 not set (run scripts/gpu-test.sh)");
+        return Ok(None);
+    }
+    let gpu = Gpu::new(0)?;
+    let blas = Blas::new(&gpu)?;
+    Ok(Some((gpu, blas)))
+}
+
+/// FP16 values of one window's cross keys or values
+const WINDOW: usize = N_AUDIO_CTX * D_MODEL;
+
+/// Most windows one GEMM of the cross keys and values is checked at: a prefill takes up to
+/// the 52 decode slots, and a DTW call rarely more than 9 rows
+const MAX_WINDOWS: usize = 64;
+
+/// The DTW forward reads the cross keys and values a prefill computed, over that
+/// prefill's windows, where the reference projects them again over the DTW rows: GEMMs of
+/// the same windows at other row counts and positions. This checks that cuBLAS gives each
+/// window the same bits at every count from 1 to [`MAX_WINDOWS`] windows, and at the first,
+/// middle and last position, for the bias-free key call and the value call with its bias
+#[test]
+fn cross_kv_bits_ignore_row_count() -> Result<()> {
+    let Some((gpu, blas)) = gpu_only()? else {
+        return Ok(());
+    };
+    let mut rng = Rng::new(0x5eed_d7a0);
+    let xa = gpu.upload(rng.f16_normal(MAX_WINDOWS * WINDOW, 0.0, 1.0))?;
+    let wk = gpu.upload(rng.f16_normal(D_MODEL * D_MODEL, 0.0, 0.03))?;
+    let wv = gpu.upload(rng.f16_normal(D_MODEL * D_MODEL, 0.0, 0.03))?;
+    let bv = gpu.upload(rng.f16_normal(D_MODEL, 0.0, 0.1))?;
+    let out = gpu.alloc(MAX_WINDOWS * WINDOW * 2)?;
+    out_nan(&gpu, &out)?;
+
+    let project = |windows: usize, value: bool| -> Result<()> {
+        let dims = (windows * N_AUDIO_CTX, D_MODEL, D_MODEL);
+        if value {
+            blas.linear_bias(xa.ptr(), wv.ptr(), bv.ptr(), out.ptr(), dims)
+        } else {
+            blas.linear(xa.ptr(), wk.ptr(), out.ptr(), dims)
+        }
+    };
+    let window = |w: usize| -> Result<Vec<u16>> {
+        let mut host = vec![0u16; WINDOW];
+        gpu.download_into(&out, w * WINDOW * 2, &mut host)?;
+        Ok(host)
+    };
+
+    let mut checked = 0;
+    for value in [false, true] {
+        // every window projected over all 64 at once is the reference; each count's
+        // windows are compared with it
+        project(MAX_WINDOWS, value)?;
+        let all: Vec<Vec<u16>> = (0..MAX_WINDOWS).map(window).collect::<Result<_>>()?;
+        ensure!(
+            all.iter().flatten().all(|&b| b & 0x7c00 != 0x7c00),
+            "non-finite cross {} at {MAX_WINDOWS} windows",
+            if value { "value" } else { "key" }
+        );
+        for windows in 1..MAX_WINDOWS {
+            out_nan(&gpu, &out)?;
+            project(windows, value)?;
+            let mut at = vec![0, windows / 2, windows - 1];
+            at.dedup();
+            for w in at {
+                let got = window(w)?;
+                ensure!(got.len() == all[w].len(), "window {w}: length");
+                let differ = got.iter().zip(&all[w]).filter(|(a, b)| a != b).count();
+                ensure!(
+                    differ == 0,
+                    "cross {} of window {w} at {windows} windows: {differ} of {WINDOW} values \
+                     differ from the {MAX_WINDOWS}-window GEMM",
+                    if value { "value" } else { "key" }
+                );
+                checked += 1;
+            }
+        }
+    }
+    println!("cross K/V: {checked} windows bit for bit at 1..{MAX_WINDOWS} windows");
+    Ok(())
+}
+
+/// Fills a buffer with FP16 NaN, so a GEMM or kernel that skips a value fails the check
+fn out_nan(gpu: &Gpu, buf: &Buf) -> Result<()> {
+    gpu.upload_to(
+        buf.ptr(),
+        bytemuck::cast_slice(&vec![NAN16; buf.bytes() / 2]),
+    )
+}
+
+/// NaN in slot `slot`'s encoder output and every layer's cross keys and values, so a DTW
+/// row that reads it (a wrong stride or slot) turns its scores to NaN
+fn poison_slot(gpu: &Gpu, caches: &KvCaches, slot: usize) -> Result<()> {
+    let nan = vec![NAN16; WINDOW];
+    let bytes: &[u8] = bytemuck::cast_slice(&nan);
+    gpu.upload_to(caches.xa_slot(slot)?, bytes)?;
+    for layer in 0..caches.layers() {
+        let (k, v) = caches.cross_slot(layer, slot)?;
+        gpu.upload_to(k, bytes)?;
+        gpu.upload_to(v, bytes)?;
+    }
+    Ok(())
+}
+
+/// A DTW batch over `slots` of random text tokens, eot padding, lengths and audio caps
+fn random_batch(rng: &mut Rng, slots: &[usize], t_pad: usize) -> DtwBatch {
+    const EOT: u32 = 50257;
+    let rows = slots.len();
+    let mut full_tokens = vec![EOT; rows * t_pad];
+    let mut actual_lens = Vec::with_capacity(rows);
+    let mut audio_caps = Vec::with_capacity(rows);
+    for b in 0..rows {
+        // the first row fills t_pad, as the longest row of a real batch does
+        let len = if b == 0 {
+            t_pad
+        } else {
+            t_pad / 2 + (rng.next_u64() as usize) % (t_pad / 2 + 1)
+        };
+        for tok in &mut full_tokens[b * t_pad..][..len] {
+            *tok = (rng.next_u64() % 50000) as u32;
+        }
+        actual_lens.push(len);
+        audio_caps.push(300 + (rng.next_u64() as usize) % (N_AUDIO_CTX - 299));
+    }
+    DtwBatch {
+        full_tokens,
+        t_pad,
+        actual_lens,
+        audio_caps,
+        slots: (0..rows).collect(),
+    }
+}
+
+/// The DTW forward over cached cross keys and values, against the forward the reference
+/// runs: the same rows with their keys and values projected over the rows stacked (a
+/// fresh cache prefilled at that row count, which is that projection). The production
+/// cache is prefilled in groups of other sizes, consecutive and not (the scratch path),
+/// and the rows read it in runs that are consecutive, repeated, descending, strided over a
+/// NaN slot and mixed. Raw scores and prepped matrices must match bit for bit and be
+/// finite; reading a slot whose prefill isn't its current encoder output must fail
+#[test]
+fn dtw_cached_kv_matches_projection() -> Result<()> {
+    let Some((gpu, blas)) = gpu_only()? else {
+        return Ok(());
+    };
+    let Some(weights) = std::env::var_os("WHISPERDRZ_WEIGHTS").map(PathBuf::from) else {
+        eprintln!("skipping: WHISPERDRZ_WEIGHTS not set (run scripts/gpu-test.sh)");
+        return Ok(());
+    };
+    let mut w = Weights::load(&gpu, &weights, |n| n.starts_with("decoder."))?;
+    let decoder = Decoder::new(&gpu, &mut w)?;
+    let env = (&gpu, &blas, &decoder);
+
+    const SLOTS: usize = 8;
+    const POISONED: usize = 6;
+    let mut rng = Rng::new(0xd7a_cac4e);
+    // slot i's encoder output is window i
+    let windows: Vec<Vec<u16>> = (0..SLOTS)
+        .map(|_| rng.f16_normal(WINDOW, 0.0, 1.0))
+        .collect();
+    let stacked = |slots: &[usize]| -> Result<Buf> {
+        gpu.upload(
+            slots
+                .iter()
+                .flat_map(|&s| windows[s].clone())
+                .collect::<Vec<u16>>(),
+        )
+    };
+
+    let caches = KvCaches::new(&gpu, N_LAYER, SLOTS)?;
+    for group in [&[0usize, 1, 2][..], &[5, 3], &[4], &[7]] {
+        prefill(env, &caches, stacked(group)?.ptr(), group)?;
+    }
+    poison_slot(&gpu, &caches, POISONED)?;
+    poison_slot(&gpu, &caches, caches.trash())?;
+
+    let patterns: [&[usize]; 6] = [
+        &[0, 1, 2],
+        &[3, 3],
+        &[5, 4, 3],
+        &[5, 7],
+        &[7, 0, 2, 4, 4],
+        &[4],
+    ];
+    for (i, &slots) in patterns.iter().enumerate() {
+        let t_pad = [61, 128, 200, 445, 97, 300][i];
+        let batch = random_batch(&mut rng, slots, t_pad);
+        let rows = slots.len();
+
+        let reference = KvCaches::new(&gpu, N_LAYER, rows)?;
+        let ref_slots: Vec<usize> = (0..rows).collect();
+        prefill(env, &reference, stacked(slots)?.ptr(), &ref_slots)?;
+        let want = decoder.dtw_scores(&gpu, &blas, &reference, &batch, &ref_slots)?;
+        let got = decoder.dtw_scores(&gpu, &blas, &caches, &batch, slots)?;
+        let shape = [ALIGNMENT_HEADS.len(), rows, t_pad, N_AUDIO_CTX];
+        ensure!(
+            want.shape() == shape && got.shape() == shape,
+            "{slots:?}: scores {:?} and {:?}, want {shape:?}",
+            want.shape(),
+            got.shape()
+        );
+        let (want_raw, got_raw): (Vec<f32>, Vec<f32>) = (want.download(&gpu)?, got.download(&gpu)?);
+        let n: usize = shape.iter().product();
+        ensure!(
+            want_raw.len() == n && got_raw.len() == n,
+            "{slots:?}: {} and {} scores, want {n}",
+            want_raw.len(),
+            got_raw.len()
+        );
+        ensure!(
+            got_raw.iter().all(|v| v.is_finite()),
+            "{slots:?}: non-finite scores"
+        );
+        let differ = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count()
+        };
+        let d = differ(&got_raw, &want_raw);
+        ensure!(
+            d == 0,
+            "{slots:?}: {d} of {n} scores differ from the projection"
+        );
+
+        let (wm, gm) = (want.prep(&gpu, &batch)?, got.prep(&gpu, &batch)?);
+        ensure!(
+            gm.shape == wm.shape
+                && gm.shape == [rows, t_pad, batch.max_audio_cap()]
+                && gm.data.len() == gm.shape.iter().product::<usize>()
+                && wm.data.len() == gm.data.len(),
+            "{slots:?}: matrices {:?} ({} values) vs {:?} ({})",
+            gm.shape,
+            gm.data.len(),
+            wm.shape,
+            wm.data.len()
+        );
+        ensure!(
+            gm.data.iter().all(|v| v.is_finite()),
+            "{slots:?}: non-finite matrices"
+        );
+        let d = differ(&gm.data, &wm.data);
+        ensure!(
+            d == 0,
+            "{slots:?}: {d} matrix values differ from the projection"
+        );
+        println!("{slots:?} T={t_pad}: {n} scores and the matrices bit for bit");
+    }
+
+    // a slot never prefilled, and one whose encoder output changed after its prefill
+    let batch = random_batch(&mut rng, &[POISONED], 32);
+    ensure!(
+        decoder
+            .dtw_scores(&gpu, &blas, &caches, &batch, &[POISONED])
+            .is_err(),
+        "DTW read slot {POISONED}, which no prefill filled"
+    );
+    caches.store_xa(&gpu, stacked(&[4])?.ptr(), &[4])?;
+    ensure!(
+        decoder
+            .dtw_scores(&gpu, &blas, &caches, &batch, &[4])
+            .is_err(),
+        "DTW read slot 4's cross keys after its encoder output was replaced"
+    );
     Ok(())
 }

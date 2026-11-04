@@ -4,9 +4,9 @@
 //!
 //! Slots follow the reference's `--pad-fix` layout: `slots` real slots plus a trash slot
 //! that padding rows of a bucketed decode step write to. The caches hold each slot's
-//! encoder output `[1500, 1280]` (the reference's `self.xa_cache`), which the DTW forward
-//! reads per row and the absorbed cross-attention of large decode buckets reads per
-//! layer. Prefill runs on the encoder's contiguous output for the batch it just encoded,
+//! encoder output `[1500, 1280]` (the reference's `self.xa_cache`), which the absorbed
+//! cross-attention of large decode buckets reads per layer, and the cross keys and values
+//! prefill computed from it, which the DTW forward reads per row. Prefill runs on the encoder's contiguous output for the batch it just encoded,
 //! as the reference passes `xa` straight from `model.encoder` to `prefill_flash`, so the
 //! cross K/V GEMMs see torch's row count
 
@@ -287,16 +287,10 @@ impl GpuModel {
     }
 
     /// The GPU half of `fill_word_timings_batch`, row `i` attending to
-    /// `xa_cache[xa_slots[i]]`
+    /// `xa_cache[xa_slots[i]]` through the cross keys and values its prefill cached
     pub fn dtw_prep(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Matrices> {
-        let xa = xa_slots
-            .iter()
-            .map(|&s| {
-                ensure!(s < self.caches.slots(), "DTW row on slot {s}");
-                self.caches.xa_slot(s)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.decoder.dtw_prep(&self.gpu, &self.blas, batch, &xa)
+        self.decoder
+            .dtw_prep(&self.gpu, &self.blas, &self.caches, batch, xa_slots)
     }
 
     /// The last position's logits of the first `rows` rows of the last prefill or step

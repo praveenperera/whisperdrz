@@ -38,6 +38,12 @@ M = 1500 x windows in the prefill batch, the prefill M = 7 x windows, and the DT
 forward M = rows x padded tokens. The algorithm, and so the bits, change with M, so the
 native runtime must form the same batches.
 
+One exception: the reference's DTW forward projects the cross keys and values again at
+M = 1500 x rows. The native forward instead reads what each slot's prefill cached, at
+M = 1500 x prefill windows. cuBLAS runs these shapes on non-split-K kernels, which sum K
+in the same order whatever the tile. `gpu_dtw`'s `cross_kv_bits_ignore_row_count` checks
+each window's bits are the same at every count from 1 to 64 windows.
+
 ## Other calls seen
 
 - ECAPA2 (TorchScript, FP32): cuBLASLt `COMPUTE_32F` with `EPILOGUE_BIAS` at M = 1 for
