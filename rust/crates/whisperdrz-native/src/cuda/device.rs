@@ -211,6 +211,8 @@ pub struct Gpu {
     sms: usize,
     /// Compute capability, major and minor
     cc: (i32, i32),
+    /// Dynamic shared memory a block may opt into, in bytes
+    smem_optin: usize,
     /// Host sources of asynchronous uploads, kept until the stream next synchronizes
     pending: RefCell<Vec<Box<dyn Any + Send>>>,
     pending_bytes: Cell<usize>,
@@ -241,6 +243,9 @@ impl Gpu {
         );
         let sms = ctx.attribute(cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?
             as usize;
+        let smem_optin = ctx.attribute(
+            cu::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        )? as usize;
 
         // a single stream, so cudarc's cross-stream event tracking is pure overhead
         unsafe { ctx.disable_event_tracking() };
@@ -269,6 +274,7 @@ impl Gpu {
             functions: RefCell::default(),
             sms,
             cc: (major, minor),
+            smem_optin,
             pending: RefCell::default(),
             pending_bytes: Cell::new(0),
             sleep_event,
@@ -277,6 +283,11 @@ impl Gpu {
 
     pub fn sms(&self) -> usize {
         self.sms
+    }
+
+    /// Shared memory a block may use with the opt-in launch attribute, in bytes
+    pub fn max_shared_per_block(&self) -> usize {
+        self.smem_optin
     }
 
     /// Compute capability as `(major, minor)`

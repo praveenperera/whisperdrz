@@ -11,6 +11,7 @@
 
 pub mod attention;
 pub mod common;
+pub mod cross;
 pub mod decoder;
 pub mod dtw;
 pub mod ecapa2;

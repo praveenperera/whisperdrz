@@ -2,9 +2,10 @@
 //!
 //! `rust/tools/attn_ref.py` writes the torch side (`flash_attn_with_kvcache` in FP16 and
 //! an FP32 attention on the same FP16 inputs); `rust/scripts/gpu-test.sh` runs both
-//! through the GPU queue. Skips when `WHISPERDRZ_ATTN_REF` doesn't name its output.
+//! through the GPU queue. The torch-backed tests skip when `WHISPERDRZ_ATTN_REF` doesn't
+//! name its output.
 //!
-//! - synthetic cases: our output against an f64 attention on the exact FP16 inputs (at
+//! - synthetic cases (self-attention and cross-attention over the K/V caches): our output against an f64 attention on the exact FP16 inputs (at
 //!   most one FP16 ulp, plus FP32-level slack near zero), ours and flash-attn's against the
 //!   FP32 truth (ours no worse than 1.5x flash-attn's, max and mean), the appended cache
 //!   positions bit for bit, every other cache position untouched, and the lengths after
@@ -13,7 +14,20 @@
 //! - trace: every decoder layer's self- and cross-attention on the inputs torch saw in a
 //!   recorded prefill, with Q/K/V from the checkpoint through `Blas`, against torch's
 //!   output and the FP32 truth per layer, and the layer-0 cross K/V cache bit for bit
-//!   against torch's
+//!   against torch's. The K/V path must stay within 1.5x flash-attn's error. The absorbed
+//!   cross-attention of large decode buckets also runs on each layer's inputs and its
+//!   max-abs and mean-abs errors are printed as ratios to flash-attn's, without a bar:
+//!   folding the key projection into the query rounds `q W_k` to FP16 where torch rounds
+//!   `xa W_k`, which puts it at 1.3-1.6x on mean-abs; the end-to-end gate judges it
+//! - `absorbed_cross_within_f64_bound` (`WHISPERDRZ_GPU=1`, no torch side): the absorbed
+//!   path's attention `O' = softmax(Q' xa^T) xa` on random encoder outputs, on several
+//!   frame splits, against f64 within a bound derived from the kernel's own roundings, with
+//!   the trash slot's encoder output NaN and every output NaN-prefilled; the default plan
+//!   must repeat bit for bit and give the real rows the same bits whatever the trash slot
+//!   holds
+//!
+//! `cross_bench` (`WHISPERDRZ_CROSS_BENCH=1`) times both cross-attention paths per layer
+//! at each decode bucket, for the table behind `ABSORBED_MIN_ROWS`, and asserts nothing
 #![cfg(feature = "cuda")]
 
 use std::path::{Path, PathBuf};
@@ -23,9 +37,16 @@ use half::f16;
 use serde_json::Value;
 use whisperdrz_fixtures::{ArrayData, read_npy};
 use whisperdrz_native::cuda::decoder_attn::{
-    Batch, CROSS_LEN, F16_NAN, HEAD_DIM, HEADS, Rows, SCALE, SELF_CAP, STATE,
+    ABSORBED_MAX_SPLITS, AbsorbedPlan, Batch, CROSS_LEN, CrossKv, F16_NAN, HEAD_DIM, HEADS, Rows,
+    SCALE, SELF_CAP, STATE, XA_BYTES,
 };
-use whisperdrz_native::cuda::{Blas, Buf, DecoderAttn, Gpu, KvCaches, Weights};
+use whisperdrz_native::cuda::{Blas, Buf, DecoderAttn, Gpu, KvCaches, Weights, nvtx};
+
+#[allow(dead_code)]
+#[path = "support/numerics.rs"]
+mod numerics;
+
+use numerics::Rng;
 
 /// Ours against the FP32 truth may be at most this many times flash-attn's error
 const TRUTH_RATIO: f64 = 1.5;
@@ -628,6 +649,7 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
         "xa shape {xa_shape:?}"
     );
     let xa = upload16(&gpu, &xa)?;
+    caches.store_xa(&gpu, xa.ptr(), &slot_list)?;
 
     let load = |key: &str| -> Result<(Vec<u16>, Vec<u16>, Vec<f32>)> {
         let (sx, x) = dir.f16(&files[format!("{key}_x")])?;
@@ -658,6 +680,11 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
         gpu.alloc(per_layer * 2)?,
     );
     let out = gpu.alloc(per_layer * 2)?;
+    // the absorbed cross-attention's per-head query and output, [tokens, HEADS, STATE]
+    let (qk, ok) = (
+        gpu.alloc(per_layer * HEADS * 2)?,
+        gpu.alloc(per_layer * HEADS * 2)?,
+    );
     let nan = vec![F16_NAN; per_layer];
     // cross f64 checks are the slow part, so they cover the first, a middle and the last layer
     let f64_cross_layers = [0, layers / 2, layers - 1];
@@ -667,7 +694,7 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
         tr["stem"], tr["seq"]
     );
     println!(
-        "layer | self ours max/mean | self flash max/mean | cross ours max/mean | cross flash max/mean | f64 self / cross"
+        "layer | self ours max/mean | self flash max/mean | cross ours max/mean | cross flash max/mean | f64 self / cross | absorbed / flash max, mean (no bar)"
     );
     let mut failed = Vec::new();
     for layer in 0..layers {
@@ -757,6 +784,19 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
         attn.cross_attn(&gpu, &caches, layer, batch, Rows::dense(q.ptr()), out.ptr())?;
         let cross_out: Vec<u16> = gpu.download(&out)?;
 
+        // the absorbed path on the same query: each head's key projection, attention over
+        // the encoder output, then each head's value projection
+        let kv = CrossKv {
+            wk: cross_w.0,
+            wv: cross_w.1,
+            bv: cross_w.2,
+        };
+        gpu.upload_to(out.ptr(), bytemuck::cast_slice(&nan))?;
+        kv.query_keys(&blas, q.ptr(), qk.ptr(), tokens)?;
+        attn.cross_absorbed(&gpu, &caches, batch, qk.ptr(), ok.ptr())?;
+        kv.values(&blas, ok.ptr(), out.ptr(), tokens)?;
+        let absorbed_out: Vec<u16> = gpu.download(&out)?;
+
         let mut cross_ulp = UlpStats::default();
         if f64_cross_layers.contains(&layer) {
             let cq: Vec<u16> = gpu.download(&q)?;
@@ -822,13 +862,14 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
         };
         let (so, sf) = score(&self_out, &self_flash, &self_truth);
         let (co, cf) = score(&cross_out, &cross_flash, &cross_truth);
+        let (ca, _) = score(&absorbed_out, &cross_flash, &cross_truth);
         let cross_f64 = if cross_ulp.n > 0 {
             format!("{:.3}", cross_ulp.max_ulp)
         } else {
             "-".to_owned()
         };
         println!(
-            "{layer:5} | {:.3e} / {:.3e} | {:.3e} / {:.3e} | {:.3e} / {:.3e} | {:.3e} / {:.3e} | {:.3} / {cross_f64} ulp",
+            "{layer:5} | {:.3e} / {:.3e} | {:.3e} / {:.3e} | {:.3e} / {:.3e} | {:.3e} / {:.3e} | {:.3} / {cross_f64} ulp | {:.2}x, {:.2}x",
             so.max,
             so.mean(),
             sf.max,
@@ -837,8 +878,13 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
             co.mean(),
             cf.max,
             cf.mean(),
-            self_ulp.max_ulp
+            self_ulp.max_ulp,
+            ca.max / cf.max,
+            ca.mean() / cf.mean()
         );
+        if !ca.max.is_finite() || !ca.mean().is_finite() {
+            failed.push(format!("layer {layer} absorbed cross not finite"));
+        }
         if !so.within(&sf) {
             failed.push(format!("layer {layer} self vs truth"));
         }
@@ -866,5 +912,416 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
     }
 
     ensure!(failed.is_empty(), "trace checks failed: {failed:?}");
+    Ok(())
+}
+/// Real slots of the absorbed cross-attention cases; rows share them, since
+/// cross-attention only reads its slot
+const XA_SLOTS: usize = 12;
+
+/// A synthetic absorbed cross-attention case: `real` rows on random real slots, then `pad`
+/// padding rows on the trash slot, `Q'` drawn with standard deviation `q_std` over unit
+/// normal encoder outputs, so scores spread by `q_std * sqrt(STATE)`: 0.36 is nearly flat
+/// over the 1500 frames, 3.6 like the trace, 10.7 a few frames
+struct AbsorbedCase {
+    name: &'static str,
+    real: usize,
+    pad: usize,
+    q_len: usize,
+    q_std: f64,
+}
+
+const ABSORBED_CASES: [AbsorbedCase; 5] = [
+    AbsorbedCase {
+        name: "decode_b52",
+        real: 46,
+        pad: 6,
+        q_len: 1,
+        q_std: 0.1,
+    },
+    AbsorbedCase {
+        name: "decode_b8_peaked",
+        real: 8,
+        pad: 0,
+        q_len: 1,
+        q_std: 0.3,
+    },
+    AbsorbedCase {
+        name: "decode_b2_flat",
+        real: 2,
+        pad: 0,
+        q_len: 1,
+        q_std: 0.01,
+    },
+    AbsorbedCase {
+        name: "decode_b1",
+        real: 1,
+        pad: 0,
+        q_len: 1,
+        q_std: 0.1,
+    },
+    AbsorbedCase {
+        name: "prefill_b5",
+        real: 5,
+        pad: 0,
+        q_len: 7,
+        q_std: 0.1,
+    },
+];
+
+/// Each real slot's encoder output in f64 and, per dimension, the sum of its magnitudes
+/// over the frames
+struct XaHost {
+    xa: Vec<Vec<f64>>,
+    abs_sum: Vec<Vec<f64>>,
+}
+
+/// `softmax(q xa^T) xa` in f64 for one query row of `Q'`, and each output's error bound
+/// for a kernel on these FP16 inputs that sums in FP32, rounds the softmax weights to FP16
+/// and the output to FP16: the weights' rounding (2^-11 relative, and 2^-25 absolute per
+/// frame in FP16's subnormal range, the row sum being at least 1), FP32 sums of up to 1500
+/// terms and the scores' FP32 rounding inside 2^-12 relative, then half an FP16 ulp
+fn absorbed_f64(q: &[u16], xa: &[f64], abs_sum: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let q: Vec<f64> = q.iter().map(|&b| h(b)).collect();
+    let scores: Vec<f64> = xa
+        .as_chunks::<STATE>()
+        .0
+        .iter()
+        .map(|x| x.iter().zip(&q).map(|(a, b)| a * b).sum())
+        .collect();
+    let mx = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    let (mut out, mut mag, mut l) = (vec![0f64; STATE], vec![0f64; STATE], 0f64);
+    for (x, &s) in xa.as_chunks::<STATE>().0.iter().zip(&scores) {
+        let p = (s - mx).exp();
+        l += p;
+        for ((o, m), &v) in out.iter_mut().zip(mag.iter_mut()).zip(x) {
+            *o += p * v;
+            *m += p * v.abs();
+        }
+    }
+
+    let rel = 2f64.powi(-11) + 2f64.powi(-12);
+    let bound = out
+        .iter_mut()
+        .zip(&mag)
+        .zip(abs_sum)
+        .map(|((o, &m), &a)| {
+            *o /= l;
+            let e = rel * m / l + 2f64.powi(-25) * a;
+            e + 0.5 * ulp16(o.abs() + e)
+        })
+        .collect();
+    (out, bound)
+}
+
+/// [`absorbed_f64`] for the first `tokens` tokens of `q` (`[tokens, HEADS, STATE]`), token
+/// `t` reading the slot of row `t / q_len`, across the host's cores
+fn absorbed_truth(
+    host: &XaHost,
+    q: &[u16],
+    slots: &[usize],
+    (tokens, q_len): (usize, usize),
+) -> (Vec<f64>, Vec<f64>) {
+    let n = tokens * HEADS;
+    let mut want = vec![0f64; n * STATE];
+    let mut bound = vec![0f64; n * STATE];
+    let threads = std::thread::available_parallelism().map_or(8, usize::from);
+    let per = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for ((w, b), first) in want
+            .chunks_mut(per * STATE)
+            .zip(bound.chunks_mut(per * STATE))
+            .zip((0..).step_by(per))
+        {
+            scope.spawn(move || {
+                for (i, (wr, br)) in w
+                    .as_chunks_mut::<STATE>()
+                    .0
+                    .iter_mut()
+                    .zip(b.as_chunks_mut::<STATE>().0)
+                    .enumerate()
+                {
+                    let qi = first + i;
+                    let slot = slots[qi / HEADS / q_len];
+                    let (o, e) = absorbed_f64(
+                        &q[qi * STATE..(qi + 1) * STATE],
+                        &host.xa[slot],
+                        &host.abs_sum[slot],
+                    );
+                    wr.copy_from_slice(&o);
+                    br.copy_from_slice(&e);
+                }
+            });
+        }
+    });
+    (want, bound)
+}
+
+/// The worst error of `got` as a fraction of its bound; fails on a non-finite output or a
+/// length mismatch
+fn absorbed_check(got: &[u16], want: &[f64], bound: &[f64]) -> Result<f64> {
+    ensure!(
+        got.len() == want.len() && want.len() == bound.len() && !want.is_empty(),
+        "{} outputs against {} references",
+        got.len(),
+        want.len()
+    );
+    let mut worst = 0f64;
+    for (i, ((&g, &w), &b)) in got.iter().zip(want).zip(bound).enumerate() {
+        let g = h(g);
+        ensure!(g.is_finite(), "output {i} is {g}");
+        worst = worst.max((g - w).abs() / b);
+    }
+
+    Ok(worst)
+}
+
+#[test]
+fn absorbed_cross_within_f64_bound() -> Result<()> {
+    if !numerics::gpu_enabled() {
+        return Ok(());
+    }
+
+    let gpu = Gpu::new(0)?;
+    let attn = DecoderAttn::new(&gpu)?;
+    let caches = KvCaches::new(&gpu, 1, XA_SLOTS)?;
+    let trash = caches.trash();
+    let mut rng = Rng::new(7);
+    let mut host = XaHost {
+        xa: Vec::new(),
+        abs_sum: Vec::new(),
+    };
+    for s in 0..XA_SLOTS {
+        let bits = rng.f16_normal(CROSS_LEN * STATE, 0.0, 1.0);
+        gpu.upload_to(caches.xa_slot(s)?, bytemuck::cast_slice(&bits))?;
+        let xa: Vec<f64> = bits.iter().map(|&b| h(b)).collect();
+        let mut abs_sum = vec![0f64; STATE];
+        for x in xa.as_chunks::<STATE>().0 {
+            for (a, &v) in abs_sum.iter_mut().zip(x) {
+                *a += v.abs();
+            }
+        }
+        host.xa.push(xa);
+        host.abs_sum.push(abs_sum);
+    }
+    // padding rows read the trash slot; NaN there shows any leak into real rows
+    let fill_trash = |bits: u16| -> Result<()> {
+        gpu.upload_to(
+            caches.xa_slot(trash)?,
+            bytemuck::cast_slice(&vec![bits; CROSS_LEN * STATE]),
+        )
+    };
+    fill_trash(F16_NAN)?;
+    let max_parts = gpu.sms().max(ABSORBED_MAX_SPLITS);
+
+    let mut failed = Vec::new();
+    for c in &ABSORBED_CASES {
+        let rows = c.real + c.pad;
+        let (tokens, real_tokens) = (rows * c.q_len, c.real * c.q_len);
+        let slots: Vec<usize> = (0..rows)
+            .map(|r| {
+                if r < c.real {
+                    (rng.next_u64() % XA_SLOTS as u64) as usize
+                } else {
+                    trash
+                }
+            })
+            .collect();
+        let q = rng.f16_normal(tokens * HEADS * STATE, 0.0, c.q_std);
+        let (want, bound) = absorbed_truth(&host, &q, &slots, (real_tokens, c.q_len));
+
+        let slot_buf = gpu.upload(slots.iter().map(|&s| s as i32).collect::<Vec<i32>>())?;
+        let batch = Batch {
+            slots: slot_buf.ptr(),
+            rows,
+            q_len: c.q_len,
+        };
+        let n = tokens * HEADS * STATE;
+        let real_n = real_tokens * HEADS * STATE;
+        let q = gpu.upload(q)?;
+        let out = gpu.alloc(n * 2)?;
+        let run = |plan: AbsorbedPlan| -> Result<Vec<u16>> {
+            gpu.upload_to(out.ptr(), bytemuck::cast_slice(&vec![F16_NAN; n]))?;
+            attn.cross_absorbed_with(&gpu, &caches, batch, (q.ptr(), out.ptr()), plan)?;
+            gpu.download(&out)
+        };
+
+        let default = attn.absorbed_plan(rows, c.q_len);
+        let mut plans = vec![default];
+        for splits in [1, 3, ABSORBED_MAX_SPLITS] {
+            let p = AbsorbedPlan::with_splits(splits);
+            if !plans.contains(&p) && p.splits * tokens <= max_parts {
+                plans.push(p);
+            }
+        }
+        let first = run(default)?;
+        for &plan in &plans {
+            let label = format!("{} splits of {} tiles", plan.splits, plan.tiles);
+            let got = if plan == default {
+                first.clone()
+            } else {
+                run(plan)?
+            };
+            match absorbed_check(&got[..real_n], &want, &bound) {
+                Ok(worst) => {
+                    println!(
+                        "{} (rows {rows}, {} real, q_len {}) {label}: worst error {worst:.3} of the bound",
+                        c.name, c.real, c.q_len
+                    );
+                    if worst > 1.0 {
+                        failed.push(format!("{} {label}: {worst:.3} of the bound", c.name));
+                    }
+                }
+                Err(e) => failed.push(format!("{} {label}: {e}", c.name)),
+            }
+        }
+
+        if run(default)? != first {
+            failed.push(format!("{}: the default plan isn't deterministic", c.name));
+        }
+        // zeros, what the model's never-written trash slot holds: the real rows keep their
+        // bits and the padding rows come out finite
+        fill_trash(0)?;
+        let clean = run(default)?;
+        fill_trash(F16_NAN)?;
+        if clean[..real_n] != first[..real_n] {
+            failed.push(format!("{}: real rows depend on the trash slot", c.name));
+        }
+        if !clean[real_n..].iter().all(|&b| h(b).is_finite()) {
+            failed.push(format!("{}: padding rows not finite", c.name));
+        }
+    }
+
+    ensure!(
+        failed.is_empty(),
+        "absorbed cross-attention failed: {failed:?}"
+    );
+    Ok(())
+}
+
+/// Bytes the bench clears out of L2 before each timed call (the 5090 has 96 MB)
+const FLUSH_BYTES: usize = 256 << 20;
+
+/// Per-layer GPU times of both cross-attention paths and their pieces at each decode
+/// bucket and two prefill shapes, the table behind `ABSORBED_MIN_ROWS`; asserts nothing
+///
+/// Runs with `WHISPERDRZ_CROSS_BENCH=1`. Each timed call follows an L2 flush unless its
+/// name ends in `warm`; `WHISPERDRZ_CROSS_BENCH_REPS` sets the repetitions (default 25)
+/// and the median is printed. With `WHISPERDRZ_NVTX_LIB` set, each call sits in an NVTX
+/// range `xb_<piece>_r<rows>q<q_len>` for `ncu --nvtx-include`
+#[test]
+fn cross_bench() -> Result<()> {
+    if std::env::var_os("WHISPERDRZ_CROSS_BENCH").is_none_or(|v| v != "1") {
+        eprintln!("skipping: WHISPERDRZ_CROSS_BENCH not set");
+        return Ok(());
+    }
+    let reps: usize = match std::env::var("WHISPERDRZ_CROSS_BENCH_REPS") {
+        Ok(v) => v.parse()?,
+        Err(_) => 25,
+    };
+
+    let gpu = Gpu::new(0)?;
+    let blas = Blas::new(&gpu)?;
+    let attn = DecoderAttn::new(&gpu)?;
+    let max_rows = 54;
+    // one layer: its zero K/V caches time the same as filled ones
+    let caches = KvCaches::new(&gpu, 1, max_rows)?;
+    let mut rng = Rng::new(11);
+    let xa0 = gpu.upload(rng.f16_normal(CROSS_LEN * STATE, 0.0, 1.0))?;
+    for s in 0..max_rows {
+        gpu.copy_dtod(xa0.ptr(), caches.xa_slot(s)?, XA_BYTES)?;
+    }
+    let wk = gpu.upload(rng.f16_normal(STATE * STATE, 0.0, 0.03))?;
+    let wv = gpu.upload(rng.f16_normal(STATE * STATE, 0.0, 0.03))?;
+    let bv = gpu.upload(rng.f16_normal(STATE, 0.0, 0.1))?;
+    let kv = CrossKv {
+        wk: wk.ptr(),
+        wv: wv.ptr(),
+        bv: bv.ptr(),
+    };
+    let flush = gpu.alloc(FLUSH_BYTES)?;
+    let max_parts = gpu.sms().max(ABSORBED_MAX_SPLITS);
+
+    let shapes = [
+        (1, 1),
+        (2, 1),
+        (4, 1),
+        (8, 1),
+        (16, 1),
+        (32, 1),
+        (42, 1),
+        (52, 1),
+        (54, 1),
+        (8, 7),
+        (52, 7),
+    ];
+    for (rows, q_len) in shapes {
+        let tokens = rows * q_len;
+        let slot_buf = gpu.upload((0..rows as i32).collect::<Vec<i32>>())?;
+        let batch = Batch {
+            slots: slot_buf.ptr(),
+            rows,
+            q_len,
+        };
+        let q = gpu.upload(rng.f16_normal(tokens * STATE, 0.0, 1.0))?;
+        let qk = gpu.upload(rng.f16_normal(tokens * HEADS * STATE, 0.0, 0.1))?;
+        let ok = gpu.alloc(tokens * HEADS * STATE * 2)?;
+        let out = gpu.alloc(tokens * STATE * 2)?;
+
+        let time = |name: &str, f: &dyn Fn() -> Result<()>| -> Result<()> {
+            // the first call builds cuBLASLt plans
+            f()?;
+            let warm = name.ends_with("warm");
+            let mut us = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                if !warm {
+                    gpu.memset_zero(flush.ptr(), FLUSH_BYTES)?;
+                }
+                let ms = gpu.time_ms(|| {
+                    let _range = nvtx::Range::new(&format!("xb_{name}_r{rows}q{q_len}"));
+                    f()
+                })?;
+                us.push(ms * 1000.0);
+            }
+            us.sort_by(f32::total_cmp);
+            let med = us[us.len() / 2];
+            println!(
+                "xbench rows {rows:2} q_len {q_len} {name:>14}: median {med:8.1} us, min {:8.1} us, xa at {:6.0} GB/s",
+                us[0],
+                (rows * XA_BYTES) as f64 / (f64::from(med) * 1e3)
+            );
+            Ok(())
+        };
+
+        // the K/V path: attn_decode_f16 over the cached keys and values, then the combine
+        let kv_path = || attn.cross_attn(&gpu, &caches, 0, batch, Rows::dense(q.ptr()), out.ptr());
+        time("kv", &kv_path)?;
+        time("kv_warm", &kv_path)?;
+
+        // the absorbed path: both projections around the fused kernel
+        time("qk", &|| kv.query_keys(&blas, q.ptr(), qk.ptr(), tokens))?;
+        time("values", &|| kv.values(&blas, ok.ptr(), out.ptr(), tokens))?;
+        let default = attn.absorbed_plan(rows, q_len);
+        let fused = |p: AbsorbedPlan| {
+            attn.cross_absorbed_with(&gpu, &caches, batch, (qk.ptr(), ok.ptr()), p)
+        };
+        time(&format!("fused_d{}", default.splits), &|| fused(default))?;
+        time("fused_warm", &|| fused(default))?;
+        time("absorbed", &|| {
+            kv.query_keys(&blas, q.ptr(), qk.ptr(), tokens)?;
+            fused(default)?;
+            kv.values(&blas, ok.ptr(), out.ptr(), tokens)
+        })?;
+        let mut seen = vec![default];
+        for splits in [1, 2, 3, 4, 6, 8, 16, 32, 94] {
+            let p = AbsorbedPlan::with_splits(splits);
+            if seen.contains(&p) || p.splits * tokens > max_parts {
+                continue;
+            }
+            seen.push(p);
+            time(&format!("fused_s{}", p.splits), &|| fused(p))?;
+        }
+    }
+
     Ok(())
 }

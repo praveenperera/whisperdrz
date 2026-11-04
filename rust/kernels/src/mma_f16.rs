@@ -104,6 +104,19 @@ impl FragA {
 #[repr(transparent)]
 pub struct FragB([u32; 2]);
 
+impl FragB {
+    pub const ZERO: Self = Self([0; 2]);
+
+    /// The fragment from its two registers: `b[0]` holds B rows `2 * (lane % 4)` and the
+    /// next, `b[1]` the same rows plus 8, both in column `lane / 4`, low half first. For a
+    /// B operand read straight from global memory, as the absorbed cross-attention keeps its
+    /// queries in registers for the whole kernel
+    #[inline(always)]
+    pub fn from_bits(b: [u32; 2]) -> Self {
+        Self(b)
+    }
+}
+
 /// A row-major tile of FP16 in shared memory with rows of `LD` elements
 #[derive(Clone, Copy)]
 pub struct SharedTile<const LD: usize> {
@@ -159,6 +172,19 @@ impl<const LD: usize> SharedTile<LD> {
         // the A register order
         let p = self.ldsm_addr::<true>(m0, k0);
         FragA(unsafe { ldmatrix_x4_shared_u32(p.0) })
+    }
+
+    /// The A fragment of rows `[m0, m0 + 16)` and columns `[k0, k0 + 16)` from a tile that
+    /// holds A transposed: tile rows are A's columns, at `(k0, m0)`
+    ///
+    /// # Safety
+    /// As [`SharedTile::frag_a`]
+    #[inline(always)]
+    pub unsafe fn frag_a_trans(self, k0: usize, m0: usize) -> FragA {
+        // transposed matrices in the A register order: depth k0.. at m0, k0.. at m0 + 8,
+        // k0 + 8.. at m0, k0 + 8.. at m0 + 8
+        let p = self.ldsm_addr::<false>(k0, m0);
+        FragA(unsafe { ldmatrix_x4_trans_shared_u32(p.0) })
     }
 
     /// The B fragments of columns `[n0, n0 + 8)` and `[n0 + 8, n0 + 16)`, depth `[k0, k0 +

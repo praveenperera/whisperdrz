@@ -20,6 +20,18 @@
 //! fills every layer's cross keys and values from the encoder output and zeroes the slot
 //! lengths, then runs a step at positions `0..q_len`
 //!
+//! Cross-attention runs one of two ways, chosen per batch shape by
+//! [`decoder_attn::uses_absorbed`]. Prefills and small decode buckets attend over the
+//! cached cross keys and values like the reference. Large decode buckets attend over the
+//! slot's encoder output `xa` instead, with each head's query through its key projection,
+//! `q'_h = q_h W_k,h / 8`, and the value projection applied to the softmax sum, `out_h =
+//! (softmax(q'_h xa^T) xa) W_v,h^T + b_v,h` ([`DecoderAttn::cross_absorbed`]), exact in
+//! real arithmetic since the key has no bias and the weights sum to 1. Its two per-head
+//! projections run as head-batched cuBLASLt GEMMs with FP32 sums, `q'` and the attention
+//! output rounded to FP16, the value bias in the second GEMM's FP32 epilogue. The
+//! reference rounds FP16 keys and values instead, so those outputs differ from torch's by
+//! FP16 rounding
+//!
 //! [`Decoder::step`] is capture safe: it reads tokens, positions and slots from the
 //! [`Workspace`]'s device arrays ([`Workspace::stage`] writes them, outside any capture)
 //! and enqueues a fixed sequence of launches with no allocation, synchronization or host
@@ -38,7 +50,7 @@
 use eyre::{Result, ensure, eyre};
 use half::f16;
 
-use super::decoder_attn::{Batch, DecoderAttn, KvCaches, Rows};
+use super::decoder_attn::{self, Batch, CrossKv, DecoderAttn, KvCaches, Rows};
 use super::device::{Arg, Buf, Gpu, blocks};
 use super::ops::{self, HeadView};
 use super::{Blas, Tensor, Weights};
@@ -226,6 +238,21 @@ impl Block {
             fc2: Linear::take(weights, &format!("{p}.mlp.2"), (D_MODEL, D_MLP), true)?,
         })
     }
+
+    /// The cross-attention key and value weights, for the absorbed attention's two
+    /// per-head GEMMs
+    fn cross_kv(&self) -> Result<CrossKv> {
+        let bv = self
+            .cross_v
+            .b
+            .as_ref()
+            .ok_or_else(|| eyre!("cross-attention value without a bias"))?;
+        Ok(CrossKv {
+            wk: self.cross_k.w.ptr(),
+            wv: self.cross_v.w.ptr(),
+            bv: bv.ptr(),
+        })
+    }
 }
 
 fn i32s(v: impl IntoIterator<Item = usize>, what: &str) -> Result<Vec<i32>> {
@@ -259,6 +286,11 @@ pub struct Workspace {
     logits: Buf,
     /// Cross K/V for prefills into non-consecutive slots, `[windows * 1500, 1280]`
     cross_scratch: Option<Buf>,
+    /// Absorbed cross-attention queries through the key projection `[rows, 20, 1280]`, for
+    /// decode steps only
+    qk: Buf,
+    /// Absorbed cross-attention output before the value projection `[rows, 20, 1280]`
+    ok: Buf,
 }
 
 impl Workspace {
@@ -286,6 +318,8 @@ impl Workspace {
             f: gpu.alloc(n * D_MLP * 2)?,
             logits: gpu.alloc(n * N_VOCAB * 2)?,
             cross_scratch: (max_windows > 0).then(|| gpu.alloc(cross)).transpose()?,
+            qk: gpu.alloc(max_rows * N_HEAD * D_MODEL * 2)?,
+            ok: gpu.alloc(max_rows * N_HEAD * D_MODEL * 2)?,
         })
     }
 
@@ -719,7 +753,16 @@ impl Decoder {
             SubOp::CrossLn => blk.cross_ln.add_apply(gpu, x, ao, h, n),
             SubOp::CrossAttn => {
                 blk.cross_q.apply_as(blas, gemm, h, qkv, n)?;
-                attn.cross_attn(gpu, caches, i, batch, Rows::dense(qkv), o)?;
+                if decoder_attn::uses_absorbed(batch.rows, batch.q_len) {
+                    let (qk, ok) = (ws.qk.ptr(), ws.ok.ptr());
+                    let kv = blk.cross_kv()?;
+                    kv.query_keys(blas, qkv, qk, n)?;
+                    attn.cross_absorbed(gpu, caches, batch, qk, ok)?;
+                    kv.values(blas, ok, o, n)?;
+                } else {
+                    attn.cross_attn(gpu, caches, i, batch, Rows::dense(qkv), o)?;
+                }
+
                 blk.cross_out.apply_as(blas, gemm, o, ao, n)
             }
             SubOp::MlpLn => blk.mlp_ln.add_apply(gpu, x, ao, h, n),

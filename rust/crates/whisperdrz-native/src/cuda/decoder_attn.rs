@@ -1,34 +1,83 @@
-//! Decoder attention on the GPU: the per-layer KV caches and the cuda-oxide kernels that
-//! append to them and attend over them
+//! Decoder attention on the GPU: the per-layer KV caches, the per-slot encoder outputs,
+//! and the cuda-oxide kernels that attend over them
 //!
 //! The reference runs `flash_attn_with_kvcache` twice per decoder layer. Self-attention
 //! appends each row's new keys and values at the slot's cache length and attends causally
 //! over the cache; cross-attention attends over the 1500 encoder positions of the slot,
-//! whose keys and values prefill computes once per window. Here both run on
-//! `attn_decode_f16` (`rust/kernels/src/attention.rs`), split over the keys when the batch
-//! is too small to fill the GPU, then merged by `attn_combine_f16`.
+//! whose keys and values prefill computes once per window. Here self-attention, and
+//! cross-attention for prefills and small decode buckets, run on `attn_decode_f16`
+//! (`rust/kernels/src/attention.rs`), split over the keys when the batch is too small to
+//! fill the GPU, then merged by `attn_combine_f16`.
+//!
+//! Large decode buckets ([`uses_absorbed`]) run cross-attention over the encoder output
+//! `xa` itself instead, with the key projection folded into the query and the value
+//! projection applied after the softmax sum (`softmax(q_h W_k,h xa^T) xa W_v,h^T + b_v,h`,
+//! exact in real arithmetic since the key has no bias and the weights sum to 1).
+//! [`DecoderAttn::cross_absorbed`] runs the middle, `O' = softmax(Q' xa^T) xa` per token
+//! and head, on `cross_absorb_f16` (`rust/kernels/src/cross.rs`); the decoder runs the two
+//! per-head projections around it ([`CrossKv`]). That reads `xa` (3.84 MB a row) once per
+//! layer instead of 7.68 MB of cached keys and values. The caches are still filled for
+//! every slot, since a slot moves between buckets as rows finish.
 //!
 //! # Layout
 //!
-//! Every cache is FP16 `[slots + 1, positions, HEADS, HEAD_DIM]`, token-major like the
+//! Every KV cache is FP16 `[slots + 1, positions, HEADS, HEAD_DIM]`, token-major like the
 //! reference's `FlashKVCache` and like the output of the K/V projection GEMMs, so prefill
 //! writes a window's cross keys and values with no transpose: self caches hold
-//! [`SELF_CAP`] positions, cross caches [`CROSS_LEN`]. Slot `slots` is the trash slot that
-//! CUDA-graph padding rows point at (the reference's `--pad-fix`): its length is reset to
-//! 0 after every step and its output is never read. All layers share one per-slot length
-//! array, since every layer appends the same tokens.
+//! [`SELF_CAP`] positions, cross caches [`CROSS_LEN`]. The encoder outputs are FP16
+//! `[slots + 1, CROSS_LEN, STATE]`, shared by every layer. Slot `slots` is the trash slot
+//! that CUDA-graph padding rows point at (the reference's `--pad-fix`): its length is reset
+//! to 0 after every step and its output is never read. All layers share one per-slot
+//! length array, since every layer appends the same tokens.
 //!
 //! # Capture safety
 //!
 //! Slot indices and lengths live on the device and every call is a fixed sequence of
 //! launches on the one stream, with no allocation, synchronization or host read, so a
-//! decode step can be captured into a CUDA graph per bucket. The split count depends only
-//! on the row count and the SM count, which a bucket fixes
+//! decode step can be captured into a CUDA graph per bucket. The path and the split count
+//! depend only on the row count, the tokens per row and the SM count, which a bucket fixes
 
 use eyre::{Result, ensure};
 
 use super::Blas;
+use super::blas::{BatchedKey, Strided};
 use super::device::{Arg, Buf, Gpu, blocks};
+
+/// Rows from which a decode step (one token a row) runs the absorbed cross-attention
+///
+/// Per-layer cross-attention time on the RTX 5090 (us, median of 25 with L2 flushed and
+/// every row on its own slot, `cross_bench` in `tests/gpu_decoder_attn.rs`): the K/V path
+/// is `attn_decode_f16` plus `attn_combine_f16`, the absorbed path the two projection GEMMs
+/// around `cross_absorb_f16` and `cross_combine_f16`
+///
+/// | rows | 1 | 2 | 4 | 8 | 16 | 32 | 42 | 52 | 54 |
+/// |------|---|---|---|---|----|----|----|----|----|
+/// | K/V | 16.4 | 20.0 | 28.7 | 48.7 | 85.4 | 165.4 | 204.8 | 254.0 | 264.2 |
+/// | absorbed | 41.0 | 41.0 | 47.1 | 58.3 | 81.9 | 123.9 | 151.6 | 180.2 | 182.3 |
+///
+/// The 16-row bucket stays on the K/V path: 4% is not worth the absorbed path's other
+/// rounding of the same attention. Below that the absorbed path pays for two GEMMs and a
+/// kernel that can't fill the GPU from a few rows. Prefills stay on the K/V path too: at 7
+/// tokens a row the absorbed kernel runs 140 query rows against the full `xa` per row and
+/// takes twice as long (52 rows: 733 us against 383)
+pub const ABSORBED_MIN_ROWS: usize = 32;
+
+/// Whether a batch of `rows` rows of `q_len` tokens runs the absorbed cross-attention
+/// ([`DecoderAttn::cross_absorbed`]) rather than the one over the K/V caches
+/// ([`DecoderAttn::cross_attn`]); see [`ABSORBED_MIN_ROWS`]
+pub fn uses_absorbed(rows: usize, q_len: usize) -> bool {
+    q_len == 1 && rows >= ABSORBED_MIN_ROWS
+}
+
+/// Frames per tile of `cross_absorb_f16` (`TILE` in `rust/kernels/src/cross.rs`)
+const CROSS_TILE: usize = 16;
+/// Tiles over the encoder frames
+pub const CROSS_TILES: usize = CROSS_LEN.div_ceil(CROSS_TILE);
+/// Dynamic shared memory of `cross_absorb_f16` (`SMEM_BYTES` there): two `[16, 1288]` FP16
+/// `xa` tiles, 8 partial `[20, 20]` FP32 score tiles, a `[32, 24]` FP16 P tile and three
+/// 24-float vectors
+const CROSS_SMEM: usize =
+    2 * CROSS_TILE * (STATE + 8) * 2 + 8 * HEADS * 20 * 4 + 32 * 24 * 2 + 3 * 24 * 4;
 
 /// Attention heads in each decoder layer
 pub const HEADS: usize = 20;
@@ -128,7 +177,113 @@ impl SplitPlan {
     }
 }
 
-/// Self- and cross-attention KV caches for every decoder layer, plus the per-slot lengths
+/// One layer's cross-attention key weight, value weight and value bias (device
+/// addresses), for the two per-head GEMMs around [`DecoderAttn::cross_absorbed`]
+#[derive(Clone, Copy, Debug)]
+pub struct CrossKv {
+    /// FP16 `[STATE, STATE]`, `nn.Linear` layout (output rows)
+    pub wk: u64,
+    pub wv: u64,
+    /// FP16 `[STATE]`
+    pub bv: u64,
+}
+
+impl CrossKv {
+    /// `qk[tok, h] = q[tok, h] @ W_k,h * SCALE` for every head: the cross query `[tokens,
+    /// STATE]` through each head's slice `W_k,h` (`[HEAD_DIM, STATE]`, rows `64h..` of the
+    /// key weight) into FP16 `[tokens, HEADS, STATE]`, the softmax scale (a power of two)
+    /// applied to the FP32 sum
+    pub fn query_keys(&self, blas: &Blas, q: u64, qk: u64, tokens: usize) -> Result<()> {
+        let key = BatchedKey {
+            // column-major [STATE, HEAD_DIM] views of each head's rows of W_k
+            a: Strided {
+                rows: STATE,
+                cols: HEAD_DIM,
+                ld: STATE,
+                stride: HEAD_DIM * STATE,
+            },
+            trans_a: false,
+            // the head's 64 query columns of each token
+            b: Strided {
+                rows: HEAD_DIM,
+                cols: tokens,
+                ld: STATE,
+                stride: HEAD_DIM,
+            },
+            // token rows of HEADS * STATE, head h at STATE * h
+            d: Strided {
+                rows: STATE,
+                cols: tokens,
+                ld: HEADS * STATE,
+                stride: STATE,
+            },
+            batch: HEADS,
+            bias_stride: None,
+        };
+        blas.matmul_batched(key, SCALE, (self.wk, q, qk), 0)
+    }
+
+    /// `out[tok, 64h..] = o[tok, h] @ W_v,h^T + b_v,h` for every head: the attention output
+    /// `[tokens, HEADS, STATE]` through each head's value rows into FP16 `[tokens, STATE]`,
+    /// the bias added in the FP32 epilogue
+    pub fn values(&self, blas: &Blas, o: u64, out: u64, tokens: usize) -> Result<()> {
+        let key = BatchedKey {
+            a: Strided {
+                rows: STATE,
+                cols: HEAD_DIM,
+                ld: STATE,
+                stride: HEAD_DIM * STATE,
+            },
+            trans_a: true,
+            b: Strided {
+                rows: STATE,
+                cols: tokens,
+                ld: HEADS * STATE,
+                stride: STATE,
+            },
+            d: Strided {
+                rows: HEAD_DIM,
+                cols: tokens,
+                ld: STATE,
+                stride: HEAD_DIM,
+            },
+            batch: HEADS,
+            bias_stride: Some(HEAD_DIM),
+        };
+        blas.matmul_batched(key, 1.0, (self.wv, o, out), self.bv)
+    }
+}
+
+/// How one absorbed cross-attention launch splits the encoder frames
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbsorbedPlan {
+    pub splits: usize,
+    /// 16-frame tiles per split; the last split takes what is left, at least one
+    pub tiles: usize,
+}
+
+impl AbsorbedPlan {
+    /// The plan closest to `splits` splits that leaves no split empty
+    pub fn with_splits(splits: usize) -> Self {
+        let tiles = CROSS_TILES.div_ceil(splits.clamp(1, CROSS_TILES));
+        Self {
+            splits: CROSS_TILES.div_ceil(tiles),
+            tiles,
+        }
+    }
+
+    /// The split for `tokens` tokens on `sms` SMs: one block per SM in one wave, since a
+    /// block holds an SM's registers and most of its shared memory, down to one tile a split
+    pub fn new(tokens: usize, sms: usize) -> Self {
+        Self::with_splits((sms / tokens.max(1)).clamp(1, ABSORBED_MAX_SPLITS))
+    }
+}
+
+/// Most splits [`AbsorbedPlan::new`] picks: one 16-frame tile each
+pub const ABSORBED_MAX_SPLITS: usize = CROSS_TILES;
+
+/// Self-attention KV caches for every decoder layer, the per-slot lengths, and each slot's
+/// encoder output, which cross-attention reads in every layer
 pub struct KvCaches {
     layers: usize,
     slots: usize,
@@ -136,8 +291,14 @@ pub struct KvCaches {
     self_v: Buf,
     cross_k: Buf,
     cross_v: Buf,
+    /// FP16 `[slots + 1, CROSS_LEN, STATE]`, the reference's `xa_cache`; the trash slot's
+    /// stays zero unless a test poisons it
+    xa: Buf,
     lens: Buf,
 }
+
+/// Bytes of one slot's encoder output
+pub const XA_BYTES: usize = CROSS_LEN * STATE * 2;
 
 impl KvCaches {
     /// Zeroed caches for `layers` layers and `slots` slots, plus the trash slot
@@ -152,6 +313,7 @@ impl KvCaches {
             self_v: gpu.zeros(self_bytes)?,
             cross_k: gpu.zeros(cross_bytes)?,
             cross_v: gpu.zeros(cross_bytes)?,
+            xa: gpu.zeros(n * XA_BYTES)?,
             lens: gpu.zeros(n * 4)?,
         })
     }
@@ -182,6 +344,7 @@ impl KvCaches {
             &self.self_v,
             &self.cross_k,
             &self.cross_v,
+            &self.xa,
             &self.lens,
         ]
         .iter()
@@ -299,6 +462,28 @@ impl KvCaches {
         Ok(())
     }
 
+    /// Device address of slot `slot`'s encoder output `[CROSS_LEN, STATE]`, the trash slot
+    /// included
+    pub fn xa_slot(&self, slot: usize) -> Result<u64> {
+        ensure!(slot <= self.slots, "encoder output of slot {slot}");
+        Ok(self.xa.at(slot * XA_BYTES))
+    }
+
+    /// Copies window `i` of the encoder output `xa` (`[windows * CROSS_LEN, STATE]` FP16)
+    /// into slot `slots[i]`, for the DTW forward and the absorbed cross-attention
+    pub fn store_xa(&self, gpu: &Gpu, xa: u64, slots: &[usize]) -> Result<()> {
+        ensure!(
+            slots.iter().all(|&s| s < self.slots),
+            "encoder outputs for slots {slots:?} outside the {} real slots",
+            self.slots
+        );
+        for (i, &s) in slots.iter().enumerate() {
+            gpu.copy_dtod(xa + (i * XA_BYTES) as u64, self.xa_slot(s)?, XA_BYTES)?;
+        }
+
+        Ok(())
+    }
+
     /// Sets the cache length of each row's slot to 0, before a prefill's layers run
     pub fn reset_lens(&self, gpu: &Gpu, batch: Batch) -> Result<()> {
         self.update_lens(gpu, batch, 0, 0)
@@ -327,25 +512,43 @@ impl KvCaches {
     }
 }
 
-/// The attention launches and their split-KV workspace
+/// The attention launches and their split workspaces
 pub struct DecoderAttn {
     sms: usize,
     part_o: Buf,
     part_lse: Buf,
     /// Partial results the workspace holds, `(row, token, head, split)` entries
     parts: usize,
+    /// The split cross-attention's partials, FP32 `[tokens, splits, HEADS, STATE]`, and
+    /// their log2-sum-exps `[tokens, splits, HEADS]`
+    cross_part_o: Buf,
+    cross_part_lse: Buf,
+    /// (token, split) pairs the cross partials hold
+    cross_parts: usize,
 }
 
 impl DecoderAttn {
     pub fn new(gpu: &Gpu) -> Result<Self> {
+        ensure!(
+            gpu.max_shared_per_block() >= CROSS_SMEM,
+            "cross-attention needs {CROSS_SMEM} bytes of shared memory per block; this GPU \
+             allows {}",
+            gpu.max_shared_per_block()
+        );
         // a plan splits only while rows * q_len * HEADS is under BLOCKS_PER_SM * sms, and
         // then makes fewer than BLOCKS_PER_SM * sms + rows * q_len * HEADS partials
         let parts = 2 * BLOCKS_PER_SM * gpu.sms();
+        // a split cross plan keeps tokens * splits at most sms, or ABSORBED_MAX_SPLITS when
+        // a single token gets more splits than that would allow
+        let cross_parts = gpu.sms().max(ABSORBED_MAX_SPLITS);
         Ok(Self {
             sms: gpu.sms(),
             part_o: gpu.alloc(parts * HEAD_DIM * 4)?,
             part_lse: gpu.alloc(parts * 4)?,
             parts,
+            cross_part_o: gpu.alloc(cross_parts * HEADS * STATE * 4)?,
+            cross_part_lse: gpu.alloc(cross_parts * HEADS * 4)?,
+            cross_parts,
         })
     }
 
@@ -354,9 +557,15 @@ impl DecoderAttn {
         SplitPlan::new(rows, q_len, SELF_CAP, self.sms)
     }
 
-    /// The split the next cross-attention launch for this batch shape uses
+    /// The split the next cross-attention launch over the K/V caches for this batch shape
+    /// uses
     pub fn cross_plan(&self, rows: usize, q_len: usize) -> SplitPlan {
         SplitPlan::new(rows, q_len, CROSS_LEN, self.sms)
+    }
+
+    /// The frame split the next absorbed cross-attention launch for this batch shape uses
+    pub fn absorbed_plan(&self, rows: usize, q_len: usize) -> AbsorbedPlan {
+        AbsorbedPlan::new(rows * q_len, self.sms)
     }
 
     /// Self-attention of `layer` for the batch's new tokens
@@ -414,6 +623,106 @@ impl DecoderAttn {
             (q, None),
             out,
         )
+    }
+
+    /// The middle of the absorbed cross-attention: for each token, `O' = softmax(Q' xa^T)
+    /// xa` with its 20 heads as the query rows and `xa` its row's slot's encoder output.
+    /// `q` is FP16 `Q'` `[rows * q_len, HEADS, STATE]` (each head's query through its key
+    /// projection, the softmax scale folded in), `out` FP16 `O'` in the same layout
+    pub fn cross_absorbed(
+        &self,
+        gpu: &Gpu,
+        caches: &KvCaches,
+        batch: Batch,
+        q: u64,
+        out: u64,
+    ) -> Result<()> {
+        self.cross_absorbed_with(
+            gpu,
+            caches,
+            batch,
+            (q, out),
+            self.absorbed_plan(batch.rows, batch.q_len),
+        )
+    }
+
+    /// [`DecoderAttn::cross_absorbed`] on an explicit frame split
+    pub fn cross_absorbed_with(
+        &self,
+        gpu: &Gpu,
+        caches: &KvCaches,
+        batch: Batch,
+        (q, out): (u64, u64),
+        plan: AbsorbedPlan,
+    ) -> Result<()> {
+        let tokens = batch.tokens();
+        ensure!(tokens > 0, "cross-attention over no tokens");
+        ensure!(
+            q.is_multiple_of(16) && out.is_multiple_of(16),
+            "cross-attention query at {q:#x} or output at {out:#x} misaligned"
+        );
+        ensure!(
+            plan.splits >= 1
+                && plan.tiles >= 1
+                && (plan.splits - 1) * plan.tiles < CROSS_TILES
+                && plan.splits * plan.tiles >= CROSS_TILES,
+            "cross plan {plan:?} leaves frames out or a split empty"
+        );
+        let split = plan.splits > 1;
+        let parts = tokens * plan.splits;
+        if split {
+            ensure!(
+                parts <= self.cross_parts,
+                "cross plan {plan:?} for {tokens} tokens overflows the {} partials",
+                self.cross_parts
+            );
+        }
+
+        let rows_elems = tokens * HEADS * STATE;
+        let out_arg = Arg::slice(out, rows_elems);
+        let (out_k, part_o, part_lse) = if split {
+            (
+                Arg::EMPTY,
+                Arg::slice(self.cross_part_o.ptr(), parts * HEADS * STATE),
+                Arg::slice(self.cross_part_lse.ptr(), parts * HEADS),
+            )
+        } else {
+            (out_arg, Arg::EMPTY, Arg::EMPTY)
+        };
+        gpu.launch(
+            "cross_absorb_f16",
+            (plan.splits as u32, u32::try_from(tokens)?, 1),
+            (256, 1, 1),
+            CROSS_SMEM as u32,
+            &[
+                out_k,
+                part_o,
+                part_lse,
+                caches.xa.slice::<u16>(),
+                Arg::slice(q, rows_elems),
+                batch.slots_arg(),
+                batch.q_len.into(),
+                plan.splits.into(),
+                plan.tiles.into(),
+            ],
+        )?;
+
+        if split {
+            gpu.launch(
+                "cross_combine_f16",
+                (u32::try_from(tokens * HEADS)?, (STATE / 256) as u32, 1),
+                (64, 1, 1),
+                0,
+                &[
+                    out_arg,
+                    Arg::slice(self.cross_part_o.ptr(), parts * HEADS * STATE),
+                    Arg::slice(self.cross_part_lse.ptr(), parts * HEADS),
+                    plan.splits.into(),
+                ],
+            )?;
+        }
+
+        Ok(())
     }
 
     fn launch(

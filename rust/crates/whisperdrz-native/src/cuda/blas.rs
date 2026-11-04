@@ -23,8 +23,10 @@ use cudarc::driver::sys::CUstream;
 
 use super::device::{Buf, Gpu};
 
+mod batched;
 mod decode;
 
+pub use batched::{BatchedKey, Strided};
 pub use decode::{LtAlgo, LtCandidate};
 
 /// The cuBLAS release torch 2.8.0+cu128 ships, as `cublasLtGetVersion` reports it
@@ -145,6 +147,8 @@ entry_points!(LtFns -> lt::cublasStatus_t {
     layout_create = "cublasLtMatrixLayoutCreate":
         fn(*mut lt::cublasLtMatrixLayout_t, lt::cudaDataType, u64, u64, i64);
     layout_destroy = "cublasLtMatrixLayoutDestroy": fn(lt::cublasLtMatrixLayout_t);
+    layout_set = "cublasLtMatrixLayoutSetAttribute":
+        fn(lt::cublasLtMatrixLayout_t, lt::cublasLtMatrixLayoutAttribute_t, *const c_void, usize);
     pref_create = "cublasLtMatmulPreferenceCreate": fn(*mut lt::cublasLtMatmulPreference_t);
     pref_destroy = "cublasLtMatmulPreferenceDestroy": fn(lt::cublasLtMatmulPreference_t);
     pref_set = "cublasLtMatmulPreferenceSetAttribute":
@@ -347,6 +351,8 @@ pub struct Blas {
     algo_plans: RefCell<HashMap<(LinearKey, LtAlgo), LinearPlan>>,
     /// Whether this GPU is the one the decode table was measured on
     decode_table: bool,
+    /// Plans of the strided-batched matmuls, see [`Blas::matmul_batched`]
+    batched_plans: RefCell<HashMap<BatchedKey, batched::BatchedPlan>>,
 }
 
 impl Blas {
@@ -371,6 +377,7 @@ impl Blas {
             decode_workspace,
             algo_plans: RefCell::default(),
             decode_table: decode::measured_on(gpu),
+            batched_plans: RefCell::default(),
         };
 
         let fns = &this.libs.blas;
@@ -751,6 +758,9 @@ impl Drop for Blas {
                 (f.layout_destroy)(plan.x);
                 (f.layout_destroy)(plan.y);
                 (f.desc_destroy)(plan.desc);
+            }
+            for plan in self.batched_plans.borrow().values() {
+                plan.destroy(self);
             }
 
             (f.destroy)(self.lt);

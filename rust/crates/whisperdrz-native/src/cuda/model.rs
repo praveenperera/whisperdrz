@@ -3,11 +3,12 @@
 //! [`crate::transcriber::Model`]
 //!
 //! Slots follow the reference's `--pad-fix` layout: `slots` real slots plus a trash slot
-//! that padding rows of a bucketed decode step write to. `xa_cache` holds each real
-//! slot's encoder output `[1500, 1280]` (the reference's `self.xa_cache`), which the DTW
-//! forward reads per row. Prefill runs on the encoder's contiguous output for the batch
-//! it just encoded, as the reference passes `xa` straight from `model.encoder` to
-//! `prefill_flash`, so the cross K/V GEMMs see torch's row count
+//! that padding rows of a bucketed decode step write to. The caches hold each slot's
+//! encoder output `[1500, 1280]` (the reference's `self.xa_cache`), which the DTW forward
+//! reads per row and the absorbed cross-attention of large decode buckets reads per
+//! layer. Prefill runs on the encoder's contiguous output for the batch it just encoded,
+//! as the reference passes `xa` straight from `model.encoder` to `prefill_flash`, so the
+//! cross K/V GEMMs see torch's row count
 
 use std::path::Path;
 use std::sync::Arc;
@@ -16,17 +17,14 @@ use eyre::{Result, ensure};
 use half::f16;
 
 use super::decoder::{self, Decoder, MAX_ROWS, N_LAYER, N_VOCAB, PREFILL_LEN};
-use super::decoder_attn::{Batch, DecoderAttn, KvCaches};
+use super::decoder_attn::{Batch, DecoderAttn, KvCaches, XA_BYTES};
 use super::ecapa2::Precision;
 use super::embedder::Embedder;
-use super::encoder::{D_MODEL, N_CTX, N_FRAMES, N_MELS, Workspace};
+use super::encoder::{N_FRAMES, N_MELS, Workspace};
 use super::{Blas, Buf, Encoder, Gpu, Priority, Weights, nvtx};
 use crate::dtw::{DtwBatch, Matrices};
 use crate::speaker::EMBED_DIM;
 use crate::transcriber::{DecodeStep, Logits, MelBatch, Model};
-
-/// Bytes of one slot's encoder output
-const XA_BYTES: usize = N_CTX * D_MODEL * 2;
 
 /// The batch a prefill most recently encoded: its slots, whose outputs sit contiguously
 /// in `GpuModel::xa_batch` in this order
@@ -44,9 +42,8 @@ pub struct GpuModel {
     decoder: Decoder,
     dec_ws: decoder::Workspace,
     attn: DecoderAttn,
+    /// Self- and cross-attention caches and each slot's encoder output
     caches: KvCaches,
-    /// `[slots, 1500, 1280]` FP16, the reference's `xa_cache`
-    xa_cache: Buf,
     /// `[max_batch, 1500, 1280]` FP16, the encoder output of the last encoded batch
     xa_batch: Buf,
     encoded: Encoded,
@@ -91,7 +88,6 @@ impl GpuModel {
             attn: DecoderAttn::new(&gpu)?,
             decoder,
             caches: KvCaches::new(&gpu, N_LAYER, slots)?,
-            xa_cache: gpu.zeros(slots * XA_BYTES)?,
             xa_batch: gpu.alloc(max_batch * XA_BYTES)?,
             encoded: Encoded::default(),
             mel: gpu.alloc(max_batch * N_MELS * N_FRAMES * 2)?,
@@ -161,14 +157,8 @@ impl GpuModel {
             self.xa_batch.ptr(),
             &mut self.enc_ws,
         )?;
-        for (i, &s) in slots.iter().enumerate() {
-            self.gpu.copy_dtod(
-                self.xa_batch.at(i * XA_BYTES),
-                self.xa_cache.at(s * XA_BYTES),
-                XA_BYTES,
-            )?;
-        }
-
+        self.caches
+            .store_xa(&self.gpu, self.xa_batch.ptr(), slots)?;
         self.encoded = Encoded {
             slots: slots.to_vec(),
         };
@@ -190,7 +180,7 @@ impl GpuModel {
             for (i, &s) in slots.iter().enumerate() {
                 ensure!(s < self.caches.slots(), "prefill slot {s}");
                 self.gpu.copy_dtod(
-                    self.xa_cache.at(s * XA_BYTES),
+                    self.caches.xa_slot(s)?,
                     self.xa_batch.at(i * XA_BYTES),
                     XA_BYTES,
                 )?;
@@ -255,7 +245,7 @@ impl GpuModel {
             .iter()
             .map(|&s| {
                 ensure!(s < self.caches.slots(), "DTW row on slot {s}");
-                Ok(self.xa_cache.at(s * XA_BYTES))
+                self.caches.xa_slot(s)
             })
             .collect::<Result<Vec<_>>>()?;
         self.decoder.dtw_prep(&self.gpu, &self.blas, batch, &xa)

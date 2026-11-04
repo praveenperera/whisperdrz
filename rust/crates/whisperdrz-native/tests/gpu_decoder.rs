@@ -9,6 +9,8 @@
 //! weights (`rust/tools/decoder_layers.py`): isolated (our layer N on torch FP16's input
 //! and caches) and chained (ours end to end from the tokens), on real rows only (padding
 //! rows must stay finite and can't change real rows, checked with a poisoned trash slot).
+//! These batches are far below `ABSORBED_MIN_ROWS`, so their cross-attention runs over the
+//! K/V caches; `tests/gpu_decoder_attn.rs` checks the absorbed path of large buckets.
 //! Each sub-op of each block (the three LayerNorms, self-attention, cross-attention, the
 //! MLP), run on torch FP16's input to it, must have max-abs and mean-abs errors at most
 //! 1.5x torch FP16's. Whole layers, isolated and chained, assert mean-abs at 1.5x and
@@ -1008,6 +1010,7 @@ fn decoder_layers_match_torch() -> Result<()> {
         // isolated: our layer N on torch FP16's layer N - 1 output and caches
         if phase == "prefill" {
             decoder.fill_cross(gpu, blas, &iso_kv, &ws, xa.ptr(), &p.slots)?;
+            iso_kv.store_xa(gpu, xa.ptr(), &p.slots)?;
         }
         load_torch_caches(gpu, &iso_kv, &dir)?;
         let batch = ws.stage(gpu, &p.tokens, &p.positions, &p.slots)?;
@@ -1117,6 +1120,7 @@ fn decoder_layers_match_torch() -> Result<()> {
         // chained: ours from the tokens on our own caches
         if phase == "prefill" {
             decoder.fill_cross(gpu, blas, &chain_kv, &ws, xa.ptr(), &p.slots)?;
+            chain_kv.store_xa(gpu, xa.ptr(), &p.slots)?;
             chain_kv.reset_lens(gpu, batch)?;
         }
         let (mut chain, mut noise_qkv, mut noise_sdpa, mut noise_eff) =
@@ -1181,6 +1185,7 @@ fn decoder_layers_match_torch() -> Result<()> {
 
         // the fused prefill / step on its own caches gives the chain bit for bit
         if phase == "prefill" {
+            fused_kv.store_xa(gpu, xa.ptr(), &p.slots)?;
             decoder.prefill(
                 gpu,
                 blas,
@@ -1378,8 +1383,9 @@ fn decoder_layers_match_torch() -> Result<()> {
     pads.print();
 
     // padding rows can't reach real rows: step1 after the same prefill, with the trash
-    // slot's caches clean, full of finite garbage at a long length, and full of NaN, and
-    // the padding row's token and position changed, gives the real rows bit for bit
+    // slot's caches and encoder output clean, full of finite garbage at a long length, and
+    // full of NaN, and the padding row's token and position changed, gives the real rows
+    // bit for bit
     let p0 = Phase::load(manifest, "prefill")?;
     let p1 = Phase::load(manifest, "step1")?;
     let real1 = p1.real_rows(slots_n)?;
@@ -1389,6 +1395,7 @@ fn decoder_layers_match_torch() -> Result<()> {
     let nan = vec![NAN16; SELF_CAP.max(CROSS_LEN) * D_MODEL];
     let mut logits_of =
         |kv: &KvCaches, fill: Option<(&[u16], i32)>, tok: u32, pos: i32| -> Result<Vec<u16>> {
+            kv.store_xa(gpu, xa.ptr(), &p0.slots)?;
             decoder.prefill(
                 gpu,
                 blas,
@@ -1410,6 +1417,13 @@ fn decoder_layers_match_torch() -> Result<()> {
                         gpu.upload_to(v, bytemuck::cast_slice(&fill[..n * D_MODEL]))?;
                     }
                 }
+
+                // the trash slot's encoder output, which the absorbed cross-attention of
+                // large buckets reads for padding rows
+                gpu.upload_to(
+                    kv.xa_slot(trash)?,
+                    bytemuck::cast_slice(&fill[..CROSS_LEN * D_MODEL]),
+                )?;
                 gpu.upload_to(
                     kv.lens().ptr() + 4 * trash as u64,
                     bytemuck::cast_slice(&[len]),
