@@ -1,6 +1,8 @@
 //! The GPU side of the transcriber as a trait: encoder, KV slots, prefill, the decode
 //! step, the DTW forward and the speaker embedder
 
+use std::sync::Arc;
+
 use eyre::{Result, ensure};
 use half::f16;
 
@@ -118,6 +120,32 @@ pub trait Model {
 
     /// `_embed_audio_segment`: the L2-normalised ECAPA2 embedding of 16 kHz audio
     fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]>;
+
+    /// Forgets every crop prefetched for an earlier file; the transcriber calls it at
+    /// the start and end of each `transcribe`
+    fn reset_embeds(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// A hint that `embed_crop(audio, start, len)` will be called for this file: a
+    /// model may embed the crop early, alongside decoding. It must not block
+    fn prefetch_embed(&mut self, _audio: &Arc<[f32]>, _start: usize, _len: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// The embedding of `audio[start..start + len]`, identical to [`Model::embed`] of
+    /// that slice; a model that prefetched the crop returns its early result
+    fn embed_crop(
+        &mut self,
+        audio: &Arc<[f32]>,
+        start: usize,
+        len: usize,
+    ) -> Result<[f32; EMBED_DIM]> {
+        let crop = audio
+            .get(start..start + len)
+            .ok_or_else(|| eyre::eyre!("crop {start}+{len} of {} samples", audio.len()))?;
+        self.embed(crop)
+    }
 
     /// Called before a prefill that runs on the side stream (`n_warm > 0` only)
     fn begin_async_prefill(&mut self) -> Result<()> {

@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use eyre::{Result, WrapErr, bail, ensure, eyre};
 use safetensors::SafeTensors;
@@ -24,7 +25,8 @@ use whisperdrz_native::cuda::device::{Arg, Buf};
 use whisperdrz_native::cuda::ecapa2::{
     Ecapa2, Grid, Precision, Se, Steps, conv3x3_layout, conv3x3_layout_f16, dft_basis, normalize,
 };
-use whisperdrz_native::cuda::{Blas, F32Math, Gpu};
+use whisperdrz_native::cuda::embedder::Embedder;
+use whisperdrz_native::cuda::{Blas, F32Math, Gpu, Operand, Priority};
 
 const N_FFT: usize = 511;
 const BINS: usize = 256;
@@ -1086,6 +1088,148 @@ fn embeddings_match_recorded() -> Result<()> {
     ensure!(
         min_truth > 0.9999,
         "embeddings off the FP32 truth: min cos {min_truth}"
+    );
+    Ok(())
+}
+
+/// The recorded segments' audio, in manifest order
+fn segment_audio(dir: &Path) -> Result<Vec<Vec<f32>>> {
+    let manifest: Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+    manifest["segments"]
+        .as_array()
+        .ok_or_else(|| eyre!("no segments"))?
+        .iter()
+        .map(|seg| {
+            let rel = seg["audio"]
+                .as_str()
+                .ok_or_else(|| eyre!("segment without audio"))?;
+            Ok(f32_npy(&dir.join(rel))?.1)
+        })
+        .collect()
+}
+
+/// The segments back to back as one file, with each segment's `(start, len)`
+fn as_file(segments: &[&Vec<f32>]) -> (Arc<[f32]>, Vec<(usize, usize)>) {
+    let mut audio = Vec::new();
+    let mut crops = Vec::new();
+    for s in segments {
+        crops.push((audio.len(), s.len()));
+        audio.extend_from_slice(s);
+    }
+
+    (audio.into(), crops)
+}
+
+/// The speaker embedder's background thread and stream give bit for bit the
+/// embeddings of the serial path on the main stream, while the main stream keeps the
+/// GPU busy, across a file change that reuses every `(start, len)` key
+#[test]
+fn background_embeddings_match_serial() -> Result<()> {
+    let Some((dir, weights)) = inputs() else {
+        return Ok(());
+    };
+    let segments = segment_audio(&dir)?;
+    ensure!(segments.len() >= 2, "{} segments", segments.len());
+    let forward: Vec<&Vec<f32>> = segments.iter().collect();
+    let backward: Vec<&Vec<f32>> = segments.iter().rev().collect();
+    let (file_a, crops_a) = as_file(&forward);
+    // the same total length with different audio under the same keys, so a cache that
+    // outlived its file would hand back the wrong embedding
+    let (file_b, _) = as_file(&backward);
+    let crops_b = crops_a.clone();
+
+    let gpu = Gpu::with_priority(0, Priority::High)?;
+    let blas = Blas::new(&gpu)?;
+    let serial_model = Ecapa2::load(&gpu, &weights, Precision::F16Convs)?;
+    let serial = |file: &Arc<[f32]>, crops: &[(usize, usize)]| -> Result<Vec<Vec<f32>>> {
+        crops
+            .iter()
+            .map(|&(s, n)| {
+                Ok(normalize(&serial_model.embed(
+                    &gpu,
+                    &blas,
+                    &file[s..s + n],
+                )?))
+            })
+            .collect()
+    };
+    let want_a = serial(&file_a, &crops_a)?;
+    let want_b = serial(&file_b, &crops_b)?;
+    drop(serial_model);
+
+    // main-stream load: large TF32 GEMMs queued without waiting
+    const N: usize = 4096;
+    let a = gpu.zeros(N * N * 4)?;
+    let b = gpu.zeros(N * N * 4)?;
+    let c = gpu.alloc(N * N * 4)?;
+    let load = || -> Result<()> {
+        for _ in 0..200 {
+            blas.gemm_f32(
+                F32Math::Tf32,
+                (false, false),
+                (N, N, N),
+                Operand::new(a.ptr(), N),
+                Operand::new(b.ptr(), N),
+                Operand::new(c.ptr(), N),
+                1,
+                0.0,
+            )?;
+        }
+        Ok(())
+    };
+
+    let same = |label: &str, got: &[f32], want: &[f32]| -> Result<()> {
+        ensure!(
+            got.len() == 192 && want.len() == 192,
+            "{label}: widths {} and {}",
+            got.len(),
+            want.len()
+        );
+        let diff = got
+            .iter()
+            .zip(want)
+            .position(|(g, w)| g.to_bits() != w.to_bits());
+        ensure!(
+            diff.is_none(),
+            "{label}: element {} is {} on the background stream, {} serially",
+            diff.unwrap_or(0),
+            got[diff.unwrap_or(0)],
+            want[diff.unwrap_or(0)]
+        );
+        Ok(())
+    };
+
+    let mut embedder = Embedder::spawn(0, &weights, Precision::F16Convs)?;
+    for (name, file, crops, want) in [
+        ("a", &file_a, &crops_a, &want_a),
+        ("b", &file_b, &crops_b, &want_b),
+    ] {
+        embedder.reset();
+        for &(s, n) in crops.iter() {
+            embedder.prefetch(file, s, n)?;
+        }
+
+        load()?;
+        for (i, &(s, n)) in crops.iter().enumerate() {
+            let got = embedder.embed_crop(file, s, n)?;
+            same(&format!("file {name} crop {i}"), &got, &want[i])?;
+        }
+
+        gpu.synchronize()?;
+    }
+
+    // the uncached path, and a crop asked for without a prefetch
+    let (s, n) = crops_a[1];
+    same("direct", &embedder.embed(&file_a[s..s + n])?, &want_a[1])?;
+    embedder.reset();
+    same(
+        "unprefetched",
+        &embedder.embed_crop(&file_a, s, n)?,
+        &want_a[1],
+    )?;
+    eprintln!(
+        "background embeddings match serial: {} crops x 2 files, under main-stream load",
+        crops_a.len()
     );
     Ok(())
 }

@@ -23,6 +23,7 @@ macro_rules! emit {
 }
 
 mod align;
+mod crops;
 mod graphs;
 mod model;
 mod probe;
@@ -46,8 +47,9 @@ pub use slot::{Chunk, Meta, SAMPLE_RATE, Slot};
 
 use crate::decode::{DecodeConfig, DecoderTables};
 use crate::post::{self, Segment};
-use crate::speaker::{self, CropRng};
+use crate::speaker::{self, CropRng, MIN_CROP_SECONDS};
 use crate::text::Token;
+use crops::CropPlanner;
 
 /// `Transcriber.__init__` settings the scheduler reads
 #[derive(Debug, Clone, PartialEq)]
@@ -128,6 +130,8 @@ pub struct Transcriber<M: Model> {
     pub(crate) prefill_events: Vec<(usize, PrefillEvent)>,
     pub(crate) batch_start: Option<Instant>,
     pub(crate) probe: Option<Probe>,
+    /// Crop planning for the speaker remap, while `transcribe` runs with it on
+    pub(crate) planner: Option<CropPlanner>,
 }
 
 impl<M: Model> Transcriber<M> {
@@ -174,6 +178,7 @@ impl<M: Model> Transcriber<M> {
             prefill_events: Vec::new(),
             batch_start: None,
             probe: None,
+            planner: None,
             config,
             model,
             mel,
@@ -218,8 +223,14 @@ impl<M: Model> Transcriber<M> {
     /// `transcribe(audio)`: splits 16 kHz mono audio into `max_audio_length`
     /// chunks, transcribes them all, joins the predictions in chunk order, remaps
     /// speakers (`rng` is the global `random` state the line crops draw from) and
-    /// runs the final merge, repair and renumbering
-    pub fn transcribe(&mut self, audio: &[f32], rng: &mut impl CropRng) -> Result<Transcription> {
+    /// runs the final merge, repair and renumbering. With the remap on, each crop is
+    /// handed to [`Model::prefetch_embed`] once the chunks it depends on finish (see
+    /// [`crops`]), so the model can embed it alongside decoding
+    pub fn transcribe<R: CropRng + Clone + 'static>(
+        &mut self,
+        audio: &[f32],
+        rng: &mut R,
+    ) -> Result<Transcription> {
         let audio: Arc<[f32]> = Arc::from(audio);
         let chunk_len = (self.config.max_audio_length * SAMPLE_RATE as f64) as usize;
         let mut chunks = Vec::new();
@@ -236,6 +247,12 @@ impl<M: Model> Transcriber<M> {
             start += chunk_len;
         }
 
+        self.model.reset_embeds()?;
+        self.planner = self
+            .config
+            .speaker_remap
+            .then(|| CropPlanner::new(audio.clone(), Box::new(rng.clone()), chunks.len()));
+
         let mut results = Vec::new();
         self.pending.extend(chunks);
         while self.busy() {
@@ -243,6 +260,8 @@ impl<M: Model> Transcriber<M> {
                 results.extend(r);
             }
         }
+
+        self.planner = None;
 
         // continuous batching finishes chunks out of order
         let mut keyed = results
@@ -265,18 +284,32 @@ impl<M: Model> Transcriber<M> {
                 &combined,
                 audio.len(),
                 rng,
-                |start, len| model.embed(&audio[start..start + len]),
+                |start, len| model.embed_crop(&audio, start, len),
                 threshold,
-                1.0,
+                MIN_CROP_SECONDS,
             )?;
             Ok(r.text)
         })?;
+        self.model.reset_embeds()?;
 
         Ok(Transcription {
             text: transcript.text,
             segments: transcript.segments,
             raw_chunks,
         })
+    }
+
+    /// Hands a finished chunk to the crop planner, when `transcribe` runs one
+    pub(crate) fn plan_crops(&mut self, result: &ChunkResult) -> Result<()> {
+        let Some(mut planner) = self.planner.take() else {
+            return Ok(());
+        };
+
+        let planned = chunk_number(&result.id)
+            .and_then(|n| Ok(usize::try_from(n)?))
+            .and_then(|n| planner.finished(n, &result.prediction, &mut self.model));
+        self.planner = Some(planner);
+        planned
     }
 
     /// `__call__(chunks)`: queues chunks for pipeline use, first draining while

@@ -31,6 +31,50 @@ pub struct LineCrop {
     pub len: usize,
 }
 
+/// Lines shorter than this are not embedded (`min_duration` of the remap)
+pub const MIN_CROP_SECONDS: f64 = 1.0;
+/// Lines longer than this are embedded from a random window (`max_duration`)
+pub const MAX_CROP_SECONDS: f64 = 10.0;
+
+/// The samples a segment's crop comes from, before any random window
+enum LineSpan {
+    /// The whole span is the crop: no random draw
+    Fixed { start: i64, end: i64 },
+    /// Longer than `max_duration`: the crop is a random window of the span
+    Random { start: i64, duration: i64 },
+}
+
+/// The span of one segment in a file of `audio_len` samples, `None` for crowd lines
+/// and lines under `min_duration`
+fn line_span(
+    audio_len: usize,
+    seg: &crate::post::Segment,
+    min_duration: f64,
+    max_duration: f64,
+) -> Option<(i64, LineSpan)> {
+    let Speaker::Id(speaker) = seg.speaker else {
+        return None;
+    };
+    // `int(max(0, start) * 16000)`: `int()` truncates toward zero
+    let s = (py::max(0.0, seg.start) * SAMPLE_RATE) as i64;
+    let mut e = (seg.end * SAMPLE_RATE) as i64;
+    if e > audio_len as i64 {
+        e = audio_len as i64;
+    }
+
+    let duration = e - s;
+    if duration < (min_duration * SAMPLE_RATE) as i64 {
+        return None;
+    }
+
+    let span = if duration > (max_duration * SAMPLE_RATE) as i64 {
+        LineSpan::Random { start: s, duration }
+    } else {
+        LineSpan::Fixed { start: s, end: e }
+    };
+    Some((speaker, span))
+}
+
 /// `extract_line_audio_segments(audio, text, min_duration, max_duration)` over a
 /// file of `audio_len` samples: one crop per non-crowd segment lasting at least
 /// `min_duration`; segments longer than `max_duration` get a random window of 3 s to
@@ -40,34 +84,25 @@ pub fn extract_line_audio_segments(
     text: &str,
     min_duration: f64,
     max_duration: f64,
-    rng: &mut impl CropRng,
+    rng: &mut (impl CropRng + ?Sized),
 ) -> Result<Vec<LineCrop>> {
     const MIN_WINDOW: f64 = 3.0;
 
     let mut out = Vec::new();
     for (line, seg) in parse_to_segments(text)?.iter().enumerate() {
-        let Speaker::Id(speaker) = seg.speaker else {
+        let Some((speaker, span)) = line_span(audio_len, seg, min_duration, max_duration) else {
             continue;
         };
-        // `int(max(0, start) * 16000)`: `int()` truncates toward zero
-        let mut s = (py::max(0.0, seg.start) * SAMPLE_RATE) as i64;
-        let mut e = (seg.end * SAMPLE_RATE) as i64;
-        if e > audio_len as i64 {
-            e = audio_len as i64;
-        }
 
-        let duration = e - s;
-        if duration < (min_duration * SAMPLE_RATE) as i64 {
-            continue;
-        }
-
-        let max_samples = (max_duration * SAMPLE_RATE) as i64;
-        if duration > max_samples {
-            let window =
-                ((rng.uniform(MIN_WINDOW, max_duration) * SAMPLE_RATE) as i64).min(duration);
-            s += rng.randint(0, duration - window)?;
-            e = s + window;
-        }
+        let (s, e) = match span {
+            LineSpan::Fixed { start, end } => (start, end),
+            LineSpan::Random { start, duration } => {
+                let window =
+                    ((rng.uniform(MIN_WINDOW, max_duration) * SAMPLE_RATE) as i64).min(duration);
+                let s = start + rng.randint(0, duration - window)?;
+                (s, s + window)
+            }
+        };
 
         out.push(LineCrop {
             line,
@@ -78,6 +113,28 @@ pub fn extract_line_audio_segments(
     }
 
     Ok(out)
+}
+
+/// The crops of [`extract_line_audio_segments`] that draw nothing from the rng, as
+/// `(start, len)`: a line's crop depends on the rng only when the line is longer than
+/// `max_duration`, so these are exact from the line's own text
+pub fn fixed_line_crops(
+    audio_len: usize,
+    text: &str,
+    min_duration: f64,
+    max_duration: f64,
+) -> Result<Vec<(usize, usize)>> {
+    Ok(parse_to_segments(text)?
+        .iter()
+        .filter_map(
+            |seg| match line_span(audio_len, seg, min_duration, max_duration)? {
+                (_, LineSpan::Fixed { start, end }) => {
+                    Some((start as usize, (end - start) as usize))
+                }
+                (_, LineSpan::Random { .. }) => None,
+            },
+        )
+        .collect())
 }
 
 /// What a remap did, for logging and parity checks
@@ -115,7 +172,7 @@ pub fn remap_speakers_per_line(
         return Ok(unchanged(Vec::new()));
     }
 
-    let crops = extract_line_audio_segments(audio_len, text, min_duration, 10.0, rng)?;
+    let crops = extract_line_audio_segments(audio_len, text, min_duration, MAX_CROP_SECONDS, rng)?;
     if crops.is_empty() {
         return Ok(unchanged(crops));
     }

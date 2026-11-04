@@ -12,7 +12,7 @@
 //! next. Each label in [`REQUIRED`] must be checked at least once per trace set
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -174,6 +174,11 @@ struct Replay {
     /// The `decode_batch` event between its before and after probes
     decode: Option<Recorded>,
     buckets: Vec<usize>,
+    /// Crops the planner prefetched for the current file, and those since embedded
+    prefetched: HashSet<(usize, usize)>,
+    embedded: HashSet<(usize, usize)>,
+    /// Crops the remap embedded, over every file
+    crop_embeds: usize,
 }
 
 impl Replay {
@@ -774,6 +779,48 @@ impl Model for FakeModel {
         })
     }
 
+    fn reset_embeds(&mut self) -> Result<()> {
+        let mut r = self.0.borrow_mut();
+        // every prefetched crop must be one the remap embeds, so early work is never wasted
+        let unused: Vec<_> = r.prefetched.difference(&r.embedded).copied().collect();
+        r.check("prefetch_unused", unused.is_empty(), || {
+            format!("prefetched but never embedded: {unused:?}")
+        });
+        r.prefetched.clear();
+        r.embedded.clear();
+        Ok(())
+    }
+
+    fn prefetch_embed(&mut self, audio: &Arc<[f32]>, start: usize, len: usize) -> Result<()> {
+        let mut r = self.0.borrow_mut();
+        ensure!(
+            Arc::ptr_eq(audio, &r.audio) || **audio == *r.audio,
+            "prefetch from other audio"
+        );
+        r.prefetched.insert((start, len));
+        Ok(())
+    }
+
+    fn embed_crop(
+        &mut self,
+        audio: &Arc<[f32]>,
+        start: usize,
+        len: usize,
+    ) -> Result<[f32; EMBED_DIM]> {
+        {
+            let mut r = self.0.borrow_mut();
+            // the planner must have named every crop before the remap asks for it
+            let hit = r.prefetched.contains(&(start, len));
+            r.check("prefetch_hit", hit, || {
+                format!("crop {start}+{len} was never prefetched")
+            });
+            r.embedded.insert((start, len));
+            r.crop_embeds += 1;
+        }
+
+        self.embed(&audio[start..start + len])
+    }
+
     fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]> {
         let mut r = self.0.borrow_mut();
         let ev = r
@@ -866,6 +913,9 @@ fn replay_file(
         audio: audio.clone(),
         decode: None,
         buckets: captured_buckets(config.bs),
+        prefetched: HashSet::new(),
+        embedded: HashSet::new(),
+        crop_embeds: 0,
     }));
 
     let mel_replay = replay.clone();
@@ -966,6 +1016,12 @@ fn replay(name: &str, config: Config) -> Result<()> {
             "{name}: {label} never checked"
         );
     }
+
+    // every remap crop went through `embed_crop` after a prefetch named it
+    ensure!(
+        checks.get("prefetch_hit").copied().unwrap_or(0) > 0,
+        "{name}: no remap crop was checked against the prefetches"
+    );
 
     Ok(())
 }

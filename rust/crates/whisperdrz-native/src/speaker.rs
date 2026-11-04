@@ -9,4 +9,7 @@ pub mod torch_cpu;
 
 pub use cluster::{Clustering, MergeStep, cluster_speakers};
 pub use pyrandom::{CropRng, PyRandom};
-pub use remap::{EMBED_DIM, LineCrop, Remap, extract_line_audio_segments, remap_speakers_per_line};
+pub use remap::{
+    EMBED_DIM, LineCrop, MAX_CROP_SECONDS, MIN_CROP_SECONDS, Remap, extract_line_audio_segments,
+    fixed_line_crops, remap_speakers_per_line,
+};

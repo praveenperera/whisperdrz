@@ -10,15 +10,17 @@
 //! `prefill_flash`, so the cross K/V GEMMs see torch's row count
 
 use std::path::Path;
+use std::sync::Arc;
 
 use eyre::{Result, ensure};
 use half::f16;
 
 use super::decoder::{self, Decoder, MAX_ROWS, N_LAYER, N_VOCAB, PREFILL_LEN};
 use super::decoder_attn::{Batch, DecoderAttn, KvCaches};
-use super::ecapa2::{self, Ecapa2, Precision};
+use super::ecapa2::Precision;
+use super::embedder::Embedder;
 use super::encoder::{D_MODEL, N_CTX, N_FRAMES, N_MELS, Workspace};
-use super::{Blas, Buf, Encoder, Gpu, Weights, nvtx};
+use super::{Blas, Buf, Encoder, Gpu, Priority, Weights, nvtx};
 use crate::dtw::{DtwBatch, Matrices};
 use crate::speaker::EMBED_DIM;
 use crate::transcriber::{DecodeStep, Logits, MelBatch, Model};
@@ -52,7 +54,8 @@ pub struct GpuModel {
     mel: Buf,
     /// `i32 [slots + 1]` slot indices for length updates issued from the host
     slot_ids: Buf,
-    ecapa: Ecapa2,
+    /// ECAPA2 on its own thread and background stream
+    embedder: Embedder,
 }
 
 impl GpuModel {
@@ -64,7 +67,14 @@ impl GpuModel {
             (1..=slots).contains(&max_batch),
             "encoder batch {max_batch} for {slots} slots"
         );
-        let gpu = Gpu::new(0)?;
+        // torch runs ECAPA2's convs in TF32 by default; full FP32 ran on SIMT cores and
+        // took over a third of the wall time. FP16 inputs to the trunk convs (FP32 sums)
+        // halve the TF32 GEMM time again and keep every layer within 1.5x of torch's
+        // TF32 error
+        let embedder = Embedder::spawn(0, ecapa, Precision::F16Convs)?;
+        // the decoder's stream outranks the embedder's, so speaker embeddings fill the
+        // decoder's idle time instead of delaying its steps
+        let gpu = Gpu::with_priority(0, Priority::High)?;
         let blas = Blas::new(&gpu)?;
         let mut weights = Weights::load(&gpu, whisper, |name| !name.starts_with("speaker_head"))?;
         let encoder = Encoder::new(&gpu, &mut weights)?;
@@ -86,11 +96,7 @@ impl GpuModel {
             encoded: Encoded::default(),
             mel: gpu.alloc(max_batch * N_MELS * N_FRAMES * 2)?,
             slot_ids: gpu.alloc((slots + 1) * 4)?,
-            // torch runs ECAPA2's convs in TF32 by default; full FP32 ran on SIMT cores and
-            // took over a third of the wall time. FP16 inputs to the trunk convs (FP32 sums)
-            // halve the TF32 GEMM time again and keep every layer within 1.5x of torch's
-            // TF32 error
-            ecapa: Ecapa2::load(&gpu, ecapa, Precision::F16Convs)?,
+            embedder,
             encoder,
             blas,
             gpu,
@@ -263,11 +269,7 @@ impl GpuModel {
 
     /// `_embed_audio_segment`: the L2-normalised ECAPA2 embedding of 16 kHz audio
     pub fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]> {
-        let e = self.ecapa.embed(&self.gpu, &self.blas, audio)?;
-        let n = ecapa2::normalize(&e);
-        n.try_into().map_err(|v: Vec<f32>| {
-            eyre::eyre!("ECAPA2 embedding of {} values, want {EMBED_DIM}", v.len())
-        })
+        self.embedder.embed(audio)
     }
 }
 
@@ -300,5 +302,24 @@ impl Model for GpuModel {
     fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]> {
         let _range = nvtx::Range::new("embed");
         GpuModel::embed(self, audio)
+    }
+
+    fn reset_embeds(&mut self) -> Result<()> {
+        self.embedder.reset();
+        Ok(())
+    }
+
+    fn prefetch_embed(&mut self, audio: &Arc<[f32]>, start: usize, len: usize) -> Result<()> {
+        self.embedder.prefetch(audio, start, len)
+    }
+
+    fn embed_crop(
+        &mut self,
+        audio: &Arc<[f32]>,
+        start: usize,
+        len: usize,
+    ) -> Result<[f32; EMBED_DIM]> {
+        let _range = nvtx::Range::new("embed");
+        self.embedder.embed_crop(audio, start, len)
     }
 }

@@ -188,6 +188,20 @@ impl Kernel {
     }
 }
 
+/// Where a [`Gpu`]'s stream sits in the block scheduler, which hands free SMs to
+/// pending blocks of higher-priority streams first. Blocks already running are never
+/// preempted, so a background stream still delays the others by up to one of its blocks
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Priority {
+    /// The CUDA default, which is the lowest priority
+    Default,
+    /// The greatest priority the context offers, for latency-bound work
+    High,
+    /// The lowest priority, with host waits that sleep rather than spin, so a helper
+    /// thread waiting on the GPU leaves its core to the host work beside it
+    Background,
+}
+
 /// The GPU: context, stream, pool and the kernel module
 pub struct Gpu {
     device: Arc<Device>,
@@ -200,6 +214,9 @@ pub struct Gpu {
     /// Host sources of asynchronous uploads, kept until the stream next synchronizes
     pending: RefCell<Vec<Box<dyn Any + Send>>>,
     pending_bytes: Cell<usize>,
+    /// A blocking-sync event that [`Gpu::synchronize`] waits on instead of the stream,
+    /// for [`Priority::Background`]
+    sleep_event: Option<cu::CUevent>,
 }
 
 // CUDA handles work from any thread once the context is current there, and Gpu isn't
@@ -208,6 +225,12 @@ unsafe impl Send for Gpu {}
 
 impl Gpu {
     pub fn new(ordinal: usize) -> Result<Self> {
+        Self::with_priority(ordinal, Priority::Default)
+    }
+
+    /// A GPU handle with its own stream at `priority`, pool and module, on the device's
+    /// primary context, so handles made on several threads share one context
+    pub fn with_priority(ordinal: usize, priority: Priority) -> Result<Self> {
         check_driver()?;
         let ctx =
             CudaContext::new(ordinal).wrap_err_with(|| format!("open CUDA device {ordinal}"))?;
@@ -221,7 +244,19 @@ impl Gpu {
 
         // a single stream, so cudarc's cross-stream event tracking is pure overhead
         unsafe { ctx.disable_event_tracking() };
-        let stream = ctx.new_stream()?;
+        // the context is current on this thread from `CudaContext::new`
+        let (least, greatest) = cur::stream::get_priority_range()?;
+        let stream = match priority {
+            Priority::Default => ctx.new_stream()?,
+            Priority::High => ctx.new_stream_with_priority(greatest)?,
+            Priority::Background => ctx.new_stream_with_priority(least)?,
+        };
+        let sleep_event = match priority {
+            Priority::Background => Some(cur::event::create(
+                cu::CUevent_flags::CU_EVENT_BLOCKING_SYNC,
+            )?),
+            _ => None,
+        };
         let device = Arc::new(Device {
             pool: create_pool(&ctx)?,
             stream,
@@ -236,6 +271,7 @@ impl Gpu {
             cc: (major, minor),
             pending: RefCell::default(),
             pending_bytes: Cell::new(0),
+            sleep_event,
         })
     }
 
@@ -253,7 +289,14 @@ impl Gpu {
     }
 
     pub fn synchronize(&self) -> Result<()> {
-        self.device.stream.synchronize()?;
+        match self.sleep_event {
+            // SAFETY: the event belongs to this handle and lives until it drops
+            Some(event) => unsafe {
+                cur::event::record(event, self.cu_stream())?;
+                cu::cuEventSynchronize(event).result()?;
+            },
+            None => self.device.stream.synchronize()?,
+        }
         self.pending.borrow_mut().clear();
         self.pending_bytes.set(0);
         Ok(())
@@ -366,6 +409,14 @@ impl Gpu {
             host.len(),
             src.bytes
         );
+        // a copy to pageable memory returns only once the stream drains, and while it
+        // waits it holds up other threads' pageable copies (nsys: the decoder's logits
+        // download waited out whole background embeds). A background stream drains first
+        // on its sleeping event, so its copy finds the stream idle
+        if self.sleep_event.is_some() {
+            self.synchronize()?;
+        }
+
         if !host.is_empty() {
             unsafe { cur::memcpy_dtoh_async(host, src.ptr + offset as u64, self.cu_stream())? };
         }
@@ -456,6 +507,9 @@ impl Drop for Gpu {
             let _ = self.device.stream.synchronize();
             unsafe {
                 let _ = cur::module::unload(self.module);
+                if let Some(event) = self.sleep_event {
+                    let _ = cur::event::destroy(event);
+                }
             }
         }
     }

@@ -506,6 +506,7 @@ impl<M: Model> Transcriber<M> {
             let mut needing_continue = Vec::new();
             for (slot_idx, result) in finished.into_iter().zip(results) {
                 if let Some(r) = result {
+                    self.plan_crops(&r)?;
                     completed.push(r);
                 }
 
