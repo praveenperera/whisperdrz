@@ -195,6 +195,8 @@ pub struct Gpu {
     functions: RefCell<HashMap<&'static str, Kernel>>,
     /// Streaming multiprocessors, for grids sized to whole waves
     sms: usize,
+    /// Compute capability, major and minor
+    cc: (i32, i32),
     /// Host sources of asynchronous uploads, kept until the stream next synchronizes
     pending: RefCell<Vec<Box<dyn Any + Send>>>,
     pending_bytes: Cell<usize>,
@@ -231,6 +233,7 @@ impl Gpu {
             module,
             functions: RefCell::default(),
             sms,
+            cc: (major, minor),
             pending: RefCell::default(),
             pending_bytes: Cell::new(0),
         })
@@ -238,6 +241,11 @@ impl Gpu {
 
     pub fn sms(&self) -> usize {
         self.sms
+    }
+
+    /// Compute capability as `(major, minor)`
+    pub fn compute_capability(&self) -> (i32, i32) {
+        self.cc
     }
 
     pub fn cu_stream(&self) -> CUstream {
@@ -249,6 +257,25 @@ impl Gpu {
         self.pending.borrow_mut().clear();
         self.pending_bytes.set(0);
         Ok(())
+    }
+
+    /// GPU time in milliseconds of the work `enqueue` puts on the stream, from events
+    /// recorded around it. Synchronizes, so call it outside a graph capture
+    pub fn time_ms(&self, enqueue: impl FnOnce() -> Result<()>) -> Result<f32> {
+        let flags = cu::CUevent_flags::CU_EVENT_DEFAULT;
+        let (start, end) = (cur::event::create(flags)?, cur::event::create(flags)?);
+        let timed = (|| {
+            unsafe { cur::event::record(start, self.cu_stream())? };
+            enqueue()?;
+            unsafe { cur::event::record(end, self.cu_stream())? };
+            self.synchronize()?;
+            Ok(unsafe { cur::event::elapsed(start, end)? })
+        })();
+        unsafe {
+            let _ = cur::event::destroy(start);
+            let _ = cur::event::destroy(end);
+        }
+        timed
     }
 
     pub fn alloc(&self, bytes: usize) -> Result<Buf> {

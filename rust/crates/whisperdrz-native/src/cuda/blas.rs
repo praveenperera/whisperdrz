@@ -23,6 +23,10 @@ use cudarc::driver::sys::CUstream;
 
 use super::device::{Buf, Gpu};
 
+mod decode;
+
+pub use decode::{LtAlgo, LtCandidate};
+
 /// The cuBLAS release torch 2.8.0+cu128 ships, as `cublasLtGetVersion` reports it
 const CUBLAS_VERSION: usize = 120804;
 
@@ -156,6 +160,40 @@ entry_points!(LtFns -> lt::cublasStatus_t {
         c_int,
         *mut lt::cublasLtMatmulHeuristicResult_t,
         *mut c_int,
+    );
+    algo_init = "cublasLtMatmulAlgoInit": fn(
+        lt::cublasLtHandle_t,
+        lt::cublasComputeType_t,
+        lt::cudaDataType_t,
+        lt::cudaDataType_t,
+        lt::cudaDataType_t,
+        lt::cudaDataType_t,
+        lt::cudaDataType_t,
+        c_int,
+        *mut lt::cublasLtMatmulAlgo_t,
+    );
+    algo_check = "cublasLtMatmulAlgoCheck": fn(
+        lt::cublasLtHandle_t,
+        lt::cublasLtMatmulDesc_t,
+        lt::cublasLtMatrixLayout_t,
+        lt::cublasLtMatrixLayout_t,
+        lt::cublasLtMatrixLayout_t,
+        lt::cublasLtMatrixLayout_t,
+        *const lt::cublasLtMatmulAlgo_t,
+        *mut lt::cublasLtMatmulHeuristicResult_t,
+    );
+    algo_config_get = "cublasLtMatmulAlgoConfigGetAttribute": fn(
+        *const lt::cublasLtMatmulAlgo_t,
+        lt::cublasLtMatmulAlgoConfigAttributes_t,
+        *mut c_void,
+        usize,
+        *mut usize,
+    );
+    algo_config_set = "cublasLtMatmulAlgoConfigSetAttribute": fn(
+        *mut lt::cublasLtMatmulAlgo_t,
+        lt::cublasLtMatmulAlgoConfigAttributes_t,
+        *const c_void,
+        usize,
     );
     matmul = "cublasLtMatmul": fn(
         lt::cublasLtHandle_t,
@@ -303,6 +341,12 @@ pub struct Blas {
     lt_workspace: Buf,
     _blas_workspace: Buf,
     plans: RefCell<HashMap<LinearKey, LinearPlan>>,
+    /// The decode-step linears' own cuBLASLt workspace, sized for their split-K partials
+    decode_workspace: Buf,
+    /// Plans of linears run on an explicit algorithm, see [`Blas::linear_bias_decode`]
+    algo_plans: RefCell<HashMap<(LinearKey, LtAlgo), LinearPlan>>,
+    /// Whether this GPU is the one the decode table was measured on
+    decode_table: bool,
 }
 
 impl Blas {
@@ -310,6 +354,7 @@ impl Blas {
         let libs = Libs::open()?;
         let lt_workspace = gpu.alloc(LT_WORKSPACE)?;
         let blas_workspace = gpu.alloc(BLAS_WORKSPACE)?;
+        let decode_workspace = gpu.alloc(decode::DECODE_WORKSPACE)?;
 
         let mut lt = std::ptr::null_mut();
         check_lt(unsafe { (libs.lt.create)(&mut lt) }, "cublasLtCreate")?;
@@ -323,6 +368,9 @@ impl Blas {
             lt_workspace,
             _blas_workspace: blas_workspace,
             plans: RefCell::default(),
+            decode_workspace,
+            algo_plans: RefCell::default(),
+            decode_table: decode::measured_on(gpu),
         };
 
         let fns = &this.libs.blas;
@@ -696,7 +744,9 @@ impl Drop for Blas {
     fn drop(&mut self) {
         let f = &self.libs.lt;
         unsafe {
-            for plan in self.plans.borrow().values() {
+            let plans = self.plans.borrow();
+            let algo_plans = self.algo_plans.borrow();
+            for plan in plans.values().chain(algo_plans.values()) {
                 (f.layout_destroy)(plan.w);
                 (f.layout_destroy)(plan.x);
                 (f.layout_destroy)(plan.y);

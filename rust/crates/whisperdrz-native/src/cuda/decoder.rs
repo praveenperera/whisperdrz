@@ -12,7 +12,11 @@
 //! then `ln` and the LM head `x @ token_embedding^T` into FP16 logits `[rows * q_len,
 //! 51866]`. The self-attention query, key and value weights are packed into one GEMM with
 //! a zero key bias, and each residual add is fused with the LayerNorm after it, both exact
-//! in real arithmetic; every value is rounded to FP16 where torch rounds it. Prefill first
+//! in real arithmetic; every value is rounded to FP16 where torch rounds it. Decode steps
+//! (one token per row) run their linears on the cuBLASLt algorithms measured fastest for
+//! the bucket's row count ([`Blas::linear_bias_decode`]): same FP32 sums and bias
+//! epilogue as torch's call, in another order, so outputs can differ from torch's by
+//! FP16 rounding. Prefills and the DTW forward keep torch's calls. Prefill first
 //! fills every layer's cross keys and values from the encoder output and zeroes the slot
 //! lengths, then runs a step at positions `0..q_len`
 //!
@@ -136,10 +140,39 @@ impl Linear {
 
     /// `y = x @ w^T (+ b)` over `rows` rows, the call torch makes for this layer
     fn apply(&self, blas: &Blas, x: u64, y: u64, rows: usize) -> Result<()> {
+        self.apply_as(blas, Gemm::Torch, x, y, rows)
+    }
+
+    /// [`Linear::apply`] on the algorithm `gemm` names; bias-free layers always run
+    /// torch's call
+    fn apply_as(&self, blas: &Blas, gemm: Gemm, x: u64, y: u64, rows: usize) -> Result<()> {
         let (n_out, n_in) = (self.w.shape[0], self.w.shape[1]);
-        match &self.b {
-            Some(b) => blas.linear_bias(x, self.w.ptr(), b.ptr(), y, (rows, n_in, n_out)),
-            None => blas.linear(x, self.w.ptr(), y, (rows, n_in, n_out)),
+        let dims = (rows, n_in, n_out);
+        match (&self.b, gemm) {
+            (Some(b), Gemm::Torch) => blas.linear_bias(x, self.w.ptr(), b.ptr(), y, dims),
+            (Some(b), Gemm::Decode) => blas.linear_bias_decode(x, self.w.ptr(), b.ptr(), y, dims),
+            (None, _) => blas.linear(x, self.w.ptr(), y, dims),
+        }
+    }
+}
+
+/// Which cuBLASLt algorithm a step's linears run on
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gemm {
+    /// torch's heuristic choice, bit for bit the reference's GEMMs
+    Torch,
+    /// The algorithm measured fastest for the decode buckets ([`Blas::linear_bias_decode`]),
+    /// which streams the weights with more blocks at the step's small row counts
+    Decode,
+}
+
+impl Gemm {
+    /// Decode steps (one token per row) run [`Gemm::Decode`]; prefills keep torch's call
+    fn for_batch(batch: Batch) -> Self {
+        if batch.q_len == 1 {
+            Self::Decode
+        } else {
+            Self::Torch
         }
     }
 }
@@ -656,16 +689,19 @@ impl Decoder {
             ws.f.ptr(),
         );
 
+        let gemm = Gemm::for_batch(batch);
         match op {
             SubOp::AttnLn => blk.attn_ln.apply(gpu, x, h, n),
             SubOp::SelfAttn => {
-                blas.linear_bias(
-                    h,
-                    blk.qkv_w.ptr(),
-                    blk.qkv_b.ptr(),
-                    qkv,
-                    (n, D_MODEL, 3 * D_MODEL),
-                )?;
+                let qkv_dims = (n, D_MODEL, 3 * D_MODEL);
+                match gemm {
+                    Gemm::Torch => {
+                        blas.linear_bias(h, blk.qkv_w.ptr(), blk.qkv_b.ptr(), qkv, qkv_dims)
+                    }
+                    Gemm::Decode => {
+                        blas.linear_bias_decode(h, blk.qkv_w.ptr(), blk.qkv_b.ptr(), qkv, qkv_dims)
+                    }
+                }?;
                 let packed = |col: usize| Rows {
                     ptr: qkv + 2 * col as u64,
                     stride: 3 * D_MODEL,
@@ -678,19 +714,19 @@ impl Decoder {
                     (packed(0), packed(D_MODEL), packed(2 * D_MODEL)),
                     o,
                 )?;
-                blk.attn_out.apply(blas, o, ao, n)
+                blk.attn_out.apply_as(blas, gemm, o, ao, n)
             }
             SubOp::CrossLn => blk.cross_ln.add_apply(gpu, x, ao, h, n),
             SubOp::CrossAttn => {
-                blk.cross_q.apply(blas, h, qkv, n)?;
+                blk.cross_q.apply_as(blas, gemm, h, qkv, n)?;
                 attn.cross_attn(gpu, caches, i, batch, Rows::dense(qkv), o)?;
-                blk.cross_out.apply(blas, o, ao, n)
+                blk.cross_out.apply_as(blas, gemm, o, ao, n)
             }
             SubOp::MlpLn => blk.mlp_ln.add_apply(gpu, x, ao, h, n),
             SubOp::Mlp => {
-                blk.fc1.apply(blas, h, f, n)?;
+                blk.fc1.apply_as(blas, gemm, h, f, n)?;
                 ops::gelu_inplace(gpu, f, n * D_MLP)?;
-                blk.fc2.apply(blas, f, ao, n)
+                blk.fc2.apply_as(blas, gemm, f, ao, n)
             }
         }
     }

@@ -45,3 +45,26 @@ native runtime must form the same batches.
   graphs for its convolutions plus `cudnnBatchNormalizationForwardInference`
 - DTW attention scores: 4 `cublasSgemmStridedBatched` calls (FP32, default math)
 - encoder conv stem: cuDNN backend graphs (heuristic engine choice)
+
+## Where the native runtime departs from torch: decode-step linears
+
+At the decode buckets, torch's one-result, 1 MiB heuristic picks kernels that can't
+stream the weights at DRAM rate. For example, the packed QKV at 32 to 54 rows runs one
+160-block wave of 256x128 tiles in 36 µs, where the 9.8 MB of weights need 5.9 µs at
+1.67 TB/s. Decode steps (one token per row) therefore run their linears with bias
+through `Blas::linear_bias_decode` (`crates/whisperdrz-native/src/cuda/blas/decode.rs`).
+It keeps torch's descriptors, compute type and bias epilogue but takes the algorithm
+from a fixed table: the fastest deterministic candidate per (rows, shape) among up to 64
+heuristic results under a 4 MiB workspace and their split-K variants with the FP32
+(compute-type) reduction. A candidate qualifies only if its error against an exact f64
+product stays within 1.25x torch's max-abs error and 1.05x its mean, and it must beat
+torch's choice by 3%. That leaves mostly the 32-to-54-row buckets, where the picks are
+both 2-4x faster than torch's kernels and more accurate. Below 32 rows, the split-K
+candidates that would beat torch add about a third to the mean error, so those buckets
+keep torch's choice. The table was measured by `tests/gpu_gemm_probe.rs` on the
+RTX 5090 with cuBLAS 12.8.4 and is used only on that GPU (compute 12.0, 170 SMs). Those
+GEMMs no longer match torch bit for bit; the noise-band gate judges them. Prefills, the
+DTW forward, the encoder, the bias-free key projections and the LM head still make
+torch's calls. To re-measure, run
+`WHISPERDRZ_GEMM_PROBE=out.json cargo test --release --features cuda -p whisperdrz-native --test gpu_gemm_probe -- --nocapture`
+through the GPU queue and paste its printed `pick(...)` lines into `TABLE`.
