@@ -155,30 +155,93 @@ pub fn column_sum(col: &[f32]) -> f32 {
 /// `torch.cdist(a, b)` (p = 2) between row sets of width `dim`, row-major `[ra, rb]`
 pub fn cdist(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
     let (ra, rb) = (a.len() / dim, b.len() / dim);
-    if ra > 25 || rb > 25 {
-        euclidean_dist_mm(a, b, dim)
-    } else {
-        cdist_direct(a, b, dim)
+    match CdistPath::for_rows(ra.max(rb)) {
+        CdistPath::Direct => cdist_direct(a, b, dim),
+        path => euclidean_dist_mm(a, b, dim, path),
     }
 }
 
-/// `_cdist_forward` on the CPU: per pair, a scalar sum of `|x - y|^2` (no FMA), then
-/// `sqrt`
+/// The arithmetic `cdist` uses, chosen by the larger operand's row count; each
+/// element then depends only on its two rows, so callers may compute elements one
+/// pair at a time ([`cdist_direct_pair`], [`mm_pair`]) and match `cdist` bit for bit
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CdistPath {
+    /// Up to 25 rows: the scalar loop
+    Direct,
+    /// The MKL `sgemm` path modeled as one FMA chain over k
+    OneChain,
+    /// The same with two interleaved chains (even and odd k), for 30 to 64 rows
+    TwoChains,
+}
+
+impl CdistPath {
+    pub fn for_rows(rows: usize) -> Self {
+        match rows {
+            0..=25 => Self::Direct,
+            30..=64 => Self::TwoChains,
+            _ => Self::OneChain,
+        }
+    }
+}
+
+/// `_cdist_forward` on the CPU for one pair: a scalar sum of `|x - y|^2` (no FMA),
+/// then `sqrt`
+pub fn cdist_direct_pair(x: &[f32], y: &[f32]) -> f32 {
+    let mut agg = 0f32;
+    for (&p, &q) in x.iter().zip(y) {
+        let d = (p - q).abs();
+        agg += d * d;
+    }
+
+    agg.sqrt()
+}
+
 fn cdist_direct(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(a.len() / dim * (b.len() / dim));
     for x in a.chunks_exact(dim) {
         for y in b.chunks_exact(dim) {
-            let mut agg = 0f32;
-            for (&p, &q) in x.iter().zip(y) {
-                let d = (p - q).abs();
-                agg += d * d;
-            }
-
-            out.push(agg.sqrt());
+            out.push(cdist_direct_pair(x, y));
         }
     }
 
     out
+}
+
+/// A row of the left operand of `_euclidean_dist`'s product: `[-2x, |x|^2, 1]`
+pub fn mm_lhs(row: &[f32]) -> Vec<f32> {
+    mm_pack(row, -2.0, false)
+}
+
+/// A row of the right operand: `[y, 1, |y|^2]`
+pub fn mm_rhs(row: &[f32]) -> Vec<f32> {
+    mm_pack(row, 1.0, true)
+}
+
+fn mm_pack(row: &[f32], scale: f32, norm_last: bool) -> Vec<f32> {
+    let sq: Vec<f32> = row.iter().map(|v| v * v).collect();
+    let norm = sum(&sq);
+    let mut out: Vec<f32> = row.iter().map(|v| v * scale).collect();
+    if norm_last {
+        out.extend([1.0, norm]);
+    } else {
+        out.extend([norm, 1.0]);
+    }
+
+    out
+}
+
+/// One element of `_euclidean_dist` from packed rows ([`mm_lhs`], [`mm_rhs`]):
+/// the product as FMA chains over k, clamped at 0, `sqrt`
+pub fn mm_pair(x: &[f32], y: &[f32], path: CdistPath) -> f32 {
+    let chains = if path == CdistPath::TwoChains { 2 } else { 1 };
+    let mut acc = [0f32; 2];
+    for (k, (&p, &q)) in x.iter().zip(y).enumerate() {
+        let c = k % chains;
+        acc[c] = p.mul_add(q, acc[c]);
+    }
+
+    let dot = if chains == 1 { acc[0] } else { acc[0] + acc[1] };
+    dot.max(0.0).sqrt()
 }
 
 /// `_euclidean_dist`: `[-2x, |x|^2, 1] @ [y, 1, |y|^2]^T`, clamped at 0, `sqrt`.
@@ -187,41 +250,13 @@ fn cdist_direct(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
 /// reference CPU it is exact at 28, 31 and 33 rows and elsewhere differs on up to 5%
 /// of the off-diagonal elements by an ulp or two (probed at 26 to 150 rows); MKL
 /// picks its kernels by size and thread split, so no fixed chain order is exact
-fn euclidean_dist_mm(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
-    let pack = |rows: &[f32], scale: f32, norm_last: bool| -> Vec<Vec<f32>> {
-        rows.chunks_exact(dim)
-            .map(|r| {
-                let sq: Vec<f32> = r.iter().map(|v| v * v).collect();
-                let norm = sum(&sq);
-                let mut out: Vec<f32> = r.iter().map(|v| v * scale).collect();
-                if norm_last {
-                    out.extend([1.0, norm]);
-                } else {
-                    out.extend([norm, 1.0]);
-                }
-                out
-            })
-            .collect()
-    };
-
-    let xa = pack(a, -2.0, false);
-    let yb = pack(b, 1.0, true);
-    let chains = if (30..=64).contains(&xa.len().max(yb.len())) {
-        2
-    } else {
-        1
-    };
+fn euclidean_dist_mm(a: &[f32], b: &[f32], dim: usize, path: CdistPath) -> Vec<f32> {
+    let xa: Vec<Vec<f32>> = a.chunks_exact(dim).map(mm_lhs).collect();
+    let yb: Vec<Vec<f32>> = b.chunks_exact(dim).map(mm_rhs).collect();
     let mut out = Vec::with_capacity(xa.len() * yb.len());
     for x in &xa {
         for y in &yb {
-            let mut acc = [0f32; 2];
-            for (k, (&p, &q)) in x.iter().zip(y).enumerate() {
-                let c = k % chains;
-                acc[c] = p.mul_add(q, acc[c]);
-            }
-
-            let dot = if chains == 1 { acc[0] } else { acc[0] + acc[1] };
-            out.push(dot.max(0.0).sqrt());
+            out.push(mm_pair(x, y, path));
         }
     }
 
