@@ -14,6 +14,7 @@
 //! Temperature is 0 (greedy), so no softmax or sampling is involved
 
 use half::f16;
+use half::slice::HalfFloatSliceExt;
 
 use crate::text::Token;
 
@@ -74,26 +75,35 @@ impl Argmax {
 
 /// `torch.argmax`: first index of the maximum, NaN counting as the maximum
 pub fn argmax(values: &[f16]) -> Argmax {
+    argmax_wide(values, &widen(values))
+}
+
+/// `values` widened to f32, exactly, with half's vectorized conversion
+pub fn widen(values: &[f16]) -> Vec<f32> {
+    let mut wide = vec![0f32; values.len()];
+    values.convert_to_f32_slice(&mut wide);
+    wide
+}
+
+/// [`argmax`] over `values` given `wide`, their f32 widening. Widening is exact, so
+/// comparing the f32s decides exactly as comparing the fp16s; it only skips a scalar
+/// conversion per comparison, which dominated the per-row host time
+pub fn argmax_wide(values: &[f16], wide: &[f32]) -> Argmax {
     // python never calls this on an empty row
     assert!(!values.is_empty(), "argmax of an empty row");
+    assert_eq!(values.len(), wide.len(), "argmax over mismatched widening");
 
-    let rank = |v: f16| {
-        if v.is_nan() {
-            f32::INFINITY
-        } else {
-            v.to_f32()
-        }
-    };
-    let better = |a: f16, b: f16| (a.is_nan() && !b.is_nan()) || (!b.is_nan() && rank(a) > rank(b));
+    let rank = |v: f32| if v.is_nan() { f32::INFINITY } else { v };
+    let better = |a: f32, b: f32| (a.is_nan() && !b.is_nan()) || (!b.is_nan() && rank(a) > rank(b));
 
     let mut best = 0usize;
     let mut second: Option<usize> = None;
-    for i in 1..values.len() {
-        let v = values[i];
-        if better(v, values[best]) {
+    for i in 1..wide.len() {
+        let v = wide[i];
+        if better(v, wide[best]) {
             second = Some(best);
             best = i;
-        } else if second.is_none_or(|s| better(v, values[s])) {
+        } else if second.is_none_or(|s| better(v, wide[s])) {
             second = Some(i);
         }
     }
@@ -103,6 +113,26 @@ pub fn argmax(values: &[f16]) -> Argmax {
         value: values[best],
         runner_up: second.map(|s| (s as Token, values[s])),
     }
+}
+
+/// A logits row plus an additive mask, `x + (blocked(i) ? -65504 : unblocked)` in fp32
+/// rounded once to fp16, as [`add_mask`] (`unblocked` 0) and [`add_resample_mask`]
+/// (`unblocked` -0) compute it per entry. Returns the fp16 row and its exact widening
+pub fn masked_row(
+    wide: &[f32],
+    blocked: impl Fn(u32) -> bool,
+    unblocked: f32,
+) -> (Vec<f16>, Vec<f32>) {
+    let mut sum: Vec<f32> = wide
+        .iter()
+        .zip(0..)
+        .map(|(&x, i)| x + if blocked(i) { MASK_FILL } else { unblocked })
+        .collect();
+    let mut row = vec![f16::ZERO; wide.len()];
+    // the slice conversions round to nearest even like `f16::from_f32`
+    row.convert_from_f32_slice(&sum);
+    row.convert_to_f32_slice(&mut sum);
+    (row, sum)
 }
 
 #[cfg(test)]
@@ -129,6 +159,32 @@ mod tests {
             .filter(|x| x.to_f32() > 0.0)
             .any(|x| penalize(x) != f16::from_f32(x.to_f32() / 1.2));
         assert!(differs);
+    }
+
+    #[test]
+    fn masked_row_matches_per_entry_ops() {
+        // every fp16 bit pattern, blocked and not, under both unblocked addends, so the
+        // vectorized row path must round exactly as the scalar ops do (NaNs compared as NaN)
+        let logits: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
+        let wide = super::widen(&logits);
+        for blocked_every in [1, 2, 3] {
+            let blocked = |i: u32| i.is_multiple_of(blocked_every);
+            for (unblocked, scalar) in [
+                (0.0, add_mask as fn(f16, bool) -> f16),
+                (-0.0, super::add_resample_mask),
+            ] {
+                let (row, row_wide) = super::masked_row(&wide, blocked, unblocked);
+                for (i, (&x, (&r, &w))) in logits.iter().zip(row.iter().zip(&row_wide)).enumerate()
+                {
+                    let want = scalar(x, blocked(i as u32));
+                    assert!(
+                        r.to_bits() == want.to_bits() || (r.is_nan() && want.is_nan()),
+                        "entry {i}"
+                    );
+                    assert!(w.to_bits() == r.to_f32().to_bits() || (w.is_nan() && r.is_nan()));
+                }
+            }
+        }
     }
 
     #[test]
