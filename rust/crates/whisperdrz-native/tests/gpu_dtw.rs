@@ -776,12 +776,29 @@ fn dtw_cached_kv_matches_projection() -> Result<()> {
             .is_err(),
         "DTW read slot {POISONED}, which no prefill filled"
     );
-    caches.store_xa(&gpu, stacked(&[4])?.ptr(), &[4])?;
+    let first = stacked(&[4])?;
+    let stale = caches.store_xa(&gpu, first.ptr(), &[4])?;
     ensure!(
         decoder
             .dtw_scores(&gpu, &blas, &caches, &batch, &[4])
             .is_err(),
         "DTW read slot 4's cross keys after its encoder output was replaced"
+    );
+
+    // a source a later store replaced must not fill the cache: the check runs before the
+    // GEMMs, so placeholder weights never reach cuBLAS
+    let replacement = stacked(&[4])?;
+    caches.store_xa(&gpu, replacement.ptr(), &[4])?;
+    let w = first.ptr();
+    ensure!(
+        caches
+            .fill_cross(&gpu, &blas, 7, &stale, (w, w, w), None)
+            .is_err(),
+        "fill_cross took an encoder output a later store_xa replaced"
+    );
+    ensure!(
+        !caches.cross_from_xa(4, 1),
+        "slot 4 claims cross keys from its current encoder output"
     );
     Ok(())
 }

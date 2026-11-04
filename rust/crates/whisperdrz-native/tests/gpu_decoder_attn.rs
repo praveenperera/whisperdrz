@@ -650,7 +650,7 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
         "xa shape {xa_shape:?}"
     );
     let xa = upload16(&gpu, &xa)?;
-    caches.store_xa(&gpu, xa.ptr(), &slot_list)?;
+    let stored = caches.store_xa(&gpu, xa.ptr(), &slot_list)?;
 
     let load = |key: &str| -> Result<(Vec<u16>, Vec<u16>, Vec<f32>)> {
         let (sx, x) = dir.f16(&files[format!("{key}_x")])?;
@@ -762,16 +762,10 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
             w(layer, "cross_attn.value.weight", &sq)?,
             w(layer, "cross_attn.value.bias", &[STATE])?,
         );
-        caches.fill_cross(
-            &gpu,
-            &blas,
-            layer,
-            xa.ptr(),
-            cross_w,
-            (&slot_list, Some(&scratch)),
-        )?;
+        caches.fill_cross(&gpu, &blas, layer, &stored, cross_w, Some(&scratch))?;
         if layer == 0 {
-            caches.fill_cross(&gpu, &blas, 0, xa.ptr(), cross_w, (&direct_slots, None))?;
+            let direct = caches.store_xa(&gpu, xa.ptr(), &direct_slots)?;
+            caches.fill_cross(&gpu, &blas, 0, &direct, cross_w, None)?;
         }
         gpu.upload_to(x.ptr(), bytemuck::cast_slice(&cross_x[range.clone()]))?;
         blas.linear_bias(

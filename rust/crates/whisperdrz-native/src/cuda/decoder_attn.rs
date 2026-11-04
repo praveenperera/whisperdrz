@@ -38,6 +38,7 @@
 //! depend only on the row count, the tokens per row and the SM count, which a bucket fixes
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eyre::{Result, ensure};
 
@@ -302,8 +303,32 @@ pub struct KvCaches {
     /// Per layer and slot, the `xa_gen` its cross keys and values were computed from, so
     /// the DTW forward can check it reads the prefill of the window it aligns
     cross_gen: Vec<Cell<u64>>,
-    /// Last generation handed out
-    next_gen: Cell<u64>,
+}
+
+/// Last encoder-output generation handed out; process-wide, so a [`StoredXa`] from one
+/// `KvCaches` can never match another's
+static NEXT_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Encoder output windows that [`KvCaches::store_xa`] copied into their slots, the only
+/// input [`KvCaches::fill_cross`] projects, so cached cross keys and values always come
+/// from the encoder output their slot records
+pub struct StoredXa<'a> {
+    xa: u64,
+    slots: &'a [usize],
+    /// Generation each slot's copy was given
+    gens: Vec<u64>,
+}
+
+impl StoredXa<'_> {
+    /// The stacked encoder output `[windows * CROSS_LEN, STATE]` that was stored
+    pub fn xa(&self) -> u64 {
+        self.xa
+    }
+
+    /// Slot of each window
+    pub fn slots(&self) -> &[usize] {
+        self.slots
+    }
 }
 
 /// Bytes of one slot's encoder output
@@ -326,7 +351,6 @@ impl KvCaches {
             lens: gpu.zeros(n * 4)?,
             xa_gen: vec![Cell::new(0); n],
             cross_gen: vec![Cell::new(0); layers * n],
-            next_gen: Cell::new(0),
         })
     }
 
@@ -413,7 +437,8 @@ impl KvCaches {
     /// Computes the cross keys and values of `layer` for the windows of a prefill batch
     /// and stores window `i` in slot `slots[i]`
     ///
-    /// `xa` is the encoder output `[windows * CROSS_LEN, STATE]`. As the reference runs
+    /// `src` is the encoder output `[windows * CROSS_LEN, STATE]` as [`KvCaches::store_xa`]
+    /// stored it; fails if a later `store_xa` replaced any of its slots. As the reference runs
     /// `key(xa)` and `value(xa)` on the whole batch, the GEMMs take every window at once
     /// (torch's row count, so cuBLAS picks the same kernel): `K = xa @ wk^T` (no bias) and
     /// `V = xa @ wv^T + bv`. Consecutive ascending slots get the GEMM output directly;
@@ -425,16 +450,26 @@ impl KvCaches {
         gpu: &Gpu,
         blas: &Blas,
         layer: usize,
-        xa: u64,
+        src: &StoredXa,
         (wk, wv, bv): (u64, u64, u64),
-        (slots, scratch): (&[usize], Option<&Buf>),
+        scratch: Option<&Buf>,
     ) -> Result<()> {
+        let (xa, slots) = (src.xa, src.slots);
         let windows = slots.len();
         ensure!(windows > 0, "fill_cross with no windows");
         ensure!(
             slots.iter().all(|&s| s < self.slots),
             "fill_cross slots {slots:?} outside the {} real slots",
             self.slots
+        );
+        // the source must still be what its slots hold, or the cache would claim keys
+        // from an encoder output that is no longer there
+        ensure!(
+            slots
+                .iter()
+                .zip(&src.gens)
+                .all(|(&s, &g)| self.xa_gen[s].get() == g),
+            "fill_cross from an encoder output that a later store_xa replaced in slots {slots:?}"
         );
         let rows = windows * CROSS_LEN;
         let slot_bytes = CROSS_LEN * STATE * 2;
@@ -443,7 +478,7 @@ impl KvCaches {
         if consecutive {
             blas.linear(xa, wk, k0, (rows, STATE, STATE))?;
             blas.linear_bias(xa, wv, bv, v0, (rows, STATE, STATE))?;
-            self.mark_cross(layer, slots);
+            self.mark_cross(layer, src);
             return Ok(());
         }
 
@@ -473,41 +508,44 @@ impl KvCaches {
             )?;
         }
 
-        self.mark_cross(layer, slots);
+        self.mark_cross(layer, src);
         Ok(())
     }
 
-    /// Records that `layer`'s cross keys and values of `slots` come from their current
-    /// encoder outputs: `fill_cross` takes its `xa` to be what `store_xa` last wrote there,
-    /// as `Decoder::fill_cross` guarantees by storing it first
-    fn mark_cross(&self, layer: usize, slots: &[usize]) {
-        for &s in slots {
-            self.cross_gen[layer * (self.slots + 1) + s].set(self.xa_gen[s].get());
+    /// Records that `layer`'s cross keys and values of `src`'s slots come from its
+    /// encoder output
+    fn mark_cross(&self, layer: usize, src: &StoredXa) {
+        for (&s, &g) in src.slots.iter().zip(&src.gens) {
+            self.cross_gen[layer * (self.slots + 1) + s].set(g);
         }
     }
 
     /// Device address of slot `slot`'s encoder output `[CROSS_LEN, STATE]`, the trash slot
-    /// included
+    /// included. A write through it is not a [`KvCaches::store_xa`], so
+    /// [`KvCaches::cross_from_xa`] does not see it; only tests poison slots this way
     pub fn xa_slot(&self, slot: usize) -> Result<u64> {
         ensure!(slot <= self.slots, "encoder output of slot {slot}");
         Ok(self.xa.at(slot * XA_BYTES))
     }
 
     /// Copies window `i` of the encoder output `xa` (`[windows * CROSS_LEN, STATE]` FP16)
-    /// into slot `slots[i]`, for the DTW forward and the absorbed cross-attention
-    pub fn store_xa(&self, gpu: &Gpu, xa: u64, slots: &[usize]) -> Result<()> {
+    /// into slot `slots[i]`, for the DTW forward and the absorbed cross-attention, and
+    /// returns the source [`KvCaches::fill_cross`] projects
+    pub fn store_xa<'a>(&self, gpu: &Gpu, xa: u64, slots: &'a [usize]) -> Result<StoredXa<'a>> {
         ensure!(
             slots.iter().all(|&s| s < self.slots),
             "encoder outputs for slots {slots:?} outside the {} real slots",
             self.slots
         );
+        let mut gens = Vec::with_capacity(slots.len());
         for (i, &s) in slots.iter().enumerate() {
             gpu.copy_dtod(xa + (i * XA_BYTES) as u64, self.xa_slot(s)?, XA_BYTES)?;
-            self.next_gen.set(self.next_gen.get() + 1);
-            self.xa_gen[s].set(self.next_gen.get());
+            let g = NEXT_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+            self.xa_gen[s].set(g);
+            gens.push(g);
         }
 
-        Ok(())
+        Ok(StoredXa { xa, slots, gens })
     }
 
     /// Whether every layer below `layers` holds cross keys and values of `slot` computed by
