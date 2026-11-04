@@ -609,9 +609,9 @@ fn kernels_match_f64() -> Result<()> {
         );
     }
 
-    // squeeze-excitation MLP
-    {
-        let c = 40;
+    // squeeze-excitation MLP; 300 channels take several shared tiles of W1 and two
+    // blocks of W2's rows
+    for c in [40, 300] {
         let mean = rng.vec(c, 1.0);
         let (w1, b1, bn) = (
             rng.vec(SE_HIDDEN * c, 0.3),
@@ -651,7 +651,7 @@ fn kernels_match_f64() -> Result<()> {
         let got: Vec<f32> = gpu.download(&s_buf)?;
         // sigmoid's slope is at most 1/4, so the logit's sum bound carries over
         checks.check(
-            "ecapa_se_fc",
+            &format!("ecapa_se_fc ({c} channels)"),
             &got,
             &want,
             sum_bound(0.3 * (c as f64 + SE_HIDDEN as f64 * 8.0)),

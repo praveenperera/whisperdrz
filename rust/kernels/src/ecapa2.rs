@@ -254,6 +254,9 @@ fn conv3x3_output(
     batch_norm(v, bn, c, channels as usize)
 }
 
+/// Loads in flight per thread in [`ecapa_channel_mean`]
+const MEAN_LOADS: usize = 16;
+
 /// Per-channel mean over the interior of a `[rows][channels][cols]` buffer (one block
 /// per channel, `out` is `[channels][1]`): squeeze-excitation's average pool
 #[kernel(launch_context = lc)]
@@ -278,11 +281,26 @@ pub fn ecapa_channel_mean(
 
     let block = this_thread_block();
     let mut sum = 0.0f32;
-    let mut j = thread::threadIdx_x();
-    while j < n {
-        let (h, w) = (j / w_in + pad, j % w_in + pad);
-        sum += x[((h * channels + c) * cols + w) as usize];
-        j += BLOCK;
+    let mut j0 = thread::threadIdx_x();
+    while j0 < n {
+        // MEAN_LOADS of this thread's elements loaded together, then added in the same
+        // order as one at a time: the loads overlap and the sum is unchanged
+        let mut v = [0.0f32; MEAN_LOADS];
+        #[unroll]
+        for k in 0..MEAN_LOADS {
+            let j = j0 + k as u32 * BLOCK;
+            if j < n {
+                let (h, w) = (j / w_in + pad, j % w_in + pad);
+                v[k] = x[((h * channels + c) * cols + w) as usize];
+            }
+        }
+        #[unroll]
+        for k in 0..MEAN_LOADS {
+            if j0 + k as u32 * BLOCK < n {
+                sum += v[k];
+            }
+        }
+        j0 += MEAN_LOADS as u32 * BLOCK;
     }
     // SAFETY: every thread of the block reaches this call and only it uses SMEM
     let sum = unsafe { block_reduce::<f32, Sum, WARPS>(&block, sum, &raw mut SMEM) };
@@ -291,9 +309,30 @@ pub fn ecapa_channel_mean(
     }
 }
 
+/// Columns of `W1` per shared tile in [`ecapa_se_fc`]
+const SE_TC: usize = 64;
+/// Hidden units (columns of `W2`) per shared tile in [`ecapa_se_fc`]
+const SE_TR: usize = 32;
+/// Shared tile words in [`ecapa_se_fc`]: `SE_HIDDEN` rows of `SE_TC + 1` or `BLOCK` rows
+/// of `SE_TR + 1`, the extra word per row keeping a warp's walk along its rows off one bank
+const SE_TILE: usize = BLOCK as usize * (SE_TR + 1);
+/// Loads per thread for one tile of `W1`
+const SE_W1_LOADS: usize = SE_HIDDEN * SE_TC / BLOCK as usize;
+const _: () = assert!(
+    SE_HIDDEN <= BLOCK as usize
+        && SE_HIDDEN * (SE_TC + 1) <= SE_TILE
+        && (SE_HIDDEN * SE_TC) % BLOCK as usize == 0
+        && SE_HIDDEN % SE_TR == 0
+);
+
 /// Squeeze-excitation's MLP for one input: `sigmoid(W2 bn(relu(W1 m + b1)) + b2)` with
 /// `W1` `[SE_HIDDEN][channels]` and `W2` `[channels][SE_HIDDEN]`; one block, `out` is one
 /// row of `channels`
+///
+/// Each dot product is one thread's, summed in index order as a plain loop would, so the
+/// result does not depend on the tiling. The weights reach it through shared tiles the
+/// whole block loads with coalesced reads; walking a row straight from global memory
+/// would have each lane of a warp read its own cache line
 #[kernel(launch_context = lc)]
 #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
 pub fn ecapa_se_fc(
@@ -306,6 +345,7 @@ pub fn ecapa_se_fc(
     b2: &[f32],
 ) {
     static mut HIDDEN: SharedArray<f32, SE_HIDDEN> = SharedArray::UNINIT;
+    static mut TILE: SharedArray<f32, SE_TILE> = SharedArray::UNINIT;
     let Some(mut row) = out.block_row32(lc) else { return };
     let channels = row.width() as usize;
     if mean.len() != channels
@@ -318,30 +358,89 @@ pub fn ecapa_se_fc(
         return;
     }
 
-    // SAFETY: HIDDEN is this kernel's own shared array
+    // SAFETY: HIDDEN and TILE are this kernel's own shared arrays; every write below is
+    // ordered before the reads of the same words by a barrier, and every read before the
+    // next tile's writes by another
     let hidden = unsafe { SharedArray::as_raw_mut_ptr(&raw mut HIDDEN) };
-    let mut r = thread::threadIdx_x() as usize;
-    while r < SE_HIDDEN {
-        let mut z = b1[r];
-        for c in 0..channels {
-            z += w1[r * channels + c] * mean[c];
+    let tile = unsafe { SharedArray::as_raw_mut_ptr(&raw mut TILE) };
+    let tid = thread::threadIdx_x() as usize;
+    let block = BLOCK as usize;
+
+    // thread r < SE_HIDDEN sums W1's row r, SE_TC columns per tile
+    let mut z = if tid < SE_HIDDEN { b1[tid] } else { 0.0 };
+    let mut c0 = 0;
+    while c0 < channels {
+        // all loads first, so they are in flight together
+        let mut v = [0.0f32; SE_W1_LOADS];
+        #[unroll]
+        for k in 0..SE_W1_LOADS {
+            let e = tid + k * block;
+            let c = c0 + e % SE_TC;
+            if c < channels {
+                v[k] = w1[e / SE_TC * channels + c];
+            }
         }
-        let z = batch_norm(relu(z), bn, r, SE_HIDDEN);
-        // SAFETY: each thread writes only its own rows r, and the barrier below orders
-        // these writes before any read
-        unsafe { *hidden.add(r) = z };
-        r += BLOCK as usize;
+        #[unroll]
+        for k in 0..SE_W1_LOADS {
+            let e = tid + k * block;
+            // SAFETY: e / SE_TC < SE_HIDDEN, inside the tile (see SE_TILE)
+            unsafe { *tile.add(e / SE_TC * (SE_TC + 1) + e % SE_TC) = v[k] };
+        }
+        thread::sync_threads();
+        if tid < SE_HIDDEN {
+            for j in 0..SE_TC.min(channels - c0) {
+                // SAFETY: written before the barrier above
+                z += unsafe { *tile.add(tid * (SE_TC + 1) + j) } * mean[c0 + j];
+            }
+        }
+        thread::sync_threads();
+        c0 += SE_TC;
+    }
+    if tid < SE_HIDDEN {
+        // SAFETY: each thread writes only its own hidden unit
+        unsafe { *hidden.add(tid) = batch_norm(relu(z), bn, tid, SE_HIDDEN) };
     }
     thread::sync_threads();
 
-    for mut y in row.thread_columns() {
-        let c = y.column() as usize;
-        let mut s = b2[c];
-        for r in 0..SE_HIDDEN {
-            // SAFETY: every row was written before the barrier and none is written after
-            s += w2[c * SE_HIDDEN + r] * unsafe { *hidden.add(r) };
+    // thread t sums W2's rows cb + t for each block of BLOCK rows, SE_TR columns per tile
+    let mut cols = row.thread_columns();
+    let mut cb = 0;
+    while cb < channels {
+        let c = cb + tid;
+        let mut s = if c < channels { b2[c] } else { 0.0 };
+        let mut r0 = 0;
+        while r0 < SE_HIDDEN {
+            // BLOCK rows of SE_TR values, SE_TR loads per thread
+            let mut v = [0.0f32; SE_TR];
+            #[unroll]
+            for k in 0..SE_TR {
+                let e = tid + k * block;
+                let cc = cb + e / SE_TR;
+                if cc < channels {
+                    v[k] = w2[cc * SE_HIDDEN + r0 + e % SE_TR];
+                }
+            }
+            #[unroll]
+            for k in 0..SE_TR {
+                let e = tid + k * block;
+                // SAFETY: e / SE_TR < BLOCK, inside the tile
+                unsafe { *tile.add(e / SE_TR * (SE_TR + 1) + e % SE_TR) = v[k] };
+            }
+            thread::sync_threads();
+            if c < channels {
+                for j in 0..SE_TR {
+                    // SAFETY: both written before a barrier above
+                    s += unsafe { *tile.add(tid * (SE_TR + 1) + j) * *hidden.add(r0 + j) };
+                }
+            }
+            thread::sync_threads();
+            r0 += SE_TR;
         }
-        y.write(1.0 / (1.0 + libm::expf(-s)));
+        // the walk yields this thread's columns tid, tid + BLOCK, ... in order, the c here
+        if let Some(mut y) = cols.next() {
+            y.write(1.0 / (1.0 + libm::expf(-s)));
+        }
+        cb += block;
     }
 }
 

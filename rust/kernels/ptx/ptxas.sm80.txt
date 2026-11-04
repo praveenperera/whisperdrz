@@ -3,174 +3,174 @@ Compiling entry function 'transpose_f16' for 'sm_120'
 Function properties for transpose_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 10 registers, used 0 barriers
-Compile time = 2.329 ms
+Compile time = 19.569 ms
 Compiling entry function 'linear_n8_r8_c5' for 'sm_120'
 Function properties for linear_n8_r8_c5
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 48 registers, used 1 barriers
-Compile time = 16.551 ms
+Compile time = 19.401 ms
 Compiling entry function 'linear_n8_r16_c10' for 'sm_120'
 Function properties for linear_n8_r16_c10
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 104 registers, used 1 barriers
-Compile time = 22.431 ms
+Compile time = 22.884 ms
 Compiling entry function 'layernorm_f16' for 'sm_120'
 Function properties for layernorm_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 89 registers, used 0 barriers
-Compile time = 18.350 ms
+Compile time = 19.551 ms
 Compiling entry function 'kv_lens' for 'sm_120'
 Function properties for kv_lens
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 10 registers, used 0 barriers
-Compile time = 1.126 ms
+Compile time = 1.086 ms
 Compiling entry function 'im2col_k3_f16' for 'sm_120'
 Function properties for im2col_k3_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 14 registers, used 0 barriers
-Compile time = 2.538 ms
+Compile time = 2.508 ms
 Compiling entry function 'gelu_pos_f16x8' for 'sm_120'
 Function properties for gelu_pos_f16x8
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 40 registers, used 0 barriers
-Compile time = 5.116 ms
+Compile time = 5.005 ms
 Compiling entry function 'gelu_f16x8' for 'sm_120'
 Function properties for gelu_f16x8
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 40 registers, used 0 barriers
-Compile time = 3.462 ms
+Compile time = 3.405 ms
 Compiling entry function 'gelu_f16' for 'sm_120'
 Function properties for gelu_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 12 registers, used 0 barriers
-Compile time = 1.349 ms
+Compile time = 1.328 ms
 Compiling entry function 'flash_attn_f16_d64' for 'sm_120'
 Function properties for flash_attn_f16_d64
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 128 registers, used 1 barriers, 36864 bytes smem
-Compile time = 24.625 ms
+Compile time = 24.757 ms
 Compiling entry function 'flash_attn_causal_f16_d64' for 'sm_120'
 Function properties for flash_attn_causal_f16_d64
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 128 registers, used 1 barriers, 36864 bytes smem
-Compile time = 26.649 ms
+Compile time = 26.257 ms
 Compiling entry function 'embed_f16x8' for 'sm_120'
 Function properties for embed_f16x8
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 32 registers, used 0 barriers
-Compile time = 3.589 ms
+Compile time = 3.554 ms
 Compiling entry function 'ecapa_stats_cat' for 'sm_120'
 Function properties for ecapa_stats_cat
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 26 registers, used 1 barriers, 32 bytes smem
-Compile time = 14.741 ms
+Compile time = 15.369 ms
 Compiling entry function 'ecapa_se_fc' for 'sm_120'
 Function properties for ecapa_se_fc
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-Used 42 registers, used 1 barriers, 512 bytes smem
-Compile time = 12.862 ms
+Used 128 registers, used 1 barriers, 34304 bytes smem
+Compile time = 38.282 ms
 Compiling entry function 'ecapa_scale_residual_f16' for 'sm_120'
 Function properties for ecapa_scale_residual_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 14 registers, used 0 barriers
-Compile time = 2.681 ms
+Compile time = 2.680 ms
 Compiling entry function 'ecapa_scale_residual' for 'sm_120'
 Function properties for ecapa_scale_residual
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 14 registers, used 0 barriers
-Compile time = 2.492 ms
+Compile time = 2.483 ms
 Compiling entry function 'ecapa_reflect_add' for 'sm_120'
 Function properties for ecapa_reflect_add
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 14 registers, used 0 barriers
-Compile time = 1.808 ms
+Compile time = 1.728 ms
 Compiling entry function 'ecapa_log_power' for 'sm_120'
 Function properties for ecapa_log_power
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 13 registers, used 0 barriers
-Compile time = 1.801 ms
+Compile time = 1.766 ms
 Compiling entry function 'ecapa_frames' for 'sm_120'
 Function properties for ecapa_frames
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 12 registers, used 0 barriers
-Compile time = 1.779 ms
+Compile time = 1.756 ms
 Compiling entry function 'ecapa_conv_epilogue' for 'sm_120'
 Function properties for ecapa_conv_epilogue
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 16 registers, used 0 barriers
-Compile time = 2.818 ms
+Compile time = 2.720 ms
 Compiling entry function 'ecapa_conv3x3_epilogue_f16' for 'sm_120'
 Function properties for ecapa_conv3x3_epilogue_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 24 registers, used 0 barriers
-Compile time = 3.157 ms
+Compile time = 3.100 ms
 Compiling entry function 'ecapa_conv3x3_epilogue' for 'sm_120'
 Function properties for ecapa_conv3x3_epilogue
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 24 registers, used 0 barriers
-Compile time = 3.109 ms
+Compile time = 3.092 ms
 Compiling entry function 'ecapa_channel_mean' for 'sm_120'
 Function properties for ecapa_channel_mean
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
-Used 17 registers, used 1 barriers, 32 bytes smem
-Compile time = 6.686 ms
+Used 40 registers, used 1 barriers, 32 bytes smem
+Compile time = 16.896 ms
 Compiling entry function 'ecapa_center_rows' for 'sm_120'
 Function properties for ecapa_center_rows
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 24 registers, used 1 barriers, 32 bytes smem
-Compile time = 7.557 ms
+Compile time = 7.602 ms
 Compiling entry function 'ecapa_attentive_pool' for 'sm_120'
 Function properties for ecapa_attentive_pool
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 38 registers, used 1 barriers, 32 bytes smem
-Compile time = 19.553 ms
+Compile time = 19.199 ms
 Compiling entry function 'dtw_softmax_f32' for 'sm_120'
 Function properties for dtw_softmax_f32
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 40 registers, used 1 barriers, 64 bytes smem
-Compile time = 9.603 ms
+Compile time = 9.426 ms
 Compiling entry function 'dtw_norm_f32' for 'sm_120'
 Function properties for dtw_norm_f32
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 40 registers, used 0 barriers
-Compile time = 19.314 ms
+Compile time = 19.741 ms
 Compiling entry function 'dtw_median_mean_f32' for 'sm_120'
 Function properties for dtw_median_mean_f32
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 40 registers, used 0 barriers
-Compile time = 3.699 ms
+Compile time = 3.759 ms
 Compiling entry function 'dtw_gather_head_f32' for 'sm_120'
 Function properties for dtw_gather_head_f32
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 10 registers, used 0 barriers
-Compile time = 0.986 ms
+Compile time = 0.977 ms
 Compiling entry function 'cross_combine_f16' for 'sm_120'
 Function properties for cross_combine_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 48 registers, used 0 barriers
-Compile time = 15.743 ms
+Compile time = 15.408 ms
 Compiling entry function 'cross_absorb_f16' for 'sm_120'
 Function properties for cross_absorb_f16
     88 bytes stack frame, 84 bytes spill stores, 84 bytes spill loads
 Used 255 registers, used 1 barriers, 88 bytes cumulative stack size
-Compile time = 81.358 ms
+Compile time = 80.534 ms
 Compiling entry function 'attn_decode_f16' for 'sm_120'
 Function properties for attn_decode_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 72 registers, used 1 barriers, 1056 bytes smem
-Compile time = 28.057 ms
+Compile time = 28.093 ms
 Compiling entry function 'attn_combine_f16' for 'sm_120'
 Function properties for attn_combine_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 39 registers, used 0 barriers
-Compile time = 8.709 ms
+Compile time = 8.297 ms
 Compiling entry function 'add_layernorm_f16' for 'sm_120'
 Function properties for add_layernorm_f16
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 93 registers, used 0 barriers
-Compile time = 24.022 ms
+Compile time = 23.247 ms
 Compiling entry function 'add_f16x8' for 'sm_120'
 Function properties for add_f16x8
     0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
 Used 22 registers, used 0 barriers
-Compile time = 1.389 ms
+Compile time = 1.228 ms

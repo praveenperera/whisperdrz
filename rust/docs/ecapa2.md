@@ -164,6 +164,17 @@ rest.
   interleaved to match on load. `dense_2` is a transposed GEMM onto a copy of its bias,
   in full FP32 in both modes, as torch runs it.
 - `F.normalize` runs on the host in f64 (`normalize`).
+- Squeeze-excitation is two kernels per block. `ecapa_channel_mean` runs one block per
+  channel: each thread sums every 256th interior element in order, 16 loads in flight
+  at a time, and a fixed-order block reduction adds the threads. `ecapa_se_fc` is one
+  block for the whole MLP: each hidden unit and each output channel is one thread's dot
+  product in index order, with the weights staged through padded shared tiles that the
+  block loads coalesced. Walking a weight row straight from global memory made each lane
+  of a warp read its own cache line. Both keep the summation order of a plain loop, so
+  their outputs don't depend on the tiling. Taking the channel mean from per-row sums
+  written by the conv epilogue instead saved a pass over the block output, but the new
+  order took the F16Convs per-layer max-abs ratio past 1.5 (1.52 to 1.88), so it was
+  dropped.
 
 ### Batch norm
 
@@ -197,8 +208,13 @@ border or saves almost nothing.
   for the squeeze-excitation. Trunk rows round to 8 columns instead of 4, and the FP16
   weight rows pad to 8 values (`conv3x3_layout_f16`), so every FP16 row starts 16-byte
   aligned. cuBLAS runs an `align8` kernel for the 192-channel blocks but `align2` ones for
-  the 164-channel blocks, whose `k = 3 * 164 = 492` is not a multiple of 8. conv_1.0,
-  the downsamples and the head keep their `Reference` precision.
+  the 164-channel blocks, whose `k = 3 * 164 = 492` is not a multiple of 8. Padding `k`
+  to 496 with zero weights gets `align8` kernels, but cuBLAS's pick then swings with the
+  crop length: from 1.17x faster to 0.90x across 101 to 1001 frames, and a wash
+  (0.998x) over the trunk's shapes at crop lengths spread evenly from 1 to 10 s, as
+  speaker crops are. No fixed cuBLASLt algorithm did better than 1.017x over the same
+  sweep, so `k` stays 492. conv_1.0, the downsamples and the head keep their
+  `Reference` precision.
 
 ## Tests
 
