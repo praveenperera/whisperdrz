@@ -2,16 +2,22 @@
 //! the convolutions, the DFT and the final linear layer
 //!
 //! The 2D trunk keeps activations as `[rows][channels][cols]` (frequency-major, time
-//! innermost) with a one-element zero border on rows and columns when `pad` is 1, so a
-//! 3x3 convolution is three strided-batched GEMMs reading shifted views of the buffer.
-//! Kernels that write such a buffer cover its whole extent and write zeros on the border,
-//! which keeps every conv input's padding zero. The 1D head uses `[channels][frames]` with
-//! `pad` 0. Batch norm arrives as one `[3][channels]` slice: running mean, then
+//! innermost) with a one-element zero border on rows and columns when `pad` is 1. The
+//! interior is `width` columns from column `pad`; `cols` is rounded up past
+//! `width + 2 pad` to a multiple of 4, so every row starts 16-byte aligned for the GEMMs,
+//! and the extra columns count as border. A 3x3 convolution is one GEMM per kernel
+//! column stacked into one (`N = 3 co`) over unshifted rows, and
+//! [`ecapa_conv3x3_epilogue`] sums the three column-shifted products. Kernels that write
+//! such a buffer cover its whole extent and write zeros on the border, which keeps every
+//! conv input's padding zero. The 1D head uses `[channels][frames]` with `pad` 0 and
+//! `width == cols`. Batch norm arrives as one `[3][channels]` slice: running mean, then
 //! `weight / sqrt(var + eps)`, then bias, applied as torch does, `(x - mean) * k + b`
 
 use cuda_device::cooperative_groups::ops::{Max, Sum};
 use cuda_device::cooperative_groups::{ThreadGroup, block_reduce, this_thread_block};
 use cuda_device::{BlockRows, DisjointSlice, SharedArray, kernel, launch_contract, thread};
+
+use crate::common::f2h;
 
 /// Threads per block of the block-per-row kernels
 const BLOCK: u32 = 256;
@@ -81,7 +87,8 @@ pub fn ecapa_log_power(mut out: DisjointSlice<f32>, y: &[f32], frames: u32, bins
 }
 
 /// Each row of `x` (`[rows - 2 pad][cols]`) minus its mean, into the padded trunk input
-/// `out` (`[rows][cols + 2 pad]`, one block per output row, zero border)
+/// `out` (`[rows][at least cols + 2 pad]`, one block per output row, zero border and
+/// zeros past the interior)
 #[kernel(launch_context = lc)]
 #[launch_contract(domain = 1, coordinates = u32, block = (256, 1, 1))]
 pub fn ecapa_center_rows(
@@ -125,9 +132,10 @@ pub fn ecapa_center_rows(
 }
 
 /// True for a border element of a `[rows][channels][cols]` buffer with a `pad` border
+/// around `width` interior columns (the columns past `pad + width` are border too)
 #[inline(always)]
-fn on_border(h: u32, w: u32, rows: u32, cols: u32, pad: u32) -> bool {
-    pad != 0 && (h == 0 || h == rows - 1 || w == 0 || w == cols - 1)
+fn on_border(h: u32, w: u32, rows: u32, width: u32, pad: u32) -> bool {
+    pad != 0 && (h == 0 || h == rows - 1 || w < pad || w >= pad + width)
 }
 
 /// The conv epilogue in place over a whole `[rows][channels][cols]` buffer: add `bias`,
@@ -143,6 +151,7 @@ pub fn ecapa_conv_epilogue(
     channels: u32,
     cols: u32,
     pad: u32,
+    width: u32,
     relu_on: u32,
 ) {
     let t = thread::index_1d_u32(lc);
@@ -151,7 +160,7 @@ pub fn ecapa_conv_epilogue(
     let w = i % cols;
     let c = (i / cols) % channels;
     let h = i / (cols * channels);
-    if on_border(h, w, rows, cols, pad) {
+    if on_border(h, w, rows, width, pad) {
         y.write(0.0);
         return;
     }
@@ -170,6 +179,81 @@ pub fn ecapa_conv_epilogue(
     y.write(v);
 }
 
+/// A 3x3 conv's epilogue over padded output rows `row0..` of a trunk buffer (`out` holds
+/// whole rows from `row0`): sums the three kernel columns' products from `y`, then adds
+/// `bias`, applies ReLU and batch norm `bn`, with zeros on the border. `y` is the
+/// stacked GEMM's `[rows][3 kw][channels][cols]` over interior rows from `yrow0`, each
+/// computed at every column of the unshifted input, so output column `w` takes kernel
+/// column `kw` from column `w + kw - 1`. Needs `pad` 1
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn ecapa_conv3x3_epilogue(
+    mut out: DisjointSlice<f32>,
+    y: &[f32],
+    bias: &[f32],
+    bn: &[f32],
+    row0: u32,
+    yrow0: u32,
+    rows: u32,
+    channels: u32,
+    cols: u32,
+    width: u32,
+) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get();
+    let Some(mut out) = out.element_thread32(t) else { return };
+    out.write(conv3x3_output(i, y, bias, bn, (row0, yrow0, rows, channels, cols, width)));
+}
+
+/// [`ecapa_conv3x3_epilogue`] writing FP16 (round to nearest even), for an output only
+/// the next conv's FP16-input GEMM reads
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn ecapa_conv3x3_epilogue_f16(
+    mut out: DisjointSlice<u16>,
+    y: &[f32],
+    bias: &[f32],
+    bn: &[f32],
+    row0: u32,
+    yrow0: u32,
+    rows: u32,
+    channels: u32,
+    cols: u32,
+    width: u32,
+) {
+    let t = thread::index_1d_u32(lc);
+    let i = t.get();
+    let Some(mut out) = out.element_thread32(t) else { return };
+    let v = conv3x3_output(i, y, bias, bn, (row0, yrow0, rows, channels, cols, width));
+    out.write(f2h(v));
+}
+
+/// Element `i` of a 3x3 conv epilogue's output (see [`ecapa_conv3x3_epilogue`]): zero
+/// on the border, else the three shifted products plus bias, ReLU, batch norm
+#[inline(always)]
+fn conv3x3_output(
+    i: u32,
+    y: &[f32],
+    bias: &[f32],
+    bn: &[f32],
+    (row0, yrow0, rows, channels, cols, width): (u32, u32, u32, u32, u32, u32),
+) -> f32 {
+    let w = i % cols;
+    let c = (i / cols) % channels;
+    let h = row0 + i / (cols * channels);
+    if on_border(h, w, rows, width, 1) {
+        return 0.0;
+    }
+
+    let plane = (channels * cols) as usize;
+    let base = (((h - 1 - yrow0) * 3 * channels + c) * cols + w) as usize;
+    // the order the three accumulating GEMMs summed in: kw 0, then 1, then 2
+    let v = y[base - 1] + y[base + plane] + y[base + 2 * plane + 1];
+    let c = c as usize;
+    let v = relu(v + bias[c]);
+    batch_norm(v, bn, c, channels as usize)
+}
+
 /// Per-channel mean over the interior of a `[rows][channels][cols]` buffer (one block
 /// per channel, `out` is `[channels][1]`): squeeze-excitation's average pool
 #[kernel(launch_context = lc)]
@@ -181,11 +265,12 @@ pub fn ecapa_channel_mean(
     channels: u32,
     cols: u32,
     pad: u32,
+    width: u32,
 ) {
     static mut SMEM: SharedArray<f32, WARPS> = SharedArray::UNINIT;
     let Some(mut row) = out.block_row32(lc) else { return };
     let c = row.row();
-    let (h_in, w_in) = (rows - 2 * pad, cols - 2 * pad);
+    let (h_in, w_in) = (rows - 2 * pad, width);
     let n = h_in * w_in;
     if x.len() < (rows * channels * cols) as usize {
         return;
@@ -273,6 +358,7 @@ pub fn ecapa_scale_residual(
     channels: u32,
     cols: u32,
     pad: u32,
+    width: u32,
 ) {
     let t = thread::index_1d_u32(lc);
     let i = t.get();
@@ -280,7 +366,7 @@ pub fn ecapa_scale_residual(
     let w = i % cols;
     let c = (i / cols) % channels;
     let h = i / (cols * channels);
-    if on_border(h, w, rows, cols, pad) {
+    if on_border(h, w, rows, width, pad) {
         out.write(0.0);
         return;
     }
@@ -288,6 +374,41 @@ pub fn ecapa_scale_residual(
     let i = i as usize;
     let v = x[i] * s[c as usize];
     out.write(if r.is_empty() { v } else { v + r[i] });
+}
+
+/// [`ecapa_scale_residual`] that also writes its output as FP16 (round to nearest even)
+/// into `out_h`, the copy the next block's FP16-input conv reads
+#[kernel(launch_context = lc)]
+#[launch_contract(domain = 1, coordinates = u32)]
+pub fn ecapa_scale_residual_f16(
+    mut out: DisjointSlice<f32>,
+    mut out_h: DisjointSlice<u16>,
+    x: &[f32],
+    s: &[f32],
+    r: &[f32],
+    rows: u32,
+    channels: u32,
+    cols: u32,
+    pad: u32,
+    width: u32,
+) {
+    let t = thread::index_1d_u32(lc);
+    let th = thread::index_1d_u32(lc);
+    let i = t.get();
+    let Some(mut out) = out.element_thread32(t) else { return };
+    let Some(mut out_h) = out_h.element_thread32(th) else { return };
+    let w = i % cols;
+    let c = (i / cols) % channels;
+    let h = i / (cols * channels);
+    let v = if on_border(h, w, rows, width, pad) {
+        0.0
+    } else {
+        let i = i as usize;
+        let v = x[i] * s[c as usize];
+        if r.is_empty() { v } else { v + r[i] }
+    };
+    out.write(v);
+    out_h.write(f2h(v));
 }
 
 /// Res2Net group input: `a + b` (`b` empty for the first group) over `[channels][frames]`,

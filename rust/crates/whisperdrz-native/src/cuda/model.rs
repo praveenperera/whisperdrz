@@ -87,8 +87,10 @@ impl GpuModel {
             mel: gpu.alloc(max_batch * N_MELS * N_FRAMES * 2)?,
             slot_ids: gpu.alloc((slots + 1) * 4)?,
             // torch runs ECAPA2's convs in TF32 by default; full FP32 ran on SIMT cores and
-            // took over a third of the wall time
-            ecapa: Ecapa2::load(&gpu, ecapa, Precision::Reference)?,
+            // took over a third of the wall time. FP16 inputs to the trunk convs (FP32 sums)
+            // halve the TF32 GEMM time again and keep every layer within 1.5x of torch's
+            // TF32 error
+            ecapa: Ecapa2::load(&gpu, ecapa, Precision::F16Convs)?,
             encoder,
             blas,
             gpu,

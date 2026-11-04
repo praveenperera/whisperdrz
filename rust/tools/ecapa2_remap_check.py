@@ -8,6 +8,7 @@ and audio, with the recorded `random.uniform`/`randint` draws replayed in order 
   recorded   the embeddings the trace recorded (a control: must reproduce the trace)
   fp32       the native runtime in FP32, from `ours.json`
   reference  the native runtime with TF32 convolutions, from `ours.json`
+  f16convs   the native runtime with FP16-input trunk convs, from `ours.json`
   truth      torch in FP32 with TF32 off, from the `manifest.json` beside `ours.json`
 
 and compares each output text with the recorded one, line by line. Also reports how
@@ -122,7 +123,7 @@ def main():
         embeds = [e for e in ev_list if e["ev"] == "_embed_audio_segment"]
         recorded = [e["ret"]["data"] for e in embeds]
         variants = {"recorded": recorded}
-        for mode in ("fp32", "reference"):
+        for mode in ours:
             variants[mode] = [ours[mode][f"{args.set}-{stem}-{e['seq']}"]["embedding"] for e in embeds]
         variants["truth"] = [truth[f"{args.set}-{stem}-{e['seq']}"] for e in embeds]
 

@@ -11,9 +11,11 @@
 //! Every convolution, the DFT and the last linear layer are cuBLAS FP32 GEMMs; the glue
 //! is the `ecapa_*` cuda-oxide kernels. The 2D trunk stores activations as
 //! `[rows][channels][cols]` with frequency as rows, time as columns and a one-element
-//! zero border, so a 3x3 conv is three strided-batched GEMMs over shifted views (one per
-//! kernel column, with the three kernel rows folded into the inner dimension) and the
-//! trunk output feeds the head's first 1x1 conv in place
+//! zero border, with `cols` rounded up to a multiple of 4 so every row is 16-byte
+//! aligned. A 3x3 conv is one strided-batched GEMM over the unshifted input rows that
+//! computes all three kernel columns at once (`N = 3 co`, the three kernel rows folded
+//! into the inner dimension); its epilogue kernel sums the three products at their
+//! column shifts. The trunk output feeds the head's first 1x1 conv in place
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -46,6 +48,12 @@ const HEAD: usize = 1024;
 const POOL_IN: usize = 1536;
 const ATTENTION: usize = 128;
 const ELEMENTWISE_BLOCK: u32 = 256;
+/// Most bytes of a 3x3 conv's stacked product (`3 co` channels per row) held at once;
+/// a conv whose product is larger runs in chunks of output rows. At this size a chunk
+/// stays in L2 for the epilogue that reads it back, which was as fast on vox3 as one
+/// product for the whole crop (2230 against 2201 ms of ECAPA2) and saves hundreds of MB
+/// on long crops
+const CONV_SCRATCH: usize = 32 << 20;
 const ROW_BLOCK: u32 = 256;
 
 /// The 2D trunk in order: block name, stride of its first conv along frequency, and the
@@ -92,27 +100,51 @@ pub enum Precision {
     /// and the 1x1 downsamples), full FP32 for the DFT and the linear layer, as torch runs
     /// ECAPA2 under its default flags
     Reference,
+    /// [`Precision::Reference`] with the trunk's TF32 3x3 convs taking FP16 inputs
+    /// instead (the same 10-bit mantissa at twice the tensor rate, with FP16's narrower
+    /// exponent range) and FP32 products and sums; the head keeps TF32
+    F16Convs,
 }
 
 /// Shape of an activation buffer: `[rows][channels][cols]` with a `pad`-wide zero border
-/// on rows and cols. The 2D trunk uses pad 1 (rows are frequency, cols time); the 1D head
-/// uses one row and pad 0
+/// on rows and cols around `width` interior columns. The 2D trunk uses pad 1 (rows are
+/// frequency, cols time) and rounds `cols` up to a multiple of 4, the extra columns being
+/// zero border too, so each row starts 16-byte aligned and cuBLAS can take its vectorized
+/// kernels; the 1D head uses one row, pad 0 and `cols == width`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Grid {
     pub rows: usize,
     pub channels: usize,
     pub cols: usize,
     pub pad: usize,
+    pub width: usize,
 }
 
 impl Grid {
-    /// A trunk buffer for `height` frequency rows of `channels` over `frames`
+    /// A trunk buffer for `height` frequency rows of `channels` over `frames`, its rows
+    /// 16-byte aligned in FP32
     pub fn trunk(height: usize, channels: usize, frames: usize) -> Self {
+        Self::trunk_aligned(height, channels, frames, 4)
+    }
+
+    /// A trunk buffer whose `cols` is a multiple of `align` elements (8 keeps FP16 copies
+    /// of it 16-byte aligned too)
+    pub fn trunk_aligned(height: usize, channels: usize, frames: usize, align: usize) -> Self {
         Self {
             rows: height + 2,
             channels,
-            cols: frames + 2,
+            cols: (frames + 2).next_multiple_of(align),
             pad: 1,
+            width: frames,
+        }
+    }
+
+    /// The same columns with `height` interior rows of `channels`
+    fn reshaped(&self, height: usize, channels: usize) -> Self {
+        Self {
+            rows: height + 2 * self.pad,
+            channels,
+            ..*self
         }
     }
 
@@ -123,6 +155,7 @@ impl Grid {
             channels,
             cols: frames,
             pad: 0,
+            width: frames,
         }
     }
 
@@ -134,13 +167,9 @@ impl Grid {
         self.len() == 0
     }
 
-    /// Interior rows and columns
+    /// Interior rows
     pub fn height(&self) -> usize {
         self.rows - 2 * self.pad
-    }
-
-    pub fn width(&self) -> usize {
-        self.cols - 2 * self.pad
     }
 
     /// Element offset of interior row 0, channel 0, column 0
@@ -148,18 +177,19 @@ impl Grid {
         (self.pad * self.channels) * self.cols + self.pad
     }
 
-    fn args(&self) -> [Arg; 4] {
+    fn args(&self) -> [Arg; 5] {
         [
             self.rows.into(),
             self.channels.into(),
             self.cols.into(),
             self.pad.into(),
+            self.width.into(),
         ]
     }
 
     /// The interior as torch's `[channels][height][width]` (or `[channels][width]`)
     pub fn to_torch(&self, data: &[f32]) -> Vec<f32> {
-        let (h, w) = (self.height(), self.width());
+        let (h, w) = (self.height(), self.width);
         let mut out = Vec::with_capacity(self.channels * h * w);
         for c in 0..self.channels {
             for r in 0..h {
@@ -262,9 +292,15 @@ impl Steps<'_> {
     }
 
     /// Each row of `x` (`[height][frames]`) minus its mean over time, into the trunk
-    /// input `out` with one channel
-    pub fn center_rows(&self, out: &Buf, x: &Buf, height: usize, frames: usize) -> Result<Grid> {
-        let grid = Grid::trunk(height, 1, frames);
+    /// input `out` with one channel and `cols` a multiple of `align`
+    pub fn center_rows(
+        &self,
+        out: &Buf,
+        x: &Buf,
+        (height, frames): (usize, usize),
+        align: usize,
+    ) -> Result<Grid> {
+        let grid = Grid::trunk_aligned(height, 1, frames, align);
         self.per_row(
             "ecapa_center_rows",
             grid.rows,
@@ -281,36 +317,97 @@ impl Steps<'_> {
     }
 
     /// 3x3 conv (padding 1, stride `stride` along rows) of trunk buffer `x` into `out`,
-    /// without bias: one strided-batched GEMM per kernel column over the output rows.
-    /// `w` is `[3 kw][co][3 kh * ci]`
+    /// then bias, ReLU and batch norm (`[mean; k; b]` over `co`). `w` is
+    /// `[3 kw][co][3 kh * ci]`, which is the `[3 co][3 ci]` matrix of all three kernel
+    /// columns: one strided-batched GEMM per chunk of output rows writes each column's
+    /// product at every input column into `scratch` (`[rows][3 kw][co][cols]`, as many
+    /// rows as fit), aligned because it never shifts a pointer by a column, and the
+    /// epilogue kernel adds the three at their shifts. Under [`F32Math::F16Inputs`] `x`
+    /// and `w` hold FP16, `w` laid out by [`conv3x3_layout_f16`]; `out` holds FP16 when
+    /// `out_f16`, else FP32
+    #[allow(clippy::too_many_arguments)]
     pub fn conv3x3(
         &self,
         math: F32Math,
         (x, g): (&Buf, Grid),
-        out: &Buf,
+        scratch: &Buf,
+        (out, out_f16): (&Buf, bool),
         w: &Buf,
+        (bias, bn): (&Buf, &Buf),
         co: usize,
         stride: usize,
     ) -> Result<Grid> {
         let ci = g.channels;
         let height = g.height() / stride;
-        let o = Grid::trunk(height, co, g.width());
+        let o = g.reshaped(height, co);
+        let in_size = if math == F32Math::F16Inputs { 2 } else { 4 };
+        let out_size = if out_f16 { 2 } else { 4 };
         ensure!(
             g.pad == 1 && g.height().is_multiple_of(stride),
             "conv3x3 input {g:?}"
         );
-        ensure!(o.len() * 4 <= out.bytes(), "conv3x3 output {o:?} overflows");
-        for kw in 0..3 {
+        ensure!(
+            g.len() * in_size <= x.bytes() && o.len() * out_size <= out.bytes(),
+            "conv3x3 {g:?} -> {o:?} overflows its buffers"
+        );
+        let w_ld = weight_ld(math, ci);
+        ensure!(
+            w.bytes() >= 3 * co * w_ld * in_size
+                && bias.bytes() >= co * 4
+                && bn.bytes() >= 3 * co * 4,
+            "conv3x3 weights for {ci} -> {co}"
+        );
+        let plane = 3 * co * o.cols;
+        let chunk = (scratch.bytes() / (plane * 4)).min(height);
+        ensure!(chunk > 0, "conv3x3 scratch holds no row of {plane} values");
+
+        let mut r0 = 0;
+        while r0 < height {
+            let n = chunk.min(height - r0);
             self.blas.gemm_f32(
                 math,
                 (false, false),
-                (o.width(), co, 3 * ci),
-                Operand::strided(at(x, kw), g.cols, stride * ci * g.cols),
-                Operand::new(at(w, kw * co * 3 * ci), 3 * ci),
-                Operand::strided(at(out, o.origin()), o.cols, co * o.cols),
-                height,
-                if kw == 0 { 0.0 } else { 1.0 },
+                (g.cols, 3 * co, 3 * ci),
+                Operand::strided(
+                    x.at(r0 * stride * ci * g.cols * in_size),
+                    g.cols,
+                    stride * ci * g.cols,
+                ),
+                Operand::new(w.ptr(), w_ld),
+                Operand::strided(scratch.ptr(), o.cols, plane),
+                n,
+                0.0,
             )?;
+            // padded output rows this chunk writes: its interior rows, plus the border
+            // row above the first chunk and below the last
+            let p0 = if r0 == 0 { 0 } else { r0 + 1 };
+            let p1 = if r0 + n == height { o.rows } else { r0 + n + 1 };
+            let len = (p1 - p0) * co * o.cols;
+            let (name, out_arg) = if out_f16 {
+                (
+                    "ecapa_conv3x3_epilogue_f16",
+                    Arg::slice(out.at(p0 * co * o.cols * 2), len),
+                )
+            } else {
+                ("ecapa_conv3x3_epilogue", slice(out, p0 * co * o.cols, len))
+            };
+            self.elementwise(
+                name,
+                len,
+                &[
+                    out_arg,
+                    slice(scratch, 0, n * plane),
+                    slice(bias, 0, co),
+                    slice(bn, 0, 3 * co),
+                    p0.into(),
+                    r0.into(),
+                    o.rows.into(),
+                    co.into(),
+                    o.cols.into(),
+                    o.width.into(),
+                ],
+            )?;
+            r0 += n;
         }
 
         Ok(o)
@@ -328,7 +425,7 @@ impl Steps<'_> {
         co: usize,
     ) -> Result<Grid> {
         let ci = g.channels;
-        let o = Grid::trunk(g.height() / 2, co, g.width());
+        let o = g.reshaped(g.height() / 2, co);
         ensure!(
             g.pad == 1 && g.height().is_multiple_of(2),
             "downsample input {g:?}"
@@ -337,13 +434,15 @@ impl Steps<'_> {
             o.len() * 4 <= out.bytes(),
             "downsample output {o:?} overflows"
         );
+        // every column from 0, so the operands stay 16-byte aligned; the border columns
+        // come out as products of zeros, and the epilogue rewrites them anyway
         self.blas.gemm_f32(
             math,
             (false, false),
-            (o.width(), co, ci),
-            Operand::strided(at(x, g.origin()), g.cols, 2 * ci * g.cols),
+            (o.cols, co, ci),
+            Operand::strided(at(x, ci * g.cols), g.cols, 2 * ci * g.cols),
             Operand::new(w.ptr(), ci),
-            Operand::strided(at(out, o.origin()), o.cols, co * o.cols),
+            Operand::strided(at(out, co * o.cols), o.cols, co * o.cols),
             o.height(),
             0.0,
         )?;
@@ -384,7 +483,7 @@ impl Steps<'_> {
         bn: Arg,
         relu: bool,
     ) -> Result<()> {
-        let [rows, channels, cols, pad] = g.args();
+        let [rows, channels, cols, pad, width] = g.args();
         self.elementwise(
             "ecapa_conv_epilogue",
             g.len(),
@@ -396,6 +495,7 @@ impl Steps<'_> {
                 channels,
                 cols,
                 pad,
+                width,
                 u32::from(relu).into(),
             ],
         )
@@ -403,7 +503,7 @@ impl Steps<'_> {
 
     /// Per-channel mean of the interior of `x`
     pub fn channel_mean(&self, out: &Buf, x: &Buf, g: Grid) -> Result<()> {
-        let [rows, channels, cols, pad] = g.args();
+        let [rows, channels, cols, pad, width] = g.args();
         self.per_row(
             "ecapa_channel_mean",
             g.channels,
@@ -415,6 +515,7 @@ impl Steps<'_> {
                 channels,
                 cols,
                 pad,
+                width,
             ],
         )
     }
@@ -438,30 +539,38 @@ impl Steps<'_> {
         )
     }
 
-    /// `out = x * s[channel] + r` (no `r` for none) over buffers of shape `g`
+    /// `out = x * s[channel] + r` (no `r` for none) over buffers of shape `g`, also
+    /// written as FP16 to `out_h` when given
     pub fn scale_residual(
         &self,
-        out: &Buf,
+        (out, out_h): (&Buf, Option<&Buf>),
         x: &Buf,
         s: &Buf,
         r: Option<&Buf>,
         g: Grid,
     ) -> Result<()> {
-        let [rows, channels, cols, pad] = g.args();
-        self.elementwise(
-            "ecapa_scale_residual",
-            g.len(),
-            &[
-                slice(out, 0, g.len()),
-                slice(x, 0, g.len()),
-                slice(s, 0, g.channels),
-                r.map_or(Arg::EMPTY, |r| slice(r, 0, g.len())),
-                rows,
-                channels,
-                cols,
-                pad,
-            ],
-        )
+        let [rows, channels, cols, pad, width] = g.args();
+        let mut args = vec![slice(out, 0, g.len())];
+        if let Some(h) = out_h {
+            ensure!(h.bytes() >= g.len() * 2, "FP16 copy of {g:?} overflows");
+            args.push(Arg::slice(h.ptr(), g.len()));
+        }
+        args.extend([
+            slice(x, 0, g.len()),
+            slice(s, 0, g.channels),
+            r.map_or(Arg::EMPTY, |r| slice(r, 0, g.len())),
+            rows,
+            channels,
+            cols,
+            pad,
+            width,
+        ]);
+        let name = if out_h.is_some() {
+            "ecapa_scale_residual_f16"
+        } else {
+            "ecapa_scale_residual"
+        };
+        self.elementwise(name, g.len(), &args)
     }
 
     /// `a + b` (or `a` alone) over `[channels][frames]`, reflect-padded by `pad` frames
@@ -519,9 +628,11 @@ impl Steps<'_> {
     }
 }
 
-/// One conv layer of the trunk: weights `[3 kw][co][3 kh * ci]`, bias, batch norm
+/// One conv layer of the trunk: weights `[3 kw][co][3 kh * ci]` (and their FP16 copy
+/// under [`Precision::F16Convs`], for every conv but the first), bias, batch norm
 struct Conv2d {
     w: Buf,
+    w_h: Option<Buf>,
     bias: Buf,
     bn: Buf,
     co: usize,
@@ -687,8 +798,14 @@ impl Ecapa2 {
             let mut convs = Vec::with_capacity(3);
             for (layer, layer_ci) in [(0, ci), (3, co), (6, co)] {
                 let w = host.get(&format!("{name}.{layer}.weight"), &[co, layer_ci, 3, 3])?;
+                let w = conv3x3_layout(&w, co, layer_ci);
+
+                let w_h = (precision == Precision::F16Convs && layer_ci > 1)
+                    .then(|| gpu.upload(conv3x3_layout_f16(&w, co, layer_ci)))
+                    .transpose()?;
                 convs.push(Conv2d {
-                    w: up(conv3x3_layout(&w, co, layer_ci))?,
+                    w: up(w)?,
+                    w_h,
                     bias: up(host.get(&format!("{name}.{layer}.bias"), &[co])?)?,
                     bn: up(host.bn(&format!("{name}.{}", layer + 2), co)?)?,
                     co,
@@ -825,7 +942,7 @@ impl Ecapa2 {
     /// with TF32 allowed (its first conv and the 1x1 downsamples)
     fn conv_math(&self, exact: bool) -> F32Math {
         match self.precision {
-            Precision::Reference if !exact => F32Math::Tf32,
+            Precision::Reference | Precision::F16Convs if !exact => F32Math::Tf32,
             _ => F32Math::Full,
         }
     }
@@ -856,9 +973,9 @@ impl Ecapa2 {
                 let host: Vec<f32> = gpu.download(buf)?;
                 let data = g.to_torch(&host[..g.len()]);
                 let shape = match (g.pad, g.height()) {
-                    (0, _) => vec![g.channels, g.width()],
-                    (_, h) if g.channels == 1 => vec![h, g.width()],
-                    (_, h) => vec![g.channels, h, g.width()],
+                    (0, _) => vec![g.channels, g.width],
+                    (_, h) if g.channels == 1 => vec![h, g.width],
+                    (_, h) => vec![g.channels, h, g.width],
                 };
                 taps.push(Tap { name, shape, data });
             }
@@ -877,17 +994,33 @@ impl Ecapa2 {
         steps.log_power(&log_power, &spectrum, frames)?;
         drop((frame_buf, spectrum));
 
-        let max_grid = Grid::trunk(
-            BINS,
-            self.trunk[0].convs[0].co.max(self.trunk[19].convs[0].co),
-            frames,
-        );
+        // the largest trunk buffer, and the largest stacked conv product, any block makes
+        let f16 = self.precision == Precision::F16Convs;
+        let align = if f16 { 8 } else { 4 };
+        let (mut grid_len, mut product_len, mut height) =
+            (Grid::trunk_aligned(BINS, 1, frames, align).len(), 0, BINS);
+        for block in &self.trunk {
+            let co = block.convs[0].co;
+            height /= block.stride;
+            let o = Grid::trunk_aligned(height, co, frames, align);
+            grid_len = grid_len.max(o.len());
+            product_len = product_len.max(height * 3 * co * o.cols);
+        }
         let bufs: Vec<Buf> = (0..4)
-            .map(|_| gpu.alloc(max_grid.len() * 4))
+            .map(|_| gpu.alloc(grid_len * 4))
             .collect::<Result<_>>()?;
         let [mut cur, mut next, t1, t2]: [Buf; 4] =
             bufs.try_into().map_err(|_| eyre!("four buffers"))?;
-        let mut g = steps.center_rows(&cur, &log_power, BINS, frames)?;
+        let scratch = gpu.alloc(product_len.min(CONV_SCRATCH / 4) * 4)?;
+        // FP16 copies for the FP16-input convs: of `cur`/`next` for each block's first
+        // conv, and the first two convs' outputs, which only the next conv reads
+        let halves: Vec<Buf> = (0..if f16 { 4 } else { 0 })
+            .map(|_| gpu.alloc(grid_len * 2))
+            .collect::<Result<_>>()?;
+        let mut halves = halves.into_iter();
+        let (mut cur_h, mut next_h, t1_h, t2_h) =
+            (halves.next(), halves.next(), halves.next(), halves.next());
+        let mut g = steps.center_rows(&cur, &log_power, (BINS, frames), align)?;
         drop(log_power);
         tap("spec", &cur, g)?;
 
@@ -895,40 +1028,62 @@ impl Ecapa2 {
         let scale = gpu.alloc(HEAD * 4)?;
         for block in &self.trunk {
             let [a, b, c] = &block.convs;
+            // under F16Convs: conv a reads the FP16 copy of `cur` (the FP32 one for the
+            // exact first conv) and writes only FP16, conv b FP16 to FP16, and conv c
+            // writes FP32 for the squeeze-excitation and residual
+            let a_in = match (&cur_h, &a.w_h) {
+                (Some(h), Some(w)) => (F32Math::F16Inputs, h, w),
+                _ => (self.conv_math(g.channels == 1), &cur, &a.w),
+            };
             let og = steps.conv3x3(
-                self.conv_math(g.channels == 1),
-                (&cur, g),
-                &t1,
-                &a.w,
+                a_in.0,
+                (a_in.1, g),
+                &scratch,
+                (t1_h.as_ref().unwrap_or(&t1), t1_h.is_some()),
+                a_in.2,
+                (&a.bias, &a.bn),
                 a.co,
                 block.stride,
             )?;
-            steps.epilogue(
-                &t1,
-                0,
-                og,
-                slice(&a.bias, 0, a.co),
-                slice(&a.bn, 0, 3 * a.co),
-                true,
-            )?;
-            steps.conv3x3(self.conv_math(false), (&t1, og), &t2, &b.w, b.co, 1)?;
-            steps.epilogue(
-                &t2,
-                0,
-                og,
-                slice(&b.bias, 0, b.co),
-                slice(&b.bn, 0, 3 * b.co),
-                true,
-            )?;
-            steps.conv3x3(self.conv_math(false), (&t2, og), &t1, &c.w, c.co, 1)?;
-            steps.epilogue(
-                &t1,
-                0,
-                og,
-                slice(&c.bias, 0, c.co),
-                slice(&c.bn, 0, 3 * c.co),
-                true,
-            )?;
+            match (&t1_h, &t2_h, &b.w_h, &c.w_h) {
+                (Some(t1_h), Some(t2_h), Some(bw), Some(cw)) => {
+                    let math = F32Math::F16Inputs;
+                    steps.conv3x3(
+                        math,
+                        (t1_h, og),
+                        &scratch,
+                        (t2_h, true),
+                        bw,
+                        (&b.bias, &b.bn),
+                        b.co,
+                        1,
+                    )?;
+                    steps.conv3x3(
+                        math,
+                        (t2_h, og),
+                        &scratch,
+                        (&t1, false),
+                        cw,
+                        (&c.bias, &c.bn),
+                        c.co,
+                        1,
+                    )?;
+                }
+                _ => {
+                    for (conv, x, y) in [(b, &t1, &t2), (c, &t2, &t1)] {
+                        steps.conv3x3(
+                            self.conv_math(false),
+                            (x, og),
+                            &scratch,
+                            (y, false),
+                            &conv.w,
+                            (&conv.bias, &conv.bn),
+                            conv.co,
+                            1,
+                        )?;
+                    }
+                }
+            }
             steps.channel_mean(&mean, &t1, og)?;
             steps.se_fc(&scale, &mean, &block.se)?;
 
@@ -953,8 +1108,9 @@ impl Ecapa2 {
                     block.name
                 );
             }
-            steps.scale_residual(&next, &t1, &scale, residual, og)?;
+            steps.scale_residual((&next, next_h.as_ref()), &t1, &scale, residual, og)?;
             std::mem::swap(&mut cur, &mut next);
+            std::mem::swap(&mut cur_h, &mut next_h);
             g = og;
             tap(block.name, &cur, g)?;
         }
@@ -967,6 +1123,7 @@ impl Ecapa2 {
         );
         let hg = Grid::head(HEAD, frames);
         let h1 = gpu.alloc(hg.len() * 4)?;
+        drop((scratch, cur_h, next_h, t1_h, t2_h));
         steps.conv1d(
             self.conv_math(false),
             (at(&cur, g.origin()), g.cols),
@@ -988,7 +1145,7 @@ impl Ecapa2 {
         steps.channel_mean(&mean, &r_out, hg)?;
         steps.se_fc(&scale, &mean, &self.tdnn2_se)?;
         let h2 = r_in;
-        steps.scale_residual(&h2, &r_out, &scale, Some(&h1), hg)?;
+        steps.scale_residual((&h2, None), &r_out, &scale, Some(&h1), hg)?;
         drop((h1, res, r_out));
         tap("tdnn_2", &h2, hg)?;
 
@@ -1157,6 +1314,32 @@ pub fn conv3x3_layout(w: &[f32], co: usize, ci: usize) -> Vec<f32> {
                     out[(kw * co + o) * 3 * ci + kh * ci + c] = w[((o * ci + c) * 3 + kh) * 3 + kw];
                 }
             }
+        }
+    }
+
+    out
+}
+
+/// Leading dimension of a 3x3 conv's `[3 co][3 ci]` weight matrix. The FP16 copy pads
+/// each row to 8 values so every row starts 16-byte aligned (at 164 channels a 492-value
+/// row is only 8-byte aligned). cuBLAS still runs align2 kernels at 164 channels, as
+/// `k = 3 ci = 492` itself is not a multiple of 8
+fn weight_ld(math: F32Math, ci: usize) -> usize {
+    if math == F32Math::F16Inputs {
+        (3 * ci).next_multiple_of(8)
+    } else {
+        3 * ci
+    }
+}
+
+/// [`conv3x3_layout`] output `w` rounded to FP16, each `3 ci` row padded with zeros to
+/// the FP16 weight leading dimension
+pub fn conv3x3_layout_f16(w: &[f32], co: usize, ci: usize) -> Vec<u16> {
+    let (row, ld) = (3 * ci, weight_ld(F32Math::F16Inputs, ci));
+    let mut out = vec![0u16; 3 * co * ld];
+    for (dst, src) in out.chunks_exact_mut(ld).zip(w.chunks_exact(row)) {
+        for (d, &v) in dst.iter_mut().zip(src) {
+            *d = half::f16::from_f32(v).to_bits();
         }
     }
 

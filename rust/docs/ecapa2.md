@@ -117,25 +117,40 @@ truth used by the tests runs the same graph with `cudnn.allow_tf32 = False`.
 
 ## The native port
 
-All FP32. cuBLAS carries every convolution, the DFT and `dense_2`
-(`Blas::gemm_f32`, `cublasGemmStridedBatchedEx` with `CUBLAS_COMPUTE_32F`, or
-`CUBLAS_COMPUTE_32F_FAST_TF32` in the TF32 mode). The ten `ecapa_*` cuda-oxide kernels do
-the rest.
+Activations are FP32. cuBLAS carries every convolution, the DFT and `dense_2`
+(`Blas::gemm_f32`, `cublasGemmStridedBatchedEx` with `CUBLAS_COMPUTE_32F`,
+`CUBLAS_COMPUTE_32F_FAST_TF32` for the TF32 convs, or FP16 A and B with
+`CUBLAS_COMPUTE_32F` for the FP16-input convs). The `ecapa_*` cuda-oxide kernels do the
+rest.
 
 ### Layouts
 
 - Trunk activations are `[rows][channels][cols]`: frequency rows, time innermost, with a
-  one-element zero border on rows and columns (`Grid::trunk`). Each kernel that writes
-  one covers its whole extent and writes the border as zeros, so the border is always
-  the next conv's zero padding.
-- A 3x3 conv is three strided-batched GEMMs, one per kernel column `kw`, accumulating
-  (beta 0, then 1). In column-major terms each GEMM has `m` = output frames, `n` = output
-  channels and `k = 3 * Ci`, batched over the output rows. The A operand is a shifted
-  view of the input, `in + kw + s * h * Ci * Wp`, with `lda = Wp`. With that layout the
+  one-element zero border on rows and columns (`Grid::trunk`). `cols` (`Wp`) is the
+  frame count plus the border, rounded up to a multiple of 4 so every row starts 16-byte
+  aligned; the extra columns are border too. Each kernel that writes a trunk buffer
+  covers its whole extent and writes the border as zeros, so the border is always the
+  next conv's zero padding.
+- A 3x3 conv is one strided-batched GEMM per chunk of output rows, computing all three
+  kernel columns `kw` at once over the unshifted input. In column-major terms it has
+  `m = Wp` (every input column), `n = 3 * Co` and `k = 3 * Ci`, batched over the output
+  rows. The A operand is the input from column 0 with `lda = Wp`; with that layout the
   three kernel rows and the input channels form one contiguous inner index
   `kh * Ci + ci` of stride `Wp`. Weights are re-laid on load to `[kw][Co][kh * Ci + ci]`
-  (`conv3x3_layout`). A stride of 2 only changes the batch stride.
-- A downsample is one strided-batched GEMM over every other input row.
+  (`conv3x3_layout`), which is the `[3 Co][3 Ci]` B operand. The product goes to a
+  scratch buffer `[rows][kw][Co][Wp]`, and `ecapa_conv3x3_epilogue` sums the three
+  kernel columns at their shifts (`kw` from column `w + kw - 1`), in the order three
+  accumulating GEMMs would, then adds bias, ReLU and batch norm. A stride of 2 only
+  changes the batch stride. The scratch holds at most 32 MiB, so the product of a long
+  crop runs in row chunks that stay in L2 for the epilogue.
+- Why one stacked GEMM: shifting the A pointer by `kw` columns, as three per-column
+  GEMMs would, breaks 16-byte alignment and makes cuBLAS take its `align1` kernels.
+  More of the loss, though, came from `n = Co = 164` filling 128-wide tiles only 64%;
+  `n = 3 * Co = 492` fills them 96%. Measured on the RTX 5090 at one 128-row, 1000-frame
+  conv: 1099 us for the three accumulating `align1` GEMMs, 1053 us with only the
+  pointers aligned, 703 us for the stacked `align4` GEMM.
+- A downsample is one strided-batched GEMM over every other input row, from column 0 so
+  it stays aligned.
 - `tdnn_1` reads the trunk output in place: interior rows and channels form one inner
   dimension of stride `Wp`. Its weight columns are reordered on load from torch's
   `c * 16 + h` to the buffer's `h * 192 + c`.
@@ -168,12 +183,22 @@ border or saves almost nothing.
 
 ### Precision modes (`Precision`)
 
-- `Fp32`: every GEMM in full FP32. This is the closest to the FP32 truth and is what
-  the runtime uses.
+- `Fp32`: every GEMM in full FP32. This is the closest to the FP32 truth.
 - `Reference`: TF32 where torch uses it (every conv except conv_1.0 and the
   downsamples), full FP32 for the DFT and `dense_2`. This mirrors the transcriber's
   dispatch, but cuBLAS's TF32 kernels are not cuDNN's, so the rounding differs in
   detail.
+- `F16Convs`, what the runtime uses: `Reference`, with the trunk's TF32 3x3 convs
+  taking FP16 inputs and summing in FP32. FP16 keeps TF32's 10-bit mantissa and runs at
+  twice the tensor rate; the trunk's values stay far inside its exponent range. Each
+  block's first conv reads an FP16 copy of the block input, written by the previous
+  block's `ecapa_scale_residual_f16` beside the FP32 one the residual reads. The first
+  two convs write only FP16 (`ecapa_conv3x3_epilogue_f16`) and the third writes FP32
+  for the squeeze-excitation. Trunk rows round to 8 columns instead of 4, and the FP16
+  weight rows pad to 8 values (`conv3x3_layout_f16`), so every FP16 row starts 16-byte
+  aligned. cuBLAS runs an `align8` kernel for the 192-channel blocks but `align2` ones for
+  the 164-channel blocks, whose `k = 3 * 164 = 492` is not a multiple of 8. conv_1.0,
+  the downsamples and the head keep their `Reference` precision.
 
 ## Tests
 
@@ -222,9 +247,15 @@ End to end, cosine over 76 segments:
 | `Reference` | 0.999997349 / 0.999999821 | 0.999999624 / 0.999999870 |
 | torch FP32 truth | 0.9999975 (min) | |
 
+Layers in `F16Convs` mode: all 78 rows within 1.5x of torch's reference-mode error; the
+worst max-abs ratio is 1.39 (e21c600 conv_3) and the worst mean-abs ratio 1.05
+(e21c600 embedding). End to
+end, cosine over the 76 segments is 0.999996995 min / 0.999999821 mean against the
+recorded embeddings and 0.999999510 / 0.999999865 against the FP32 truth.
+
 Speaker remap on short3 (nctdh, willh, ikgcq): the output is identical to the trace in
-all four replays (recorded, `Fp32`, `Reference`, torch truth).
+all five replays (recorded, `Fp32`, `Reference`, `F16Convs`, torch truth).
 
 On ikgcq one recorded pairwise distance is 6.0e-4 from the 1.1 threshold. Our `Fp32`
 embeddings move pairwise distances by up to 5.39e-4, the same amount torch's own FP32
-truth moves them. The margin is torch's TF32-vs-FP32 difference, not the port's.
+truth moves them; `F16Convs` moves them by up to 5.08e-4. The margin is torch's TF32-vs-FP32 difference, not the port's.

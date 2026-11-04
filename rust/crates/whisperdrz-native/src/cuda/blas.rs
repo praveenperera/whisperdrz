@@ -270,6 +270,9 @@ pub enum F32Math {
     /// the precision of torch's cuDNN convolutions under its default
     /// `torch.backends.cudnn.allow_tf32 = True`
     Tf32,
+    /// A and B stored as FP16, FP32 products and sums on tensor cores, C in FP32: TF32's
+    /// 10-bit mantissa at about twice its tensor rate, but FP16's narrower range
+    F16Inputs,
 }
 
 /// One FP32 operand of a strided-batched GEMM: device address, leading dimension and
@@ -549,7 +552,9 @@ impl Blas {
 
     /// Column-major FP32 `c[i] = op(a[i]) @ op(b[i]) + beta c[i]` for `batch` entries,
     /// `c` being `m x n` and the product's inner dimension `k`, through
-    /// `cublasGemmStridedBatchedEx` with the default algorithm
+    /// `cublasGemmStridedBatchedEx` with the default algorithm; `a` and `b` hold FP16
+    /// under [`F32Math::F16Inputs`] and FP32 otherwise, with leading dimensions and
+    /// strides in elements either way
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_f32(
         &self,
@@ -570,10 +575,14 @@ impl Blas {
             }
         };
         let compute = match math {
-            F32Math::Full => blas::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            F32Math::Full | F32Math::F16Inputs => blas::cublasComputeType_t::CUBLAS_COMPUTE_32F,
             F32Math::Tf32 => blas::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
         };
         let f32t = blas::cudaDataType::CUDA_R_32F;
+        let input = match math {
+            F32Math::F16Inputs => blas::cudaDataType::CUDA_R_16F,
+            _ => f32t,
+        };
         let alpha = 1f32;
         let dim = |v: usize| c_int::try_from(v).wrap_err("GEMM dimension overflows int");
         let stride = |v: usize| i64::try_from(v).wrap_err("GEMM stride overflows i64");
@@ -588,11 +597,11 @@ impl Blas {
                     dim(k)?,
                     (&alpha as *const f32).cast(),
                     a.ptr as *const c_void,
-                    f32t,
+                    input,
                     dim(a.ld)?,
                     stride(a.stride)?,
                     b.ptr as *const c_void,
-                    f32t,
+                    input,
                     dim(b.ld)?,
                     stride(b.stride)?,
                     (&beta as *const f32).cast(),

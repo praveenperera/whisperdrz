@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use whisperdrz_fixtures::{ArrayData, read_npy};
 use whisperdrz_native::cuda::device::{Arg, Buf};
 use whisperdrz_native::cuda::ecapa2::{
-    Ecapa2, Grid, Precision, Se, Steps, conv3x3_layout, dft_basis, normalize,
+    Ecapa2, Grid, Precision, Se, Steps, conv3x3_layout, conv3x3_layout_f16, dft_basis, normalize,
 };
 use whisperdrz_native::cuda::{Blas, F32Math, Gpu};
 
@@ -302,7 +302,7 @@ fn kernels_match_f64() -> Result<()> {
     let g = Grid::trunk(h, 1, w);
     let c_buf = nan(&gpu, g.len())?;
     ensure!(
-        steps.center_rows(&c_buf, &x_buf, h, w)? == g,
+        steps.center_rows(&c_buf, &x_buf, (h, w), 4)? == g,
         "center_rows grid"
     );
     let mut want = vec![0f64; h * w];
@@ -321,28 +321,160 @@ fn kernels_match_f64() -> Result<()> {
         sum_bound(4.0) + 4.0 * f32::EPSILON as f64 * 8.0,
     );
 
-    // 3x3 convs at both strides, then the epilogue (bias, ReLU, batch norm, border)
-    for stride in [1, 2] {
-        let (ci, co, h, w) = (6, 10, 8, 13);
+    // 3x3 convs at both strides with their fused epilogue (bias, ReLU, batch norm,
+    // border), with scratch for every output row and for two rows at a time (chunks); a
+    // width that is not a multiple of 4 exercises the padded columns
+    for (stride, chunk) in [(1, None), (2, None), (1, Some(2)), (2, Some(3))] {
+        let (ci, co, h, w) = (6, 10, 12, 13);
         let x = rng.vec(ci * h * w, 1.0);
         let wt = rng.vec(co * ci * 9, 1.0);
         let (bias, bn) = (rng.vec(co, 0.5), rng.bn(co));
         let g = Grid::trunk(h, ci, w);
         let x_buf = gpu.upload(to_grid(&x, ci, h, w))?;
         let w_buf = gpu.upload(conv3x3_layout(&wt, co, ci))?;
+        let (b_buf, bn_buf) = (gpu.upload(bias.clone())?, gpu.upload(bn.clone())?);
         let og = Grid::trunk(h / stride, co, w);
         let y_buf = nan(&gpu, og.len())?;
-        let got_g = steps.conv3x3(F32Math::Full, (&x_buf, g), &y_buf, &w_buf, co, stride)?;
+        let rows = chunk.unwrap_or(h / stride);
+        let scratch = nan(&gpu, rows * 3 * co * og.cols)?;
+        let got_g = steps.conv3x3(
+            F32Math::Full,
+            (&x_buf, g),
+            &scratch,
+            (&y_buf, false),
+            &w_buf,
+            (&b_buf, &bn_buf),
+            co,
+            stride,
+        )?;
         ensure!(got_g == og, "conv3x3 grid {got_g:?}");
-        let (want, mag) = conv3x3_ref(&x, &wt, (ci, co, h, w, stride));
+        let (pre, mag) = conv3x3_ref(&x, &wt, (ci, co, h, w, stride));
+        let ho = h / stride;
+        let mut post = vec![0f64; pre.len()];
+        let mut bound = 0f64;
+        for o in 0..co {
+            for j in 0..ho * w {
+                let v = (pre[o * ho * w + j] + bias[o] as f64).max(0.0);
+                post[o * ho * w + j] = bn64(v, &bn, o, co);
+                // the sum's rounding through the batch norm scale, then the epilogue's own
+                bound = bound.max(
+                    sum_bound(mag[o * ho * w + j] + bias[o].abs() as f64) * bn[co + o] as f64
+                        + 4.0 * f32::EPSILON as f64 * post[o * ho * w + j].abs(),
+                );
+            }
+        }
         let got: Vec<f32> = gpu.download(&y_buf)?;
         checks.check(
-            &format!("conv3x3 gemms (fp32, stride {stride})"),
-            &og.to_torch(&got),
-            &want,
-            sum_bound(max_abs(&mag)),
+            &format!("conv3x3 + epilogue (fp32, stride {stride}, chunk {chunk:?})"),
+            &got[..og.len()],
+            &to_grid64(&post, co, ho, w),
+            bound,
         );
+    }
 
+    // the FP16-input conv with an FP16 output and with an FP32 output, on 8-aligned
+    // columns: operands rounded to FP16, then exact products and FP32 sums, so it is
+    // checked against the f64 conv of the rounded operands
+    for (stride, out_f16) in [(1, true), (2, false)] {
+        let (ci, co, h, w) = (6, 10, 12, 13);
+        let to_h = |v: &[f32]| -> Vec<f32> {
+            v.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect()
+        };
+        let x = to_h(&rng.vec(ci * h * w, 1.0));
+        let wt = to_h(&rng.vec(co * ci * 9, 1.0));
+        let (bias, bn) = (rng.vec(co, 0.5), rng.bn(co));
+        let g = Grid::trunk_aligned(h, ci, w, 8);
+        ensure!(g.cols.is_multiple_of(8), "fp16 grid {g:?}");
+        let host_x = to_grid(&x, ci, h, w);
+        // to_grid lays out 4-aligned rows; re-pack into the 8-aligned grid
+        let g4 = Grid::trunk(h, ci, w);
+        let mut xh = vec![0u16; g.len()];
+        for r in 0..g.rows {
+            for c in 0..ci {
+                for t in 0..g4.cols.min(g.cols) {
+                    xh[(r * ci + c) * g.cols + t] =
+                        half::f16::from_f32(host_x[(r * ci + c) * g4.cols + t]).to_bits();
+                }
+            }
+        }
+        // ci 6 pads each 18-value weight row to 24, as 164 channels pad 492 to 496
+        let wh = conv3x3_layout_f16(&conv3x3_layout(&wt, co, ci), co, ci);
+        let (x_buf, w_buf) = (gpu.upload(xh)?, gpu.upload(wh)?);
+        let (b_buf, bn_buf) = (gpu.upload(bias.clone())?, gpu.upload(bn.clone())?);
+        let ho = h / stride;
+        let og = Grid::trunk_aligned(ho, co, w, 8);
+        let y_buf = nan(&gpu, og.len())?;
+        let scratch = nan(&gpu, ho * 3 * co * og.cols)?;
+        let got_g = steps.conv3x3(
+            F32Math::F16Inputs,
+            (&x_buf, g),
+            &scratch,
+            (&y_buf, out_f16),
+            &w_buf,
+            (&b_buf, &bn_buf),
+            co,
+            stride,
+        )?;
+        ensure!(got_g == og, "fp16 conv3x3 grid {got_g:?}");
+        let (pre, mag) = conv3x3_ref(&x, &wt, (ci, co, h, w, stride));
+        let (mut post, mut bound) = (vec![0f64; pre.len()], 0f64);
+        for o in 0..co {
+            for j in 0..ho * w {
+                let v = (pre[o * ho * w + j] + bias[o] as f64).max(0.0);
+                post[o * ho * w + j] = bn64(v, &bn, o, co);
+                let out_round = if out_f16 {
+                    2f64.powi(-11)
+                } else {
+                    4.0 * f32::EPSILON as f64
+                };
+                bound = bound.max(
+                    sum_bound(mag[o * ho * w + j] + bias[o].abs() as f64) * bn[co + o] as f64
+                        + out_round * post[o * ho * w + j].abs(),
+                );
+            }
+        }
+        let got: Vec<f32> = if out_f16 {
+            let bits: Vec<u16> = gpu.download(&y_buf)?;
+            bits[..og.len()]
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect()
+        } else {
+            let v: Vec<f32> = gpu.download(&y_buf)?;
+            v[..og.len()].to_vec()
+        };
+        // the whole buffer against the expected grid, so the border and the padding
+        // columns must come out zero
+        let mut want = vec![0f64; og.len()];
+        for o in 0..co {
+            for r in 0..ho {
+                for t in 0..w {
+                    want[((r + 1) * co + o) * og.cols + t + 1] = post[(o * ho + r) * w + t];
+                }
+            }
+        }
+        checks.check(
+            &format!("conv3x3 f16 inputs + epilogue (stride {stride}, fp16 out {out_f16})"),
+            &got,
+            &want,
+            bound,
+        );
+    }
+
+    // the plain epilogue (downsample and head convs) on a trunk buffer
+    {
+        let (co, h, w) = (10, 8, 13);
+        let og = Grid::trunk(h, co, w);
+        let pre = rng.vec(co * h * w, 1.0);
+        let (bias, bn) = (rng.vec(co, 0.5), rng.bn(co));
+        let mut host = to_grid(&pre, co, h, w);
+        // junk on the border, which the epilogue must zero
+        for (i, v) in host.iter_mut().enumerate() {
+            if *v == 0.0 {
+                *v = i as f32;
+            }
+        }
+        let y_buf = gpu.upload(host)?;
         let (b_buf, bn_buf) = (gpu.upload(bias.clone())?, gpu.upload(bn.clone())?);
         steps.epilogue(
             &y_buf,
@@ -352,20 +484,18 @@ fn kernels_match_f64() -> Result<()> {
             slice(&bn_buf, 3 * co),
             true,
         )?;
-        let pre: Vec<f64> = og.to_torch(&got).iter().map(|&v| v as f64).collect();
-        let ho = h / stride;
         let mut post = vec![0f64; pre.len()];
         for o in 0..co {
-            for j in 0..ho * w {
-                let v = (pre[o * ho * w + j] + bias[o] as f64).max(0.0);
-                post[o * ho * w + j] = bn64(v, &bn, o, co);
+            for j in 0..h * w {
+                let v = (pre[o * h * w + j] as f64 + bias[o] as f64).max(0.0);
+                post[o * h * w + j] = bn64(v, &bn, o, co);
             }
         }
         let got: Vec<f32> = gpu.download(&y_buf)?;
         checks.check(
-            &format!("ecapa_conv_epilogue (stride {stride})"),
+            "ecapa_conv_epilogue",
             &got[..og.len()],
-            &to_grid64(&post, co, ho, w),
+            &to_grid64(&post, co, h, w),
             4.0 * f32::EPSILON as f64 * max_abs(&post),
         );
     }
@@ -529,7 +659,14 @@ fn kernels_match_f64() -> Result<()> {
             gpu.upload(s.clone())?,
         );
         let o_buf = nan(&gpu, g.len())?;
-        steps.scale_residual(&o_buf, &x_buf, &s_buf, with_r.then_some(&r_buf), g)?;
+        let h_buf = gpu.upload(vec![0x7e00u16; g.len()])?;
+        steps.scale_residual(
+            (&o_buf, with_r.then_some(&h_buf)),
+            &x_buf,
+            &s_buf,
+            with_r.then_some(&r_buf),
+            g,
+        )?;
         let want: Vec<f64> = (0..c * h * w)
             .map(|i| x[i] as f64 * s[i / (h * w)] as f64 + if with_r { r[i] as f64 } else { 0.0 })
             .collect();
@@ -540,6 +677,22 @@ fn kernels_match_f64() -> Result<()> {
             &to_grid64(&want, c, h, w),
             2.0 * f32::EPSILON as f64 * 4.0,
         );
+        if with_r {
+            // the FP16 copy: the FP32 output rounded to nearest, half an FP16 ulp
+            let halves: Vec<u16> = gpu.download(&h_buf)?;
+            let halves: Vec<f32> = halves
+                .iter()
+                .map(|&b| half::f16::from_bits(b).to_f32())
+                .collect();
+            let want = to_grid64(&want, c, h, w);
+            let bound = want.iter().fold(0f64, |m, v| m.max(v.abs())) * 2f64.powi(-11) + 1e-7;
+            checks.check(
+                "ecapa_scale_residual_f16 (fp16 copy)",
+                &halves,
+                &want,
+                bound,
+            );
+        }
     }
 
     // Res2Net group input with reflect padding
@@ -699,6 +852,7 @@ fn precision_name(p: Precision) -> &'static str {
     match p {
         Precision::Fp32 => "fp32",
         Precision::Reference => "reference (tf32 convs)",
+        Precision::F16Convs => "f16 conv inputs",
     }
 }
 
@@ -728,7 +882,7 @@ fn layers_match_torch_fp32() -> Result<()> {
     let gpu = Gpu::new(0)?;
     let blas = Blas::new(&gpu)?;
     let mut failed = Vec::new();
-    for precision in [Precision::Fp32, Precision::Reference] {
+    for precision in [Precision::Fp32, Precision::Reference, Precision::F16Convs] {
         let model = Ecapa2::load(&gpu, &weights, precision)?;
         println!(
             "\nper-layer error against torch FP32 (TF32 off), ours in {}",
@@ -852,7 +1006,7 @@ fn embeddings_match_recorded() -> Result<()> {
     let blas = Blas::new(&gpu)?;
     let mut out = BTreeMap::new();
     let mut fp32_min_truth = 0.0;
-    for precision in [Precision::Fp32, Precision::Reference] {
+    for precision in [Precision::Fp32, Precision::Reference, Precision::F16Convs] {
         let model = Ecapa2::load(&gpu, &weights, precision)?;
         let mut ours = BTreeMap::new();
         let (mut rec, mut tru) = (Vec::new(), Vec::new());
@@ -908,6 +1062,7 @@ fn embeddings_match_recorded() -> Result<()> {
             match precision {
                 Precision::Fp32 => "fp32",
                 Precision::Reference => "reference",
+                Precision::F16Convs => "f16convs",
             },
             ours,
         );
