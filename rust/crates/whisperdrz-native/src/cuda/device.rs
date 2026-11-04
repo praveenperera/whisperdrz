@@ -263,7 +263,17 @@ impl Gpu {
     /// recorded around it. Synchronizes, so call it outside a graph capture
     pub fn time_ms(&self, enqueue: impl FnOnce() -> Result<()>) -> Result<f32> {
         let flags = cu::CUevent_flags::CU_EVENT_DEFAULT;
-        let (start, end) = (cur::event::create(flags)?, cur::event::create(flags)?);
+        let start = cur::event::create(flags)?;
+        let end = match cur::event::create(flags) {
+            Ok(end) => end,
+            Err(e) => {
+                // SAFETY: `start` was created above and nothing has recorded it
+                unsafe {
+                    let _ = cur::event::destroy(start);
+                }
+                return Err(e.into());
+            }
+        };
         let timed = (|| {
             unsafe { cur::event::record(start, self.cu_stream())? };
             enqueue()?;
