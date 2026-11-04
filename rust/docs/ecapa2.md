@@ -120,8 +120,9 @@ truth used by the tests runs the same graph with `cudnn.allow_tf32 = False`.
 Activations are FP32. cuBLAS carries every convolution, the DFT and `dense_2`
 (`Blas::gemm_f32`, `cublasGemmStridedBatchedEx` with `CUBLAS_COMPUTE_32F`,
 `CUBLAS_COMPUTE_32F_FAST_TF32` for the TF32 convs, or FP16 A and B with
-`CUBLAS_COMPUTE_32F` for the FP16-input convs). The `ecapa_*` cuda-oxide kernels do the
-rest.
+`CUBLAS_COMPUTE_32F` for the FP16-input convs). The exception is the 164-channel 3x3
+convs of long enough crops, which run as a fused cuda-oxide conv (see `F16Convs` under
+precision modes). The `ecapa_*` cuda-oxide kernels do the rest.
 
 ### Layouts
 
@@ -215,6 +216,31 @@ border or saves almost nothing.
   speaker crops are. No fixed cuBLASLt algorithm did better than 1.017x over the same
   sweep, so `k` stays 492. conv_1.0, the downsamples and the head keep their
   `Reference` precision.
+- Under `F16Convs`, the 164-channel blocks skip cuBLAS for their 3x3 convs when the crop
+  is long enough. Each conv is then one fused implicit GEMM in cuda-oxide
+  (`ecapa_conv3x3_nhwc_n168`, `kernels/src/ecapa_conv.rs`) over a channels-last FP16
+  copy of the activations, `[rows][cols][168]`, with the channels padded to 168 with
+  zeros. In that layout the three input pixels a conv reads along time, for one output
+  pixel and kernel row, are one contiguous run. The run for the next pixel starts 168
+  values later. So a block stages a strip of 130 input pixels per kernel row in shared
+  memory, and `ldmatrix` reads the GEMM's A operand straight from it. Nothing is
+  unrolled into an im2col buffer, and no product goes through memory.
+  - Shape: each block computes 128 output pixels by all 164 output channels, at a depth
+    of 3 kernel rows x 512. The 504 values of three pixels are padded with zero weights
+    (`conv3x3_layout_nhwc`). Stride-1 convs tile all interior rows as one flat range of
+    pixels, so every tile but the last is full.
+  - Epilogue: bias, ReLU, batch norm and the zero border are fused. The first two convs
+    write the channels-last copy and the third writes FP32 in the trunk layout. Every
+    output sums in one fixed order, so results are the same run to run and on any
+    stream.
+  - Producers: the block before writes the input copy with `ecapa_scale_residual_nhwc`
+    beside the FP32 output. conv_1.0 stays the exact FP32 GEMM, and the same kernel
+    converts its output.
+  - Routing: a block runs this way when its stride-1 conv grid fills at least half the
+    SMs (`Steps::nhwc_wins`). On the RTX 5090 the fused conv lost to cuBLAS at 52 to 64
+    blocks (0.65x) and won from 104 blocks up (1.07-1.47x a conv, 1.31x over the
+    164-channel convs at crop lengths spread evenly from 1 to 10 s). Shorter crops, and
+    every 192-channel block, keep the cuBLAS path.
 
 ## Tests
 
@@ -223,6 +249,11 @@ border or saves almost nothing.
 - `kernels_match_f64`: every glue kernel and conv GEMM (both strides, the downsample, a
   strided conv1d, the DFT) against an f64 CPU reference on random inputs. Outputs start
   as NaN, so a skipped element fails.
+- `channels_last_convs_match_f64`: the channels-last path, as above, against f64.
+  First `ecapa_scale_residual_nhwc`, whose channels-last copy must be exactly its FP32
+  output rounded to FP16, with zeros past the channels. Then the fused conv reading
+  that copy, at both strides, in all three output layouts, at lengths from part of one
+  tile to tiles that span several rows. Outputs start as NaN.
 - `layers_match_torch_fp32`: each block's output on three recorded segments (100, 546
   and 996 frames) against torch's FP32 truth, beside torch's own error in the
   transcriber's mode. A layer passes when our max-abs and mean-abs errors are both at
@@ -263,15 +294,21 @@ End to end, cosine over 76 segments:
 | `Reference` | 0.999997349 / 0.999999821 | 0.999999624 / 0.999999870 |
 | torch FP32 truth | 0.9999975 (min) | |
 
-Layers in `F16Convs` mode: all 78 rows within 1.5x of torch's reference-mode error; the
-worst max-abs ratio is 1.39 (e21c600 conv_3) and the worst mean-abs ratio 1.05
-(e21c600 embedding). End to
-end, cosine over the 76 segments is 0.999996995 min / 0.999999821 mean against the
-recorded embeddings and 0.999999510 / 0.999999865 against the FP32 truth.
+Layers in `F16Convs` mode, with the channels-last 164-channel convs: all 78 rows within
+1.5x of torch's reference-mode error. The worst max-abs ratio is 1.43 (e21c600 conv_11)
+and the worst mean-abs ratio 1.05 (e21c600 embedding). On the cuBLAS-only path they were
+1.39 (e21c600 conv_3) and 1.05. End to end, cosine over the 76 segments is 0.999997231
+min / 0.999999821 mean against the recorded embeddings and 0.999999473 / 0.999999867
+against the FP32 truth.
+
+The channels-last kernels against f64 (`channels_last_convs_match_f64`): the fused conv
+reaches 5.3e-6 max-abs with FP32 output against a bound of 1.8e-5. With FP16 output it
+reaches 9.8e-4 against 1.5e-3, which is the output rounding.
 
 Speaker remap on short3 (nctdh, willh, ikgcq): the output is identical to the trace in
 all five replays (recorded, `Fp32`, `Reference`, `F16Convs`, torch truth).
 
 On ikgcq one recorded pairwise distance is 6.0e-4 from the 1.1 threshold. Our `Fp32`
 embeddings move pairwise distances by up to 5.39e-4, the same amount torch's own FP32
-truth moves them; `F16Convs` moves them by up to 5.08e-4. The margin is torch's TF32-vs-FP32 difference, not the port's.
+truth moves them; `F16Convs` moves them by up to 5.45e-4 (5.08e-4 on the cuBLAS-only
+path). The margin is torch's TF32-vs-FP32 difference, not the port's.

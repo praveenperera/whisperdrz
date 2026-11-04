@@ -23,7 +23,8 @@ use serde_json::{Value, json};
 use whisperdrz_fixtures::{ArrayData, read_npy};
 use whisperdrz_native::cuda::device::{Arg, Buf};
 use whisperdrz_native::cuda::ecapa2::{
-    Ecapa2, Grid, Precision, Se, Steps, conv3x3_layout, conv3x3_layout_f16, dft_basis, normalize,
+    Ecapa2, Grid, NhwcOut, Precision, Se, Steps, conv3x3_layout, conv3x3_layout_f16,
+    conv3x3_layout_nhwc, dft_basis, normalize,
 };
 use whisperdrz_native::cuda::embedder::Embedder;
 use whisperdrz_native::cuda::{Blas, F32Math, Gpu, Operand, Priority};
@@ -866,6 +867,198 @@ fn precision_name(p: Precision) -> &'static str {
         Precision::Reference => "reference (tf32 convs)",
         Precision::F16Convs => "f16 conv inputs",
     }
+}
+
+/// The channels-last path the 164-channel blocks take under F16Convs: the FP32 block
+/// output with its channels-last FP16 copy, then the fused 3x3 conv reading that copy in
+/// each output layout, at both strides and at lengths from a part of one tile to tiles
+/// that span several rows, against f64. Outputs start as NaN, so an element no block
+/// writes fails, and the channels-last copies must hold exact zeros past the channels
+#[test]
+fn channels_last_convs_match_f64() -> Result<()> {
+    if inputs().is_none() {
+        return Ok(());
+    }
+    const CP: usize = 168;
+    let gpu = Gpu::new(0)?;
+    let blas = Blas::new(&gpu)?;
+    let steps = Steps {
+        gpu: &gpu,
+        blas: &blas,
+    };
+    let mut rng = Rng(0x0ecc_a2c0_4f16);
+    let mut checks = Checks::default();
+    let f16 = |v: f32| half::f16::from_f32(v);
+
+    let (ci, co) = (164, 164);
+    // FP16 weights at torch's init scale, so sums stay near the activations' size
+    let wt: Vec<f32> = rng
+        .vec(co * ci * 9, 1.0 / (9.0 * ci as f64).sqrt())
+        .into_iter()
+        .map(|v| f16(v).to_f32())
+        .collect();
+    let w_buf = gpu.upload(conv3x3_layout_nhwc(&wt, co, ci))?;
+    let (bias, bn) = (rng.vec(co, 0.5), rng.bn(co));
+    let (b_buf, bn_buf) = (gpu.upload(bias.clone())?, gpu.upload(bn.clone())?);
+
+    for (h, w, stride) in [
+        (2, 5, 1),
+        (4, 13, 2),
+        (6, 150, 1),
+        (4, 301, 2),
+        (10, 200, 1),
+    ] {
+        let label = format!("h {h} w {w} stride {stride}");
+        let g = Grid::trunk(h, ci, w);
+        let (x, sc, r) = (
+            rng.vec(ci * h * w, 1.0),
+            rng.vec(ci, 1.0),
+            rng.vec(ci * h * w, 1.0),
+        );
+        let x_buf = gpu.upload(to_grid(&x, ci, h, w))?;
+        let r_buf = gpu.upload(to_grid(&r, ci, h, w))?;
+        let s_buf = gpu.upload(sc.clone())?;
+        let out = nan(&gpu, g.len())?;
+        let xh_len = g.rows * g.cols * CP;
+        let xh = nan_f16(&gpu, xh_len)?;
+        steps.scale_residual_nhwc((Some(&out), &xh), &x_buf, Some(&s_buf), Some(&r_buf), g)?;
+
+        // the FP32 output: one rounding for the product and one for the sum
+        let got: Vec<f32> = gpu.download(&out)?;
+        ensure!(
+            got.len() == g.len(),
+            "{label}: scale_residual_nhwc {} values",
+            got.len()
+        );
+        let mut want = vec![0f64; ci * h * w];
+        let mut bound = 0f64;
+        for c in 0..ci {
+            for j in 0..h * w {
+                let (xs, rv) = (
+                    x[c * h * w + j] as f64 * sc[c] as f64,
+                    r[c * h * w + j] as f64,
+                );
+                want[c * h * w + j] = xs + rv;
+                bound = bound.max(2.0 * f32::EPSILON as f64 * (xs.abs() + rv.abs()));
+            }
+        }
+        checks.check(
+            &format!("scale_residual_nhwc fp32 ({label})"),
+            &got,
+            &to_grid64(&want, ci, h, w),
+            bound,
+        );
+
+        // the copy: exactly that output rounded to FP16, channels-last, zero past ci
+        let bits: Vec<u16> = gpu.download(&xh)?;
+        ensure!(
+            bits.len() == xh_len,
+            "{label}: channels-last copy {} values",
+            bits.len()
+        );
+        for row in 0..g.rows {
+            for t in 0..g.cols {
+                for c in 0..CP {
+                    let want = if c < ci {
+                        f16(got[(row * ci + c) * g.cols + t]).to_bits()
+                    } else {
+                        0
+                    };
+                    let have = bits[(row * g.cols + t) * CP + c];
+                    ensure!(
+                        have == want,
+                        "{label}: copy at row {row} col {t} channel {c} is {have:#x}, want {want:#x}"
+                    );
+                }
+            }
+        }
+
+        // the conv of that copy, in torch layout for the reference
+        let mut xin = vec![0f32; ci * h * w];
+        for c in 0..ci {
+            for rr in 0..h {
+                for t in 0..w {
+                    let b = bits[((rr + 1) * g.cols + t + 1) * CP + c];
+                    xin[(c * h + rr) * w + t] = half::f16::from_bits(b).to_f32();
+                }
+            }
+        }
+        let (pre, mag) = conv3x3_ref(&xin, &wt, (ci, co, h, w, stride));
+        let ho = h / stride;
+        let og = Grid::trunk(ho, co, w);
+        let mut post = vec![0f64; pre.len()];
+        let mut sum_err = 0f64;
+        for o in 0..co {
+            for j in 0..ho * w {
+                let v = (pre[o * ho * w + j] + bias[o] as f64).max(0.0);
+                post[o * ho * w + j] = bn64(v, &bn, o, co);
+                sum_err = sum_err
+                    .max(sum_bound(mag[o * ho * w + j] + bias[o].abs() as f64) * bn[co + o] as f64);
+            }
+        }
+        let want = to_grid64(&post, co, ho, w);
+        for layout in [NhwcOut::Nhwc16, NhwcOut::Nchw32, NhwcOut::Nchw16] {
+            let y_len = match layout {
+                NhwcOut::Nhwc16 => og.rows * og.cols * CP,
+                _ => og.len(),
+            };
+            let y = match layout {
+                NhwcOut::Nchw32 => nan(&gpu, y_len)?,
+                _ => nan_f16(&gpu, y_len)?,
+            };
+            let got_g = steps.conv3x3_nhwc(
+                (&xh, g),
+                (&y, layout),
+                &w_buf,
+                (&b_buf, &bn_buf),
+                co,
+                stride,
+            )?;
+            ensure!(got_g == og, "{label} {layout:?}: grid {got_g:?}");
+            let got: Vec<f32> = match layout {
+                NhwcOut::Nchw32 => gpu.download(&y)?,
+                NhwcOut::Nchw16 => {
+                    let b: Vec<u16> = gpu.download(&y)?;
+                    b.iter()
+                        .map(|&v| half::f16::from_bits(v).to_f32())
+                        .collect()
+                }
+                NhwcOut::Nhwc16 => {
+                    let b: Vec<u16> = gpu.download(&y)?;
+                    ensure!(b.len() == y_len, "{label}: nhwc output {} values", b.len());
+                    let mut out = vec![f32::NAN; og.len()];
+                    for row in 0..og.rows {
+                        for t in 0..og.cols {
+                            for c in 0..CP {
+                                let v = half::f16::from_bits(b[(row * og.cols + t) * CP + c]);
+                                if c < co {
+                                    out[(row * co + c) * og.cols + t] = v.to_f32();
+                                } else {
+                                    ensure!(
+                                        v.to_bits() == 0,
+                                        "{label}: channel {c} at row {row} col {t} is {v}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    out
+                }
+            };
+            let out_round = if layout == NhwcOut::Nchw32 {
+                4.0 * f32::EPSILON as f64
+            } else {
+                2f64.powi(-11)
+            };
+            checks.check(
+                &format!("conv3x3_nhwc {layout:?} ({label})"),
+                &got,
+                &want,
+                sum_err + out_round * max_abs(&want),
+            );
+        }
+    }
+    checks.finish()
 }
 
 #[test]

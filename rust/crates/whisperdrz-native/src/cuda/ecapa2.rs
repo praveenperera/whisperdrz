@@ -16,6 +16,11 @@
 //! computes all three kernel columns at once (`N = 3 co`, the three kernel rows folded
 //! into the inner dimension); its epilogue kernel sums the three products at their
 //! column shifts. The trunk output feeds the head's first 1x1 conv in place
+//!
+//! Under [`Precision::F16Convs`] the 164-channel blocks of a long enough crop skip cuBLAS:
+//! each 3x3 conv is one fused cuda-oxide implicit GEMM (`ecapa_conv3x3_nhwc_n168`) over
+//! a channels-last FP16 copy of the activations, `[rows][cols][168]`
+//! ([`Steps::conv3x3_nhwc`], routed by [`Steps::nhwc_wins`])
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -55,6 +60,20 @@ const ELEMENTWISE_BLOCK: u32 = 256;
 /// on long crops
 const CONV_SCRATCH: usize = 32 << 20;
 const ROW_BLOCK: u32 = 256;
+/// Channels of a channels-last FP16 trunk buffer (the kernels' `ecapa_conv::CP`): 164
+/// padded to a multiple of 8, so each pixel is whole 16-byte chunks
+const NHWC_CP: usize = 168;
+/// Weight rows (output channels padded) and depth per kernel row of the channels-last
+/// conv, the kernels' `NB` and `ecapa_conv::KP`
+const NHWC_NB: usize = 176;
+const NHWC_KP: usize = 512;
+/// Output pixels per block of the channels-last conv (`ecapa_conv::BM`)
+const NHWC_BM: usize = 128;
+/// Its dynamic shared memory, `ecapa_conv::smem_bytes(NHWC_NB)`: the input strip, a zero
+/// block, two 64-deep weight stages, bias and batch norm
+const NHWC_SMEM: usize = (NHWC_BM + 2) * NHWC_CP * 2 + 16 + 2 * NHWC_NB * 64 * 2 + 4 * NHWC_NB * 4;
+/// Pixels per block of `ecapa_scale_residual_nhwc` (`ecapa_conv::SR_COLS`)
+const SR_COLS: usize = 32;
 
 /// The 2D trunk in order: block name, stride of its first conv along frequency, and the
 /// residual added after squeeze-excitation
@@ -200,6 +219,17 @@ impl Grid {
 
         out
     }
+}
+
+/// Output layout of [`Steps::conv3x3_nhwc`], the kernel's `mode`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NhwcOut {
+    /// Channels-last FP16, `[rows][cols][NHWC_CP]`, for the next channels-last conv
+    Nhwc16 = 0,
+    /// The trunk layout in FP32
+    Nchw32 = 1,
+    /// The trunk layout in FP16
+    Nchw16 = 2,
 }
 
 /// Address of element `offset` of an FP32 buffer
@@ -411,6 +441,136 @@ impl Steps<'_> {
         }
 
         Ok(o)
+    }
+
+    /// [`Steps::conv3x3`] under [`F32Math::F16Inputs`] as one fused implicit GEMM
+    /// (`ecapa_conv3x3_nhwc_n168`) over a channels-last FP16 input: `x` is
+    /// `[rows][cols][NHWC_CP]` for the trunk grid `g`, `w` is [`conv3x3_layout_nhwc`], and
+    /// `layout` picks the output's. Bias, ReLU, batch norm and the zero border as there,
+    /// with FP32 sums in one fixed order per output
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv3x3_nhwc(
+        &self,
+        (x, g): (&Buf, Grid),
+        (out, layout): (&Buf, NhwcOut),
+        w: &Buf,
+        (bias, bn): (&Buf, &Buf),
+        co: usize,
+        stride: usize,
+    ) -> Result<Grid> {
+        let height = g.height() / stride;
+        let o = g.reshaped(height, co);
+        ensure!(
+            g.pad == 1
+                && g.height().is_multiple_of(stride)
+                && height > 0
+                && (stride == 1 || stride == 2)
+                && g.channels <= NHWC_CP
+                && (1..=NHWC_CP).contains(&co),
+            "conv3x3_nhwc {g:?} -> {co} channels, stride {stride}"
+        );
+        let (out_len, out_size) = match layout {
+            NhwcOut::Nhwc16 => (o.rows * o.cols * NHWC_CP, 2),
+            NhwcOut::Nchw32 => (o.len(), 4),
+            NhwcOut::Nchw16 => (o.len(), 2),
+        };
+        let x_len = g.rows * g.cols * NHWC_CP;
+        ensure!(
+            x_len * 2 <= x.bytes() && out_len * out_size <= out.bytes(),
+            "conv3x3_nhwc {g:?} -> {o:?} overflows its buffers"
+        );
+        let w_len = 3 * NHWC_NB * NHWC_KP;
+        ensure!(
+            w.bytes() >= w_len * 2 && bias.bytes() >= co * 4 && bn.bytes() >= 3 * co * 4,
+            "conv3x3_nhwc weights for {} -> {co}",
+            g.channels
+        );
+        // stride 1 tiles the interior rows as one flat range of pixels; stride 2 tiles
+        // each output row
+        let grid = if stride == 1 {
+            (u32::try_from((height * o.cols).div_ceil(NHWC_BM))?, 1, 1)
+        } else {
+            (
+                u32::try_from(o.cols.div_ceil(NHWC_BM))?,
+                u32::try_from(height)?,
+                1,
+            )
+        };
+        let (o16, o32) = match layout {
+            NhwcOut::Nchw32 => (Arg::EMPTY, slice(out, 0, out_len)),
+            _ => (Arg::slice(out.ptr(), out_len), Arg::EMPTY),
+        };
+        self.gpu.launch(
+            "ecapa_conv3x3_nhwc_n168",
+            grid,
+            (256, 1, 1),
+            u32::try_from(NHWC_SMEM)?,
+            &[
+                o16,
+                o32,
+                Arg::slice(x.ptr(), x_len),
+                Arg::slice(w.ptr(), w_len),
+                slice(bias, 0, co),
+                slice(bn, 0, 3 * co),
+                g.rows.into(),
+                g.cols.into(),
+                g.width.into(),
+                o.rows.into(),
+                stride.into(),
+                co.into(),
+                (layout as u32).into(),
+            ],
+        )?;
+
+        Ok(o)
+    }
+
+    /// Whether [`Steps::conv3x3_nhwc`] runs and beats the cuBLAS path for stride-1 convs
+    /// over grid `g`. On the RTX 5090 it lost (0.65x) at 52 and 64 blocks, under a
+    /// third of the SMs, and won (1.07-1.47x) from 104 blocks up, so it takes grids of at
+    /// least half a wave
+    pub fn nhwc_wins(&self, g: Grid) -> bool {
+        self.gpu.max_shared_per_block() >= NHWC_SMEM
+            && 2 * (g.height() * g.cols).div_ceil(NHWC_BM) >= self.gpu.sms()
+    }
+
+    /// [`Steps::scale_residual`] writing its FP16 copy channels-last (`[rows][cols]
+    /// [NHWC_CP]`, zero past the channels) for [`Steps::conv3x3_nhwc`]. With no `out`,
+    /// `s` and `r` it only converts the FP32 buffer `x`
+    pub fn scale_residual_nhwc(
+        &self,
+        (out, out_h): (Option<&Buf>, &Buf),
+        x: &Buf,
+        s: Option<&Buf>,
+        r: Option<&Buf>,
+        g: Grid,
+    ) -> Result<()> {
+        let h_len = g.rows * g.cols * NHWC_CP;
+        ensure!(
+            g.pad == 1 && g.channels <= NHWC_CP && out_h.bytes() >= h_len * 2,
+            "channels-last copy of {g:?} overflows"
+        );
+        self.gpu.launch(
+            "ecapa_scale_residual_nhwc",
+            (
+                u32::try_from(g.cols.div_ceil(SR_COLS))?,
+                u32::try_from(g.rows)?,
+                1,
+            ),
+            (256, 1, 1),
+            u32::try_from(SR_COLS * NHWC_CP * 2)?,
+            &[
+                out.map_or(Arg::EMPTY, |o| slice(o, 0, g.len())),
+                Arg::slice(out_h.ptr(), h_len),
+                slice(x, 0, g.len()),
+                s.map_or(Arg::EMPTY, |s| slice(s, 0, g.channels)),
+                r.map_or(Arg::EMPTY, |r| slice(r, 0, g.len())),
+                g.rows.into(),
+                g.channels.into(),
+                g.cols.into(),
+                g.width.into(),
+            ],
+        )
     }
 
     /// 1x1 conv with stride 2 along rows and no padding (the downsample path), without
@@ -629,10 +789,12 @@ impl Steps<'_> {
 }
 
 /// One conv layer of the trunk: weights `[3 kw][co][3 kh * ci]` (and their FP16 copy
-/// under [`Precision::F16Convs`], for every conv but the first), bias, batch norm
+/// under [`Precision::F16Convs`], for every conv but the first, plus the channels-last
+/// conv's [`conv3x3_layout_nhwc`] copy for the 164-channel ones), bias, batch norm
 struct Conv2d {
     w: Buf,
     w_h: Option<Buf>,
+    w_nhwc: Option<Buf>,
     bias: Buf,
     bn: Buf,
     co: usize,
@@ -797,8 +959,14 @@ impl Ecapa2 {
                 .ok_or_else(|| eyre!("no {name}.0.weight"))?;
             let mut convs = Vec::with_capacity(3);
             for (layer, layer_ci) in [(0, ci), (3, co), (6, co)] {
-                let w = host.get(&format!("{name}.{layer}.weight"), &[co, layer_ci, 3, 3])?;
-                let w = conv3x3_layout(&w, co, layer_ci);
+                let torch_w = host.get(&format!("{name}.{layer}.weight"), &[co, layer_ci, 3, 3])?;
+                let w = conv3x3_layout(&torch_w, co, layer_ci);
+                let w_nhwc = (precision == Precision::F16Convs
+                    && layer_ci > 1
+                    && layer_ci <= NHWC_CP
+                    && co <= NHWC_CP)
+                    .then(|| gpu.upload(conv3x3_layout_nhwc(&torch_w, co, layer_ci)))
+                    .transpose()?;
 
                 let w_h = (precision == Precision::F16Convs && layer_ci > 1)
                     .then(|| gpu.upload(conv3x3_layout_f16(&w, co, layer_ci)))
@@ -806,6 +974,7 @@ impl Ecapa2 {
                 convs.push(Conv2d {
                     w: up(w)?,
                     w_h,
+                    w_nhwc,
                     bias: up(host.get(&format!("{name}.{layer}.bias"), &[co])?)?,
                     bn: up(host.bn(&format!("{name}.{}", layer + 2), co)?)?,
                     co,
@@ -1003,6 +1172,11 @@ impl Ecapa2 {
             0,
             BINS,
         );
+        // which blocks run their convs channels-last: all three have the weights for it
+        // (or the first is the exact one-channel conv, converted after), and the grid is
+        // large enough that the fused conv beats cuBLAS
+        let mut nhwc = Vec::with_capacity(self.trunk.len());
+        let mut half_len = 0;
         for block in &self.trunk {
             let co = block.convs[0].co;
             height /= block.stride;
@@ -1010,7 +1184,17 @@ impl Ecapa2 {
             grid_len = grid_len.max(o.len());
             row_len = row_len.max(3 * co * o.cols);
             product_len = product_len.max(height * 3 * co * o.cols);
+            let [a, b, c] = &block.convs;
+            let fits = (a.w_nhwc.is_some() || a.w_h.is_none())
+                && b.w_nhwc.is_some()
+                && c.w_nhwc.is_some()
+                && steps.nhwc_wins(o);
+            if fits {
+                half_len = half_len.max(o.rows * o.cols * NHWC_CP);
+            }
+            nhwc.push(fits);
         }
+        let half_len = half_len.max(grid_len);
         let bufs: Vec<Buf> = (0..4)
             .map(|_| gpu.alloc(grid_len * 4))
             .collect::<Result<_>>()?;
@@ -1020,8 +1204,9 @@ impl Ecapa2 {
         let scratch = gpu.alloc(product_len.min((CONV_SCRATCH / 4).max(row_len)) * 4)?;
         // FP16 copies for the FP16-input convs: of `cur`/`next` for each block's first
         // conv, and the first two convs' outputs, which only the next conv reads
+        // (channels-last for the blocks that run so)
         let halves: Vec<Buf> = (0..if f16 { 4 } else { 0 })
-            .map(|_| gpu.alloc(grid_len * 2))
+            .map(|_| gpu.alloc(half_len * 2))
             .collect::<Result<_>>()?;
         let mut halves = halves.into_iter();
         let (mut cur_h, mut next_h, t1_h, t2_h) =
@@ -1032,64 +1217,115 @@ impl Ecapa2 {
 
         let mean = gpu.alloc(HEAD * 4)?;
         let scale = gpu.alloc(HEAD * 4)?;
-        for block in &self.trunk {
+        for (i, block) in self.trunk.iter().enumerate() {
             let [a, b, c] = &block.convs;
-            // under F16Convs: conv a reads the FP16 copy of `cur` (the FP32 one for the
-            // exact first conv) and writes only FP16, conv b FP16 to FP16, and conv c
-            // writes FP32 for the squeeze-excitation and residual
-            let a_in = match (&cur_h, &a.w_h) {
-                (Some(h), Some(w)) => (F32Math::F16Inputs, h, w),
-                _ => (self.conv_math(g.channels == 1), &cur, &a.w),
-            };
-            let og = steps.conv3x3(
-                a_in.0,
-                (a_in.1, g),
-                &scratch,
-                (t1_h.as_ref().unwrap_or(&t1), t1_h.is_some()),
-                a_in.2,
-                (&a.bias, &a.bn),
-                a.co,
-                block.stride,
-            )?;
-            match (&t1_h, &t2_h, &b.w_h, &c.w_h) {
-                (Some(t1_h), Some(t2_h), Some(bw), Some(cw)) => {
-                    let math = F32Math::F16Inputs;
-                    steps.conv3x3(
-                        math,
+            let og = match (nhwc[i], &cur_h, &t1_h, &t2_h, &b.w_nhwc, &c.w_nhwc) {
+                (true, Some(cur_h), Some(t1_h), Some(t2_h), Some(bw), Some(cw)) => {
+                    // the same convs channels-last: conv a reads the previous block's
+                    // channels-last copy, or for the exact first conv writes FP32 into
+                    // the free `t2` and converts it
+                    let og = match &a.w_nhwc {
+                        Some(aw) => steps.conv3x3_nhwc(
+                            (cur_h, g),
+                            (t1_h, NhwcOut::Nhwc16),
+                            aw,
+                            (&a.bias, &a.bn),
+                            a.co,
+                            block.stride,
+                        )?,
+                        None => {
+                            let og = steps.conv3x3(
+                                self.conv_math(g.channels == 1),
+                                (&cur, g),
+                                &scratch,
+                                (&t2, false),
+                                &a.w,
+                                (&a.bias, &a.bn),
+                                a.co,
+                                block.stride,
+                            )?;
+                            steps.scale_residual_nhwc((None, t1_h), &t2, None, None, og)?;
+                            og
+                        }
+                    };
+                    steps.conv3x3_nhwc(
                         (t1_h, og),
-                        &scratch,
-                        (t2_h, true),
+                        (t2_h, NhwcOut::Nhwc16),
                         bw,
                         (&b.bias, &b.bn),
                         b.co,
                         1,
                     )?;
-                    steps.conv3x3(
-                        math,
+                    steps.conv3x3_nhwc(
                         (t2_h, og),
-                        &scratch,
-                        (&t1, false),
+                        (&t1, NhwcOut::Nchw32),
                         cw,
                         (&c.bias, &c.bn),
                         c.co,
                         1,
                     )?;
+                    og
                 }
                 _ => {
-                    for (conv, x, y) in [(b, &t1, &t2), (c, &t2, &t1)] {
-                        steps.conv3x3(
-                            self.conv_math(false),
-                            (x, og),
-                            &scratch,
-                            (y, false),
-                            &conv.w,
-                            (&conv.bias, &conv.bn),
-                            conv.co,
-                            1,
-                        )?;
+                    // under F16Convs: conv a reads the FP16 copy of `cur` (the FP32 one
+                    // for the exact first conv) and writes only FP16, conv b FP16 to FP16,
+                    // and conv c writes FP32 for the squeeze-excitation and residual
+                    let a_in = match (&cur_h, &a.w_h) {
+                        (Some(h), Some(w)) => (F32Math::F16Inputs, h, w),
+                        _ => (self.conv_math(g.channels == 1), &cur, &a.w),
+                    };
+                    let og = steps.conv3x3(
+                        a_in.0,
+                        (a_in.1, g),
+                        &scratch,
+                        (t1_h.as_ref().unwrap_or(&t1), t1_h.is_some()),
+                        a_in.2,
+                        (&a.bias, &a.bn),
+                        a.co,
+                        block.stride,
+                    )?;
+                    match (&t1_h, &t2_h, &b.w_h, &c.w_h) {
+                        (Some(t1_h), Some(t2_h), Some(bw), Some(cw)) => {
+                            let math = F32Math::F16Inputs;
+                            steps.conv3x3(
+                                math,
+                                (t1_h, og),
+                                &scratch,
+                                (t2_h, true),
+                                bw,
+                                (&b.bias, &b.bn),
+                                b.co,
+                                1,
+                            )?;
+                            steps.conv3x3(
+                                math,
+                                (t2_h, og),
+                                &scratch,
+                                (&t1, false),
+                                cw,
+                                (&c.bias, &c.bn),
+                                c.co,
+                                1,
+                            )?;
+                        }
+                        _ => {
+                            for (conv, x, y) in [(b, &t1, &t2), (c, &t2, &t1)] {
+                                steps.conv3x3(
+                                    self.conv_math(false),
+                                    (x, og),
+                                    &scratch,
+                                    (y, false),
+                                    &conv.w,
+                                    (&conv.bias, &conv.bn),
+                                    conv.co,
+                                    1,
+                                )?;
+                            }
+                        }
                     }
+                    og
                 }
-            }
+            };
             steps.channel_mean(&mean, &t1, og)?;
             steps.se_fc(&scale, &mean, &block.se)?;
 
@@ -1114,7 +1350,13 @@ impl Ecapa2 {
                     block.name
                 );
             }
-            steps.scale_residual((&next, next_h.as_ref()), &t1, &scale, residual, og)?;
+            // the FP16 copy in the layout the next block's first conv reads
+            match (nhwc.get(i + 1), &next_h) {
+                (Some(true), Some(h)) => {
+                    steps.scale_residual_nhwc((Some(&next), h), &t1, Some(&scale), residual, og)?
+                }
+                _ => steps.scale_residual((&next, next_h.as_ref()), &t1, &scale, residual, og)?,
+            }
             std::mem::swap(&mut cur, &mut next);
             std::mem::swap(&mut cur_h, &mut next_h);
             g = og;
@@ -1346,6 +1588,27 @@ pub fn conv3x3_layout_f16(w: &[f32], co: usize, ci: usize) -> Vec<u16> {
     for (dst, src) in out.chunks_exact_mut(ld).zip(w.chunks_exact(row)) {
         for (d, &v) in dst.iter_mut().zip(src) {
             *d = half::f16::from_f32(v).to_bits();
+        }
+    }
+
+    out
+}
+
+/// torch `[co][ci][kh][kw]` conv weights to the channels-last conv's FP16 `[3 kh][NHWC_NB]
+/// [NHWC_KP]`: row `o` of kernel row `kh` holds `w[o][c][kh][kw]` at `kw * NHWC_CP + c`,
+/// the order of three adjacent channels-last pixels, zero for `c >= ci`, `o >= co` and
+/// past `3 NHWC_CP`
+pub fn conv3x3_layout_nhwc(w: &[f32], co: usize, ci: usize) -> Vec<u16> {
+    assert!(ci <= NHWC_CP && co <= NHWC_NB && w.len() == co * ci * 9);
+    let mut out = vec![0u16; 3 * NHWC_NB * NHWC_KP];
+    for o in 0..co {
+        for c in 0..ci {
+            for kh in 0..3 {
+                for kw in 0..3 {
+                    out[(kh * NHWC_NB + o) * NHWC_KP + kw * NHWC_CP + c] =
+                        half::f16::from_f32(w[((o * ci + c) * 3 + kh) * 3 + kw]).to_bits();
+                }
+            }
         }
     }
 

@@ -15,6 +15,7 @@ pub mod cross;
 pub mod decoder;
 pub mod dtw;
 pub mod ecapa2;
+pub mod ecapa_conv;
 pub mod elementwise;
 pub mod flash;
 pub mod linear;
