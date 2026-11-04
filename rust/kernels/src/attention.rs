@@ -371,6 +371,9 @@ pub fn attn_decode_f16(
     }
 }
 
+/// Splits [`attn_combine_f16`] loads per round trip
+const COMBINE_BATCH: usize = 16;
+
 /// Merges the split partials of `attn_decode_f16` into FP16 output
 ///
 /// Grid: x = blocks of the attention launch, one per (row, token, head). Block: 64 threads,
@@ -396,22 +399,49 @@ pub fn attn_combine_f16(
         return;
     }
 
+    // the loads go out COMBINE_BATCH at a time and the sums take them in split order, so
+    // the result is the plain loop's while the latency is one round trip per batch, not
+    // one per split (24 splits at one cross-attention row)
     let lse = &part_lse[b * n..(b + 1) * n];
     let mut mx = NEG_INF;
     let mut i = 0;
     while i < n {
-        mx = mx.max(lse[i]);
-        i += 1;
+        let mut v = [NEG_INF; COMBINE_BATCH];
+        #[unroll]
+        for j in 0..COMBINE_BATCH {
+            if i + j < n {
+                v[j] = lse[i + j];
+            }
+        }
+        #[unroll]
+        for j in 0..COMBINE_BATCH {
+            mx = mx.max(v[j]);
+        }
+        i += COMBINE_BATCH;
     }
 
     let mut wsum = 0.0f32;
     let mut o = 0.0f32;
     let mut i = 0;
     while i < n {
-        let w = rescale(lse[i], mx);
-        wsum += w;
-        o += w * part_o[(b * n + i) * HEAD_DIM as usize + d];
-        i += 1;
+        let mut l = [NEG_INF; COMBINE_BATCH];
+        let mut p = [0.0f32; COMBINE_BATCH];
+        #[unroll]
+        for j in 0..COMBINE_BATCH {
+            if i + j < n {
+                l[j] = lse[i + j];
+                p[j] = part_o[(b * n + i + j) * HEAD_DIM as usize + d];
+            }
+        }
+        #[unroll]
+        for j in 0..COMBINE_BATCH {
+            if i + j < n {
+                let w = rescale(l[j], mx);
+                wsum += w;
+                o += w * p[j];
+            }
+        }
+        i += COMBINE_BATCH;
     }
 
     let v = if wsum > 0.0 { o / wsum } else { f32::NAN };

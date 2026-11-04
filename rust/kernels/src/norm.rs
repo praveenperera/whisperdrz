@@ -60,18 +60,46 @@ fn row_of(rows: u32, cols8: u32, lens: [usize; 3], w: &[H8], b: &[H8]) -> Option
     (row < rows).then_some((row as usize * cols8 as usize, threadIdx_x() % 32))
 }
 
-/// Normalizes a row held as `v[i]` = chunk `lane + 32 i` (chunks at or past `cols8` are
-/// zero) and stores chunk `c` through `store(c, value)`
+/// This lane's chunks of the LayerNorm weight and bias, chunk `lane + 32 i` at `i`, for
+/// a kernel that loads them before its row
 ///
 /// # Safety
-/// The whole warp calls it together; `w` and `b` hold `cols8` chunks
+/// `w` and `b` hold `cols8` chunks
+#[inline(always)]
+unsafe fn affine(
+    lane: u32,
+    cols8: u32,
+    w: &[H8],
+    b: &[H8],
+) -> ([H8; MAX_CHUNKS], [H8; MAX_CHUNKS]) {
+    let mut wv = [H8([0; 4]); MAX_CHUNKS];
+    let mut bv = [H8([0; 4]); MAX_CHUNKS];
+    for i in 0..MAX_CHUNKS {
+        __unroll_config::<0>();
+        let c = (lane + 32 * i as u32) as usize;
+        if c < cols8 as usize {
+            // SAFETY: c < cols8 <= w.len(), b.len()
+            unsafe {
+                wv[i] = *w.get_unchecked(c);
+                bv[i] = *b.get_unchecked(c);
+            }
+        }
+    }
+    (wv, bv)
+}
+
+/// Normalizes a row held as `v[i]` = chunk `lane + 32 i` (chunks at or past `cols8` are
+/// zero) with the weight and bias chunks `affine(i, c)` gives for chunk `c`, and stores
+/// chunk `c` through `store(c, value)`
+///
+/// # Safety
+/// The whole warp calls it together; `affine` is safe to call for every `c < cols8`
 #[inline(always)]
 unsafe fn normalize(
     v: &[H8; MAX_CHUNKS],
     lane: u32,
     cols8: u32,
-    w: &[H8],
-    b: &[H8],
+    affine: impl Fn(usize, usize) -> ([f32; 8], [f32; 8]),
     eps: f32,
     mut store: impl FnMut(usize, H8),
 ) {
@@ -107,8 +135,7 @@ unsafe fn normalize(
         let c = (lane + 32 * i as u32) as usize;
         if c < cols8 as usize {
             let x = v[i].unpack();
-            // SAFETY: c < cols8 <= w.len(), b.len()
-            let (wc, bc) = unsafe { (w.get_unchecked(c).unpack(), b.get_unchecked(c).unpack()) };
+            let (wc, bc) = affine(i, c);
             let mut y = [0.0f32; 8];
             for e in 0..8 {
                 __unroll_config::<0>();
@@ -148,8 +175,17 @@ pub fn layernorm_f16(
     }
     let op = out.as_mut_ptr();
     // SAFETY: the warp runs it together; each chunk of this row is stored by one lane
-    // only, inside the checked rows * cols8 <= out.len()
-    unsafe { normalize(&v, lane, cols8, w, b, eps, |c, y| *op.add(base + c) = y) };
+    // only, inside the checked rows * cols8 <= out.len(); c < cols8 <= w.len(), b.len()
+    unsafe {
+        normalize(
+            &v,
+            lane,
+            cols8,
+            |_, c| (w.get_unchecked(c).unpack(), b.get_unchecked(c).unpack()),
+            eps,
+            |c, y| *op.add(base + c) = y,
+        )
+    };
 }
 
 /// The residual add before a LayerNorm, fused: `x[r] = f16(x[r] + add[r])`, then
@@ -171,18 +207,34 @@ pub fn add_layernorm_f16(
         return;
     };
     let xp = x.as_mut_ptr();
+    // the weight and bias, then the row, all loaded before the first store of x, which
+    // the compiler cannot move a later load above: loaded next to each store, every
+    // chunk waited out its own memory round trip, and a one-row add and LayerNorm in a
+    // decode step is nothing but that latency
+    // SAFETY: row_of checked w and b against cols8
+    let (wv, bv) = unsafe { affine(lane, cols8, w, b) };
+    let mut xs = [H8([0; 4]); MAX_CHUNKS];
+    let mut ds = [H8([0; 4]); MAX_CHUNKS];
+    #[unroll]
+    for i in 0..MAX_CHUNKS {
+        let c = (lane + 32 * i as u32) as usize;
+        if c < cols8 as usize {
+            // SAFETY: base + c < rows * cols8, inside x and add (checked in row_of)
+            unsafe {
+                xs[i] = *xp.add(base + c);
+                ds[i] = *add.get_unchecked(base + c);
+            }
+        }
+    }
     let mut v = [H8([0; 4]); MAX_CHUNKS];
     #[unroll]
     for i in 0..MAX_CHUNKS {
         let c = (lane + 32 * i as u32) as usize;
         if c < cols8 as usize {
-            // SAFETY: base + c < rows * cols8, inside x and add (checked in row_of); the
-            // chunk is this lane's alone, read then written by it only
+            // SAFETY: as above; the chunk is this lane's alone, read then written by it
+            // only
             unsafe {
-                let (a, d) = (
-                    (*xp.add(base + c)).unpack(),
-                    add.get_unchecked(base + c).unpack(),
-                );
+                let (a, d) = (xs[i].unpack(), ds[i].unpack());
                 let mut s = [0.0f32; 8];
                 #[unroll]
                 for e in 0..8 {
@@ -196,5 +248,14 @@ pub fn add_layernorm_f16(
     }
     let op = out.as_mut_ptr();
     // SAFETY: as in layernorm_f16
-    unsafe { normalize(&v, lane, cols8, w, b, eps, |c, y| *op.add(base + c) = y) };
+    unsafe {
+        normalize(
+            &v,
+            lane,
+            cols8,
+            |i, _| (wv[i].unpack(), bv[i].unpack()),
+            eps,
+            |c, y| *op.add(base + c) = y,
+        )
+    };
 }
