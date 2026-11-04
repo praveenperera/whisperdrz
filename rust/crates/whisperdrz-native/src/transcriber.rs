@@ -47,7 +47,7 @@ pub use slot::{Chunk, Meta, SAMPLE_RATE, Slot};
 
 use crate::decode::{DecodeConfig, DecoderTables};
 use crate::post::{self, Segment};
-use crate::speaker::{self, CropRng, MIN_CROP_SECONDS};
+use crate::speaker::{self, MIN_CROP_SECONDS, PyRandom};
 use crate::text::Token;
 use crops::CropPlanner;
 
@@ -225,12 +225,11 @@ impl<M: Model> Transcriber<M> {
     /// speakers (`rng` is the global `random` state the line crops draw from) and
     /// runs the final merge, repair and renumbering. With the remap on, each crop is
     /// handed to [`Model::prefetch_embed`] once the chunks it depends on finish (see
-    /// [`crops`]), so the model can embed it alongside decoding
-    pub fn transcribe<R: CropRng + Clone + 'static>(
-        &mut self,
-        audio: &[f32],
-        rng: &mut R,
-    ) -> Result<Transcription> {
+    /// [`crops`]), so the model can embed it alongside decoding. The planner replays
+    /// the remap's draws on a copy of `rng`, so `rng` is the concrete [`PyRandom`],
+    /// whose clone owns its state: a generic `Clone` could share state and let the
+    /// planner advance the caller's rng
+    pub fn transcribe(&mut self, audio: &[f32], rng: &mut PyRandom) -> Result<Transcription> {
         let audio: Arc<[f32]> = Arc::from(audio);
         let chunk_len = (self.config.max_audio_length * SAMPLE_RATE as f64) as usize;
         let mut chunks = Vec::new();
@@ -251,7 +250,7 @@ impl<M: Model> Transcriber<M> {
         self.planner = self
             .config
             .speaker_remap
-            .then(|| CropPlanner::new(audio.clone(), Box::new(rng.clone()), chunks.len()));
+            .then(|| CropPlanner::new(audio.clone(), rng.clone(), chunks.len()));
 
         let mut results = Vec::new();
         self.pending.extend(chunks);

@@ -18,15 +18,15 @@ use eyre::{Result, ensure};
 use super::Model;
 use crate::post::join_predictions;
 use crate::speaker::{
-    CropRng, MAX_CROP_SECONDS, MIN_CROP_SECONDS, extract_line_audio_segments, fixed_line_crops,
+    MAX_CROP_SECONDS, MIN_CROP_SECONDS, PyRandom, extract_line_audio_segments, fixed_line_crops,
 };
 
 /// One `transcribe` call's crop planning
 pub(crate) struct CropPlanner {
     audio: Arc<[f32]>,
-    /// The file's rng as `transcribe` received it, advanced past the long lines of
-    /// chunks `0..next`
-    rng: Box<dyn CropRng>,
+    /// An independent copy of the file's rng as `transcribe` received it, advanced past
+    /// the long lines of chunks `0..next`
+    rng: PyRandom,
     /// Each finished chunk's joined text, by chunk number
     texts: Vec<Option<String>>,
     /// Chunks before this have had every crop extracted
@@ -34,7 +34,7 @@ pub(crate) struct CropPlanner {
 }
 
 impl CropPlanner {
-    pub(crate) fn new(audio: Arc<[f32]>, rng: Box<dyn CropRng>, chunks: usize) -> Self {
+    pub(crate) fn new(audio: Arc<[f32]>, rng: PyRandom, chunks: usize) -> Self {
         Self {
             audio,
             rng,
@@ -71,7 +71,7 @@ impl CropPlanner {
                 text,
                 MIN_CROP_SECONDS,
                 MAX_CROP_SECONDS,
-                &mut *self.rng,
+                &mut self.rng,
             )?;
             // the rng-free crops were prefetched above; the model drops repeats
             for c in crops {
