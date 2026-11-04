@@ -17,6 +17,7 @@ pub mod dtw;
 pub mod ecapa2;
 pub mod elementwise;
 pub mod flash;
+pub mod linear;
 pub mod mma_f16;
 pub mod norm;
 pub mod pointwise;

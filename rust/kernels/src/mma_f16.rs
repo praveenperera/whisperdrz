@@ -84,6 +84,15 @@ pub struct FragA([u32; 4]);
 impl FragA {
     pub const ZERO: Self = Self([0; 4]);
 
+    /// The fragment from its four registers: rows `lane / 4` and the same plus 8 at depth
+    /// `2 * (lane % 4)`, then both at that depth plus 8, low half first. For an A operand
+    /// read straight from global memory, as the small-M linears keep their weights in
+    /// registers
+    #[inline(always)]
+    pub fn from_bits(a: [u32; 4]) -> Self {
+        Self(a)
+    }
+
     /// The A operand whose left and right 16x8 halves are the FP32 accumulators `lo` and
     /// `hi`, each value rounded to FP16: an m16n8 accumulator has the register layout of
     /// half an A fragment, which is how P = softmax(S) feeds P @ V without a trip through

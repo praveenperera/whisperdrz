@@ -14,9 +14,11 @@
 //! a zero key bias, and each residual add is fused with the LayerNorm after it, both exact
 //! in real arithmetic; every value is rounded to FP16 where torch rounds it. Decode steps
 //! (one token per row) run their linears on the cuBLASLt algorithms measured fastest for
-//! the bucket's row count ([`Blas::linear_bias_decode`]): same FP32 sums and bias
-//! epilogue as torch's call, in another order, so outputs can differ from torch's by
-//! FP16 rounding. Prefills and the DTW forward keep torch's calls. Prefill first
+//! the bucket's row count ([`Blas::linear_bias_decode`]), or for the cells
+//! [`small_m::route`](super::small_m::route) lists (2 to 16 rows) on the cuda-oxide small-M
+//! kernels, fc1's GELU fused there: same FP32 sums and bias epilogue as torch's call, in
+//! another order, so outputs can differ from torch's by FP16 rounding. Prefills and the DTW forward keep
+//! torch's calls. Prefill first
 //! fills every layer's cross keys and values from the encoder output and zeroes the slot
 //! lengths, then runs a step at positions `0..q_len`
 //!
@@ -53,6 +55,7 @@ use half::f16;
 use super::decoder_attn::{self, Batch, CrossKv, DecoderAttn, KvCaches, Rows};
 use super::device::{Arg, Buf, Gpu, blocks};
 use super::ops::{self, HeadView};
+use super::small_m::{SmallM, SmallStrides};
 use super::{Blas, Tensor, Weights};
 use crate::dtw::{DtwBatch, Matrices};
 
@@ -152,20 +155,78 @@ impl Linear {
 
     /// `y = x @ w^T (+ b)` over `rows` rows, the call torch makes for this layer
     fn apply(&self, blas: &Blas, x: u64, y: u64, rows: usize) -> Result<()> {
-        self.apply_as(blas, Gemm::Torch, x, y, rows)
-    }
-
-    /// [`Linear::apply`] on the algorithm `gemm` names; bias-free layers always run
-    /// torch's call
-    fn apply_as(&self, blas: &Blas, gemm: Gemm, x: u64, y: u64, rows: usize) -> Result<()> {
-        let (n_out, n_in) = (self.w.shape[0], self.w.shape[1]);
-        let dims = (rows, n_in, n_out);
-        match (&self.b, gemm) {
-            (Some(b), Gemm::Torch) => blas.linear_bias(x, self.w.ptr(), b.ptr(), y, dims),
-            (Some(b), Gemm::Decode) => blas.linear_bias_decode(x, self.w.ptr(), b.ptr(), y, dims),
-            (None, _) => blas.linear(x, self.w.ptr(), y, dims),
+        let dims = (rows, self.w.shape[1], self.w.shape[0]);
+        match &self.b {
+            Some(b) => blas.linear_bias(x, self.w.ptr(), b.ptr(), y, dims),
+            None => blas.linear(x, self.w.ptr(), y, dims),
         }
     }
+
+    /// A step's linear: [`linear_step`] on this layer's weights, then GELU when `gelu`;
+    /// bias-free layers always run torch's call
+    #[allow(clippy::too_many_arguments)]
+    fn apply_step(
+        &self,
+        gpu: &Gpu,
+        blas: &Blas,
+        small: &SmallM,
+        gemm: Gemm,
+        (x, y): (u64, u64),
+        rows: usize,
+        gelu: bool,
+    ) -> Result<()> {
+        let (n_out, n_in) = (self.w.shape[0], self.w.shape[1]);
+        let dims = (rows, n_in, n_out);
+        match &self.b {
+            Some(b) => linear_step(
+                gpu,
+                blas,
+                small,
+                gemm,
+                (x, self.w.ptr(), b.ptr(), y),
+                dims,
+                gelu,
+            ),
+            None => {
+                blas.linear(x, self.w.ptr(), y, dims)?;
+                if gelu {
+                    ops::gelu_inplace(gpu, y, rows * n_out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `y = x @ w^T + b` over `dims = (rows, n_in, n_out)` on the algorithm `gemm` names, then
+/// GELU when `gelu`. Decode steps run the cells [`small_m::route`](super::small_m::route)
+/// lists on the small-M kernels, with the GELU fused, and the rest on
+/// [`Blas::linear_bias_decode`]
+#[allow(clippy::too_many_arguments)]
+fn linear_step(
+    gpu: &Gpu,
+    blas: &Blas,
+    small: &SmallM,
+    gemm: Gemm,
+    (x, w, b, y): (u64, u64, u64, u64),
+    dims: (usize, usize, usize),
+    gelu: bool,
+) -> Result<()> {
+    let (rows, n_in, n_out) = dims;
+    match gemm {
+        Gemm::Torch => blas.linear_bias(x, w, b, y, dims)?,
+        Gemm::Decode => match small.route((x, w, y), dims) {
+            Some(cfg) => {
+                let s = SmallStrides::dense(n_in, n_out);
+                return small.linear(gpu, cfg, (x, w, b, y), dims, s, gelu);
+            }
+            None => blas.linear_bias_decode(x, w, b, y, dims)?,
+        },
+    }
+    if gelu {
+        ops::gelu_inplace(gpu, y, rows * n_out)?;
+    }
+    Ok(())
 }
 
 /// Which cuBLASLt algorithm a step's linears run on
@@ -291,6 +352,8 @@ pub struct Workspace {
     qk: Buf,
     /// Absorbed cross-attention output before the value projection `[rows, 20, 1280]`
     ok: Buf,
+    /// Split-K partials and counters of the small-M linears the decode steps route to
+    small: SmallM,
 }
 
 impl Workspace {
@@ -320,6 +383,7 @@ impl Workspace {
             cross_scratch: (max_windows > 0).then(|| gpu.alloc(cross)).transpose()?,
             qk: gpu.alloc(max_rows * N_HEAD * D_MODEL * 2)?,
             ok: gpu.alloc(max_rows * N_HEAD * D_MODEL * 2)?,
+            small: SmallM::for_routes(gpu)?,
         })
     }
 
@@ -726,18 +790,13 @@ impl Decoder {
         );
 
         let gemm = Gemm::for_batch(batch);
+        let small = &ws.small;
         match op {
             SubOp::AttnLn => blk.attn_ln.apply(gpu, x, h, n),
             SubOp::SelfAttn => {
                 let qkv_dims = (n, D_MODEL, 3 * D_MODEL);
-                match gemm {
-                    Gemm::Torch => {
-                        blas.linear_bias(h, blk.qkv_w.ptr(), blk.qkv_b.ptr(), qkv, qkv_dims)
-                    }
-                    Gemm::Decode => {
-                        blas.linear_bias_decode(h, blk.qkv_w.ptr(), blk.qkv_b.ptr(), qkv, qkv_dims)
-                    }
-                }?;
+                let ops = (h, blk.qkv_w.ptr(), blk.qkv_b.ptr(), qkv);
+                linear_step(gpu, blas, small, gemm, ops, qkv_dims, false)?;
                 let packed = |col: usize| Rows {
                     ptr: qkv + 2 * col as u64,
                     stride: 3 * D_MODEL,
@@ -750,11 +809,13 @@ impl Decoder {
                     (packed(0), packed(D_MODEL), packed(2 * D_MODEL)),
                     o,
                 )?;
-                blk.attn_out.apply_as(blas, gemm, o, ao, n)
+                blk.attn_out
+                    .apply_step(gpu, blas, small, gemm, (o, ao), n, false)
             }
             SubOp::CrossLn => blk.cross_ln.add_apply(gpu, x, ao, h, n),
             SubOp::CrossAttn => {
-                blk.cross_q.apply_as(blas, gemm, h, qkv, n)?;
+                blk.cross_q
+                    .apply_step(gpu, blas, small, gemm, (h, qkv), n, false)?;
                 if decoder_attn::uses_absorbed(batch.rows, batch.q_len) {
                     let (qk, ok) = (ws.qk.ptr(), ws.ok.ptr());
                     let kv = blk.cross_kv()?;
@@ -765,13 +826,15 @@ impl Decoder {
                     attn.cross_attn(gpu, caches, i, batch, Rows::dense(qkv), o)?;
                 }
 
-                blk.cross_out.apply_as(blas, gemm, o, ao, n)
+                blk.cross_out
+                    .apply_step(gpu, blas, small, gemm, (o, ao), n, false)
             }
             SubOp::MlpLn => blk.mlp_ln.add_apply(gpu, x, ao, h, n),
             SubOp::Mlp => {
-                blk.fc1.apply_as(blas, gemm, h, f, n)?;
-                ops::gelu_inplace(gpu, f, n * D_MLP)?;
-                blk.fc2.apply_as(blas, gemm, f, ao, n)
+                blk.fc1
+                    .apply_step(gpu, blas, small, gemm, (h, f), n, true)?;
+                blk.fc2
+                    .apply_step(gpu, blas, small, gemm, (f, ao), n, false)
             }
         }
     }

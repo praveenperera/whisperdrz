@@ -68,3 +68,18 @@ DTW forward, the encoder, the bias-free key projections and the LM head still ma
 torch's calls. To re-measure, run
 `WHISPERDRZ_GEMM_PROBE=out.json cargo test --release --features cuda -p whisperdrz-native --test gpu_gemm_probe -- --nocapture`
 through the GPU queue and paste its printed `pick(...)` lines into `TABLE`.
+
+Eight cells below 32 rows go to cuda-oxide kernels instead (`linear_n8_*` in
+`kernels/src/linear.rs`, routed by `crates/whisperdrz-native/src/cuda/small_m.rs`). These
+are the 1280x1280 projections (self-attention out, cross-attention query and out) at 2, 4,
+8 and 16 rows, fc2 at 8 and 16 rows, and the packed QKV and fc1 (with GELU fused) at 16
+rows. At these sizes torch's kernel, and every non-split-K algorithm the cuBLASLt heuristic
+offers, streams the 1280x1280 weights at about a quarter of DRAM rate. The kernels keep the
+f64 error within the same 1.25x max and 1.05x mean of torch's, and each routed cell ran at
+least 1.1x faster than the current pick. They sum in FP32 and round once to FP16 after the
+bias. When a cell splits the depth across blocks, the last block sums the partials in a
+fixed order, so the output is the same run to run. The other cells, including every
+1-row cell, keep the table or torch's choice. The routes are used only on the RTX 5090. To
+re-measure, run
+`WHISPERDRZ_SMALLM_PROBE=out.json cargo test --release --features cuda -p whisperdrz-native --test gpu_small_m probe_small_m -- --nocapture`
+through the GPU queue.

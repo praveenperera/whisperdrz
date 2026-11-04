@@ -10,6 +10,7 @@ pub mod encoder;
 pub mod model;
 pub mod nvtx;
 pub mod ops;
+pub mod small_m;
 pub mod weights;
 
 pub use blas::{Blas, F32Math, Operand};
