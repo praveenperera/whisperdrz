@@ -6,6 +6,7 @@ use eyre::{Result, ensure};
 use super::Transcriber;
 use super::model::{Model, N_FRAMES};
 use super::probe::Event;
+use super::trace;
 use crate::decode::Status;
 use crate::dtw::{DtwOptions, TokenizerDtw, fill_word_timings_batch};
 use crate::post::timings::TIMINGS_FORMAT;
@@ -240,6 +241,7 @@ impl<M: Model> Transcriber<M> {
             }
         }
 
+        let _range = trace::Range::new("align");
         let pre_augs = if self.config.dtw_align {
             Some(self.batched_dtw(to_align, &outs)?)
         } else {
@@ -285,11 +287,14 @@ impl<M: Model> Transcriber<M> {
         let tables = self.tables.clone();
         let tokenizer = TokenizerDtw::new(&tables.tok)?;
         let model = &mut self.model;
+        // dtw_prep nests inside, so idle time under this range is the host DTW
+        let dtw = trace::Range::new("dtw_cpu");
         let filled =
             fill_word_timings_batch(&slot_data, &tokenizer, &DtwOptions::default(), |batch| {
                 let rows: Vec<usize> = batch.slots.iter().map(|&si| xa_slots[si]).collect();
                 model.dtw_prep(batch, &rows)
             })?;
+        drop(dtw);
         ensure!(
             filled.len() == slot_data.len(),
             "DTW returned {} texts for {} slots",

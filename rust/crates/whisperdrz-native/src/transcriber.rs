@@ -29,6 +29,7 @@ mod probe;
 mod pyset;
 mod schedule;
 mod slot;
+mod trace;
 
 use std::collections::VecDeque;
 use std::sync::Arc;

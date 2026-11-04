@@ -12,6 +12,7 @@ use super::model::{Logits, MelBatch, Model, N_FRAMES};
 use super::probe::Event;
 use super::pyset::PySet;
 use super::slot::{Chunk, Slot};
+use super::trace;
 use super::{Transcriber, build_init_tokens};
 use crate::decode::{Decision, Decoder, Status};
 
@@ -255,6 +256,7 @@ impl<M: Model> Transcriber<M> {
     /// `update_state_after_decode` per row and the token writes. `step` marks the
     /// main decode loop, which also applies the non-English early exit
     fn decode_and_update(&mut self, logits: &Logits, slots: &[usize], step: bool) -> Result<()> {
+        let _range = trace::Range::new("host_decode");
         ensure!(
             logits.rows == slots.len(),
             "{} logits rows for {} slots",
@@ -286,16 +288,19 @@ impl<M: Model> Transcriber<M> {
             })
             .collect::<Result<Vec<_>>>()?;
         let all_tokens = &self.all_tokens;
+        let par = trace::Range::new("rows");
         let decisions: Vec<Decision> = rows
             .into_par_iter()
             .enumerate()
             .map(|(r, (slot_idx, slot))| {
+                let _row = trace::Range::new("row");
                 let state = &mut slot.state;
                 let window = Decoder::repetition_window(state.token_count)
                     .map(|range| &all_tokens[slot_idx][range]);
                 decoder.decode_row(logits.row(r), state, window)
             })
             .collect::<Result<_>>()?;
+        drop(par);
 
         emit!(
             self,
@@ -415,10 +420,12 @@ impl<M: Model> Transcriber<M> {
 
         let max_seq_len = self.config.max_tokens;
         for _step in 0..max_seq_len * 2 {
+            let warm = trace::Range::new("warm");
             let promoted = self.promote_warm_slots()?;
             active.extend(promoted);
             active.retain(|&i| self.is_active(i));
             self.fill_warm_slots()?;
+            drop(warm);
 
             // sync refill, only when nothing is decoding or warming
             if active.is_empty() && !self.pending.is_empty() && self.prefill_events.is_empty() {
@@ -476,6 +483,7 @@ impl<M: Model> Transcriber<M> {
                 self.decode_step(&decode_slots)?;
             }
 
+            let align_prep = trace::Range::new("align_prep");
             let mut pending_align = Vec::new();
             let mut finished = Vec::new();
             for slot_idx in active.clone() {
@@ -489,6 +497,7 @@ impl<M: Model> Transcriber<M> {
                 }
             }
 
+            drop(align_prep);
             if pending_align.is_empty() {
                 continue;
             }
