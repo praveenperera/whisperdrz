@@ -14,6 +14,8 @@
 use std::sync::Arc;
 
 use eyre::{Result, ensure};
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
 
@@ -23,6 +25,8 @@ pub const HOP_LENGTH: usize = 160;
 pub const N_MELS: usize = 128;
 /// One-sided frequency bins of an `N_FFT` transform
 pub const N_FREQS: usize = N_FFT / 2 + 1;
+/// Frames one parallel log-mel task computes; a 30 s chunk has 3001
+const FRAMES_PER_TASK: usize = 128;
 
 /// The log-mel transform with its window, filterbank and FFT plan
 pub struct LogMel {
@@ -88,31 +92,45 @@ impl LogMel {
             audio.len()
         );
         let frames = Self::frames(audio.len());
+        // frames are independent until the global floor below, so blocks of them run in
+        // parallel, each with its own FFT buffers, into a frame-major buffer
+        let mut by_frame = vec![0f32; frames * N_MELS];
+        by_frame
+            .par_chunks_mut(FRAMES_PER_TASK * N_MELS)
+            .enumerate()
+            .for_each(|(block, out)| {
+                let mut input = self.fft.make_input_vec();
+                let mut spectrum = self.fft.make_output_vec();
+                let mut scratch = self.fft.make_scratch_vec();
+                let mut power = vec![0f64; N_FREQS];
+                for (k, row) in out.as_chunks_mut::<N_MELS>().0.iter_mut().enumerate() {
+                    let t = block * FRAMES_PER_TASK + k;
+                    let start = (t * HOP_LENGTH) as isize - (N_FFT / 2) as isize;
+                    for (n, slot) in input.iter_mut().enumerate() {
+                        let x = audio[reflect(start + n as isize, audio.len())];
+                        *slot = x as f64 * self.window[n] as f64;
+                    }
+
+                    self.fft
+                        .process_with_scratch(&mut input, &mut spectrum, &mut scratch)
+                        .expect("FFT buffers come from the plan");
+                    for (p, Complex { re, im }) in power.iter_mut().zip(&spectrum) {
+                        *p = re * re + im * im;
+                    }
+
+                    for (m, &(lo, hi)) in self.bands.iter().enumerate() {
+                        let sum: f64 = (lo..hi)
+                            .map(|f| power[f] * self.fb[f * N_MELS + m] as f64)
+                            .sum();
+                        row[m] = sum.max(1e-10).log10() as f32;
+                    }
+                }
+            });
+
         let mut mel = vec![0f32; N_MELS * frames];
-        let mut input = self.fft.make_input_vec();
-        let mut spectrum = self.fft.make_output_vec();
-        let mut scratch = self.fft.make_scratch_vec();
-        let mut power = vec![0f64; N_FREQS];
-
-        for t in 0..frames {
-            let start = (t * HOP_LENGTH) as isize - (N_FFT / 2) as isize;
-            for (n, slot) in input.iter_mut().enumerate() {
-                let x = audio[reflect(start + n as isize, audio.len())];
-                *slot = x as f64 * self.window[n] as f64;
-            }
-
-            self.fft
-                .process_with_scratch(&mut input, &mut spectrum, &mut scratch)
-                .expect("FFT buffers come from the plan");
-            for (p, Complex { re, im }) in power.iter_mut().zip(&spectrum) {
-                *p = re * re + im * im;
-            }
-
-            for (m, &(lo, hi)) in self.bands.iter().enumerate() {
-                let sum: f64 = (lo..hi)
-                    .map(|f| power[f] * self.fb[f * N_MELS + m] as f64)
-                    .sum();
-                mel[m * frames + t] = sum.max(1e-10).log10() as f32;
+        for (t, row) in by_frame.as_chunks::<N_MELS>().0.iter().enumerate() {
+            for (m, &v) in row.iter().enumerate() {
+                mel[m * frames + t] = v;
             }
         }
 
