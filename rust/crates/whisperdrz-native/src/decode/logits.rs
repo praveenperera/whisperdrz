@@ -16,6 +16,7 @@
 use half::f16;
 use half::slice::HalfFloatSliceExt;
 
+use super::mask::TokenMask;
 use crate::text::Token;
 
 /// The additive mask value: fp16 max, not `-inf`, so a fully blocked row stays finite
@@ -135,6 +136,214 @@ pub fn masked_row(
     (row, sum)
 }
 
+/// A logits row under an additive mask, `x + (blocked ? -65504 : unblocked)` rounded to
+/// fp16 as [`masked_row`] computes it, with the argmax taken without building the row
+///
+/// The scan covers unblocked entries outside `skip`, where the masked value is the logit
+/// itself (adding a signed zero changes at most the sign of a zero, which compares
+/// equal), and keeps only the best and runner-up. [`Self::argmax`] then merges in the
+/// caller's values for the `skip` entries, which is exact because the top two of a
+/// union are the top two of the parts' top twos under argmax's order (value, then
+/// lowest id). Blocked entries sit near -65504 and only compete when the row has a
+/// NaN, fewer than two other entries, or a logit large enough to stay above the
+/// runner-up after the fill; those rows take the full [`masked_row`] path
+pub struct MaskedRow<'a> {
+    values: &'a [f16],
+    blocked: &'a TokenMask,
+    unblocked: f32,
+    skip: &'a [Token],
+    top: Top2,
+    /// No row entry is NaN
+    finite: bool,
+    /// An upper bound on every blocked entry's masked value
+    blocked_bound: f32,
+}
+
+/// Best and runner-up `(id, value)` under [`argmax_wide`]'s order
+#[derive(Clone, Copy, Default)]
+struct Top2 {
+    best: Option<(usize, f32)>,
+    second: Option<(usize, f32)>,
+}
+
+impl Top2 {
+    /// Adds an entry with a higher id than every entry so far, as [`argmax_wide`]'s loop
+    fn push(&mut self, i: usize, v: f32) {
+        let rank = |v: f32| if v.is_nan() { f32::INFINITY } else { v };
+        let better =
+            |a: f32, b: f32| (a.is_nan() && !b.is_nan()) || (!b.is_nan() && rank(a) > rank(b));
+        match self.best {
+            None => self.best = Some((i, v)),
+            Some((_, bv)) if better(v, bv) => {
+                self.second = self.best;
+                self.best = Some((i, v));
+            }
+            Some(_) => {
+                if self.second.is_none_or(|(_, sv)| better(v, sv)) {
+                    self.second = Some((i, v));
+                }
+            }
+        }
+    }
+}
+
+/// Entries per scan chunk, one mask word
+const CHUNK: usize = 64;
+/// Independent accumulators per chunk reduction, so the max reductions vectorize
+const LANES: usize = 8;
+
+impl<'a> MaskedRow<'a> {
+    /// Scans `values` under `blocked` once. `skip` lists the ids [`Self::argmax`] gives
+    /// values for, sorted and unique
+    pub fn new(
+        values: &'a [f16],
+        blocked: &'a TokenMask,
+        unblocked: f32,
+        skip: &'a [Token],
+    ) -> Self {
+        assert_eq!(
+            values.len(),
+            blocked.len(),
+            "logits and mask lengths differ"
+        );
+        assert!(
+            skip.windows(2).all(|w| w[0] < w[1]),
+            "skip ids must be sorted and unique"
+        );
+
+        let mut top = Top2::default();
+        let mut raw_max = f32::NEG_INFINITY;
+        let mut nan = false;
+        let mut wide = [0f32; CHUNK];
+        let mut skip_at = 0;
+        for (c, (chunk, &word)) in values.chunks(CHUNK).zip(blocked.words()).enumerate() {
+            let base = c * CHUNK;
+            let wide = &mut wide[..chunk.len()];
+            chunk.convert_to_f32_slice(wide);
+
+            let mut eligible = !word;
+            while skip_at < skip.len() && (skip[skip_at] as usize) < base + CHUNK {
+                eligible &= !(1u64 << (skip[skip_at] as usize - base));
+                skip_at += 1;
+            }
+
+            // the raw max and NaN flag over every entry, branch-free so they vectorize (a
+            // compare-select is `maxps`; NaN is tracked apart). The raw max bounds the
+            // eligible max, so a chunk below the runner-up is skipped without its bits
+            let mut raw = [f32::NEG_INFINITY; LANES];
+            let mut any_nan = [false; LANES];
+            let (lanes, tail) = wide.as_chunks::<LANES>();
+            for c in lanes {
+                for l in 0..LANES {
+                    let v = c[l];
+                    raw[l] = if v > raw[l] { v } else { raw[l] };
+                    any_nan[l] |= v.is_nan();
+                }
+            }
+
+            for (l, &v) in tail.iter().enumerate() {
+                raw[l] = if v > raw[l] { v } else { raw[l] };
+                any_nan[l] |= v.is_nan();
+            }
+
+            let chunk_max = raw.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            raw_max = raw_max.max(chunk_max);
+            nan |= any_nan.iter().any(|&b| b);
+
+            // later ids lose ties, so a chunk can only matter if it beats the runner-up
+            if eligible == 0 || top.second.is_some_and(|(_, sv)| chunk_max <= sv) {
+                continue;
+            }
+
+            let mut bits = eligible & (u64::MAX >> (CHUNK - wide.len()));
+            while bits != 0 {
+                let j = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                top.push(base + j, wide[j]);
+            }
+        }
+
+        let blocked_bound = f16::from_f32(raw_max + MASK_FILL).to_f32();
+        Self {
+            values,
+            blocked,
+            unblocked,
+            skip,
+            top,
+            finite: !nan,
+            blocked_bound,
+        }
+    }
+
+    /// Entry `id` of the masked row
+    pub fn value(&self, id: Token) -> f16 {
+        let x = self.values[id as usize].to_f32();
+        let add = if self.blocked.get(id) {
+            MASK_FILL
+        } else {
+            self.unblocked
+        };
+        f16::from_f32(x + add)
+    }
+
+    /// [`argmax_wide`] of the masked row with entry `skip[k]` replaced by `at_skip[k]`
+    pub fn argmax(&self, at_skip: &[f16]) -> Argmax {
+        assert_eq!(at_skip.len(), self.skip.len(), "one value per skipped id");
+
+        let mut cands: Vec<(usize, f32)> = [self.top.best, self.top.second]
+            .into_iter()
+            .flatten()
+            .chain(
+                self.skip
+                    .iter()
+                    .zip(at_skip)
+                    .map(|(&t, v)| (t as usize, v.to_f32())),
+            )
+            .collect();
+        cands.sort_unstable_by_key(|&(i, _)| i);
+        let mut top = Top2::default();
+        for &(i, v) in &cands {
+            top.push(i, v);
+        }
+
+        let fast = match (top.best, top.second) {
+            (Some(best), Some(second))
+                if self.finite
+                    && at_skip.iter().all(|v| !v.is_nan())
+                    && self.blocked_bound < second.1 =>
+            {
+                Some((best.0, second.0))
+            }
+            _ => None,
+        };
+        let Some((best, second)) = fast else {
+            return self.argmax_full(at_skip);
+        };
+
+        let value_at = |i: usize| match self.skip.binary_search(&(i as Token)) {
+            Ok(k) => at_skip[k],
+            Err(_) => self.value(i as Token),
+        };
+        Argmax {
+            token: best as Token,
+            value: value_at(best),
+            runner_up: Some((second as Token, value_at(second))),
+        }
+    }
+
+    /// The row built in full, for the rows the scan can't decide
+    fn argmax_full(&self, at_skip: &[f16]) -> Argmax {
+        let wide = widen(self.values);
+        let (mut row, mut row_wide) = masked_row(&wide, |i| self.blocked.get(i), self.unblocked);
+        for (&t, &v) in self.skip.iter().zip(at_skip) {
+            row[t as usize] = v;
+            row_wide[t as usize] = v.to_f32();
+        }
+
+        argmax_wide(&row, &row_wide)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use half::f16;
@@ -183,6 +392,77 @@ mod tests {
                     );
                     assert!(w.to_bits() == r.to_f32().to_bits() || (w.is_nan() && r.is_nan()));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn masked_row_argmax_matches_full_row() {
+        use super::{MaskedRow, argmax_wide, masked_row, widen};
+        use crate::decode::mask::TokenMask;
+        use crate::text::Token;
+
+        // xorshift, so the cases are fixed
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // a few repeated values for ties, signed zeros, fp16 extremes and any bit pattern
+        let draw = |r: u64| -> f16 {
+            match r % 8 {
+                0..=2 => f16::from_f32([1.0, 2.0, -3.0, 0.5][(r >> 8) as usize % 4]),
+                3 => {
+                    f16::from_bits([0x0000, 0x8000, 0x7c00, 0xfc00, 0x7bff][(r >> 8) as usize % 5])
+                }
+                4 => f16::from_bits((r >> 16) as u16),
+                _ => f16::from_f32(((r >> 16) % 2000) as f32 / 100.0 - 10.0),
+            }
+        };
+
+        let same = |a: f16, b: f16| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+        for case in 0..20_000 {
+            let len = 1 + (next() % 200) as usize;
+            let values: Vec<f16> = (0..len).map(|_| draw(next())).collect();
+            let density = [0, 50, 95, 99, 100][case % 5];
+            let blocked = TokenMask::from_ids(
+                len,
+                (0..len as Token).filter(|_| ((next() % 100) as usize) < density),
+            );
+            let mut skip: Vec<Token> = (0..next() % 6)
+                .map(|_| (next() % len as u64) as Token)
+                .collect();
+            skip.sort_unstable();
+            skip.dedup();
+            let at_skip: Vec<f16> = skip.iter().map(|_| draw(next())).collect();
+            let unblocked = if case % 2 == 0 { 0.0 } else { -0.0 };
+
+            let (mut row, mut row_wide) =
+                masked_row(&widen(&values), |i| blocked.get(i), unblocked);
+            for (&t, &v) in skip.iter().zip(&at_skip) {
+                row[t as usize] = v;
+                row_wide[t as usize] = v.to_f32();
+            }
+            let want = argmax_wide(&row, &row_wide);
+
+            let masked = MaskedRow::new(&values, &blocked, unblocked, &skip);
+            for (i, &r) in row.iter().enumerate() {
+                if skip.binary_search(&(i as Token)).is_err() {
+                    assert!(same(masked.value(i as Token), r), "case {case} value {i}");
+                }
+            }
+            let got = masked.argmax(&at_skip);
+            assert_eq!(got.token, want.token, "case {case}");
+            assert!(same(got.value, want.value), "case {case}");
+            assert_eq!(
+                got.runner_up.map(|r| r.0),
+                want.runner_up.map(|r| r.0),
+                "case {case}"
+            );
+            if let (Some(g), Some(w)) = (got.runner_up, want.runner_up) {
+                assert!(same(g.1, w.1), "case {case}");
             }
         }
     }

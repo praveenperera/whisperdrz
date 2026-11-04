@@ -52,6 +52,12 @@ impl TokenMask {
         self.len == 0
     }
 
+    /// The bits, 64 ids to a word, id `i` at bit `i % 64` of word `i / 64`; bits past
+    /// [`Self::len`] are clear
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
     pub fn get(&self, id: Token) -> bool {
         let i = id as usize;
         i < self.len && self.words[i / 64] >> (i % 64) & 1 == 1

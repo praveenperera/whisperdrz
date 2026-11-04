@@ -261,47 +261,31 @@ impl<'t> Decoder<'t> {
         };
 
         // Phase 3: additive mask, repetition penalty on non-timing rows, argmax
-        let wide = logits::widen(logits);
-        let (mut row, mut row_wide) = logits::masked_row(&wide, |i| mask.get(i), 0.0);
         let mut division_sensitive = false;
-        let mut main = None;
-        if !special_timing && state.token_count > 0 {
+        let main = if !special_timing && state.token_count > 0 {
             let mut recent = state.recent_tokens.clone();
             recent.sort_unstable();
             recent.dedup();
-            recent.retain(|&t| (t as usize) < row.len());
+            recent.retain(|&t| (t as usize) < logits.len());
 
-            let before: Vec<f16> = recent.iter().map(|&t| row[t as usize]).collect();
-            for &t in &recent {
-                let p = logits::penalize(row[t as usize]);
-                row[t as usize] = p;
-                row_wide[t as usize] = p.to_f32();
-            }
-
-            let picked = logits::argmax_wide(&row, &row_wide);
-            // the true-division row differs from `row` only at `recent`, and only matters
-            // when some entry there rounds differently
+            let masked = logits::MaskedRow::new(logits, &mask, 0.0, &recent);
+            let before: Vec<f16> = recent.iter().map(|&t| masked.value(t)).collect();
+            let penalized: Vec<f16> = before.iter().map(|&x| logits::penalize(x)).collect();
+            let picked = masked.argmax(&penalized);
+            // the true-division row differs from the penalized one only at `recent`, and
+            // only matters when some entry there rounds differently
             let alt_at: Vec<f16> = before
                 .iter()
                 .map(|&x| logits::penalize_true_division(x))
                 .collect();
-            let changed = recent
-                .iter()
-                .zip(&alt_at)
-                .any(|(&t, &v)| v != row[t as usize]);
-            if changed {
-                let (mut alt, mut alt_wide) = (row.clone(), row_wide.clone());
-                for (&t, &v) in recent.iter().zip(&alt_at) {
-                    alt[t as usize] = v;
-                    alt_wide[t as usize] = v.to_f32();
-                }
-                division_sensitive = logits::argmax_wide(&alt, &alt_wide).token != picked.token;
+            if alt_at.iter().zip(&penalized).any(|(a, p)| a != p) {
+                division_sensitive = masked.argmax(&alt_at).token != picked.token;
             }
-            main = Some(picked);
-        }
 
-        // the penalized row isn't touched after `picked`, so it is the main argmax
-        let main = main.unwrap_or_else(|| logits::argmax_wide(&row, &row_wide));
+            picked
+        } else {
+            logits::MaskedRow::new(logits, &mask, 0.0, &[]).argmax(&[])
+        };
         let mut decision = Decision {
             text: ds.vocab.text(main.token).to_owned(),
             token: main.token,
@@ -320,8 +304,7 @@ impl<'t> Decoder<'t> {
         if let Some(n) = normal
             && let Some(resample) = self.correct(logits, state, n, &base, &mut decision)?
         {
-            let (row, row_wide) = logits::masked_row(&wide, |i| resample.get(i), -0.0);
-            let a = logits::argmax_wide(&row, &row_wide);
+            let a = logits::MaskedRow::new(logits, &resample, -0.0, &[]).argmax(&[]);
             decision.samples.push(Sample {
                 stage: Stage::Correction,
                 argmax: a,
