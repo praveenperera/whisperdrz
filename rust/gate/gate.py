@@ -44,10 +44,15 @@ LIMITS = {
     # timing limits are 1.5x the worst of the mel64, enc-eff and cross-ns1 reference
     # reruns: mean boundary error vox24 0.209 s, e21 0.178 s; boundaries moved over
     # 0.2 s vox24 2.93%, e21 2.96%. The timed-word fraction of every rerun stayed within
-    # 0.13 points of the reference
-    "vox24": {"ds": "voxconverse-dev", "der": 21.98 + 1.25, "word_edit": 1.0, "cp_edit": 6.0,
+    # 0.13 points of the reference. cp limits are 1.5x the worst cp rate of all five
+    # reruns (those three plus dec-f32 and gemm-lt): vox24 mel64 1465 of 27276 words,
+    # e21 gemm-lt 63 of 9613. A BLAS-library switch alone took the reference past the
+    # earlier e21 cap of 0.3%. The 1.5x is an engineering margin, not a confidence bound
+    "vox24": {"ds": "voxconverse-dev", "der": 21.98 + 1.25, "word_edit": 1.0,
+              "cp_edit": 1.5 * 100 * 1465 / 27276,
               "timed_drop": 0.5, "t_mean": 0.313, "t_over": 4.39},
-    "e21": {"ds": "earnings21", "der": 27.47 + 0.5, "word_edit": 0.1, "cp_edit": 0.3,
+    "e21": {"ds": "earnings21", "der": 27.47 + 0.5, "word_edit": 0.1,
+            "cp_edit": 1.5 * 100 * 63 / 9613,
             "timed_drop": 0.5, "t_mean": 0.266, "t_over": 4.44},
 }
 TIMESTAMP = re.compile(r"<\|[0-9.]+\|>")
