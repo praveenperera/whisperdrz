@@ -171,6 +171,29 @@ fn f64v(v: &[f32]) -> Vec<f64> {
     v.iter().map(|&x| f64::from(x)).collect()
 }
 
+/// The values at real tokens of a `[rows, planes, t, width]` array: token `i` of row `b`
+/// counts below `lens[b]`. The DTW forward packs its shortest row's tokens, so that row's
+/// padding isn't the reference's (and no alignment reads it)
+fn real_tokens<T: Copy>(
+    v: &[T],
+    (rows, planes, t): (usize, usize, usize),
+    lens: &[usize],
+) -> Vec<T> {
+    let width = v.len() / (rows * planes * t);
+    assert_eq!(
+        v.len(),
+        rows * planes * t * width,
+        "array of {} values",
+        v.len()
+    );
+    assert_eq!(lens.len(), rows, "{} lengths for {rows} rows", lens.len());
+    let mut out = Vec::new();
+    for (i, plane) in v.chunks_exact(t * width).enumerate() {
+        out.extend_from_slice(&plane[..lens[i / planes] * width]);
+    }
+    out
+}
+
 /// [`Decoder::fill_cross`] of the windows stacked at `xa` (FP16 `[slots.len() * 1500,
 /// 1280]`) into `slots`, as a prefill of those windows fills them: the cross keys and
 /// values the DTW forward reads
@@ -259,10 +282,14 @@ fn dtw_matches_torch() -> Result<()> {
             "{name}: our scores {:?}",
             scores.shape()
         );
-        let ours = heads_inner(&scores.download(gpu)?, (heads, rows, t));
-        let torch16 = f64v(&torch_scores);
+        let lens = &batch.actual_lens;
+        let real = |v: &[f64]| real_tokens(v, (rows, heads, t), lens);
+        let ours = real(&heads_inner(&scores.download(gpu)?, (heads, rows, t)));
+        let torch16 = real(&f64v(&torch_scores));
         let same = ours.iter().zip(&torch16).filter(|(a, b)| a == b).count();
-        let truth = f64s(&refs.join(case["scores32"].as_str().unwrap_or_default()))?;
+        let truth = real(&f64s(
+            &refs.join(case["scores32"].as_str().unwrap_or_default()),
+        )?);
         score_rows.push(variant_bar(
             Row::new(&name, &ours, &torch16, &truth)?,
             case,
@@ -285,11 +312,15 @@ fn dtw_matches_torch() -> Result<()> {
             m.shape,
             recorded.shape
         );
-        let ours_m = f64v(&m.data);
-        let direct = Err::of(&ours_m, &f64v(&recorded_m))?;
-        let truth_m = f64s(&refs.join(case["matrices32"].as_str().unwrap_or_default()))?;
+        let real_m = |v: &[f64]| real_tokens(v, (rows, 1, t), lens);
+        let ours_m = real_m(&f64v(&m.data));
+        let recorded_real = real_m(&f64v(&recorded_m));
+        let direct = Err::of(&ours_m, &recorded_real)?;
+        let truth_m = real_m(&f64s(
+            &refs.join(case["matrices32"].as_str().unwrap_or_default()),
+        )?);
         matrix_rows.push(variant_bar(
-            Row::new(&name, &ours_m, &f64v(&recorded_m), &truth_m)?,
+            Row::new(&name, &ours_m, &recorded_real, &truth_m)?,
             case,
             "matrices",
         )?);
@@ -444,7 +475,8 @@ fn dtw_word_timings_match_reference() -> Result<()> {
                 prefill((gpu, blas, decoder), &caches, w.ptr(), &[i])?;
             }
             let ours = decoder.dtw_prep(gpu, blas, &caches, batch, &batch.slots)?;
-            prepared.check_matrices(&ours)?;
+            prepared.check_matrices(ours.view())?;
+            queued_matches(gpu, blas, decoder, &caches, batch, &ours)?;
             let rec = set.array(prep.ret()?)?;
             let recorded = Matrices {
                 shape: [rec.shape[0], rec.shape[1], rec.shape[2]],
@@ -455,8 +487,8 @@ fn dtw_word_timings_match_reference() -> Result<()> {
             let mut results = Vec::new();
             for bi in 0..batch.rows() {
                 let (neg_o, neg_r) = (
-                    prepared.chunk_neg_matrix(bi, &ours)?,
-                    prepared.chunk_neg_matrix(bi, &recorded)?,
+                    prepared.chunk_neg_matrix(bi, ours.view())?,
+                    prepared.chunk_neg_matrix(bi, recorded.view())?,
                 );
                 if neg_o.is_empty() {
                     results.push(Vec::new());
@@ -514,6 +546,45 @@ fn dtw_word_timings_match_reference() -> Result<()> {
         "{calls} calls, {words} words: {moved} with a moved start or end; largest move per word (frames: words) {hist:?}; {texts_differ} slot texts differ from the recorded output"
     );
     ensure!(calls > 0 && words > 0, "no DTW calls in the trace");
+    Ok(())
+}
+
+/// The transcriber's queued path gives `want` bit for bit: the prep left on the GPU,
+/// copied into page-locked memory behind a sleeping event, waited on from another thread
+fn queued_matches(
+    gpu: &Gpu,
+    blas: &Blas,
+    decoder: &Decoder,
+    caches: &KvCaches,
+    batch: &DtwBatch,
+    want: &Matrices,
+) -> Result<()> {
+    let (out, shape) = decoder.dtw_prep_queued(gpu, blas, caches, batch, &batch.slots)?;
+    ensure!(
+        shape == want.shape,
+        "queued shape {shape:?}, want {:?}",
+        want.shape
+    );
+    let host = gpu.alloc_host(out.bytes())?;
+    let done = gpu.sleeping_event()?;
+    // NaN first, so a copy that never lands can't pass
+    let nan = vec![f32::NAN; out.bytes() / 4];
+    let nan_buf = gpu.upload(nan)?;
+    gpu.download_async(&nan_buf, 0, &host, 0, out.bytes(), &done)?;
+    gpu.synchronize()?;
+    gpu.download_async(&out, 0, &host, 0, out.bytes(), &done)?;
+    drop(out);
+    std::thread::spawn(move || done.synchronize_any_thread())
+        .join()
+        .map_err(|_| eyre!("waiting thread panicked"))??;
+    // SAFETY: the copy finished at `done` and nothing else writes the buffer
+    let got = unsafe { host.slice::<f32>(0, want.data.len())? };
+    ensure!(
+        got.iter()
+            .map(|v| v.to_bits())
+            .eq(want.data.iter().map(|v| v.to_bits())),
+        "queued DTW matrices differ from dtw_prep's"
+    );
     Ok(())
 }
 
@@ -742,6 +813,51 @@ fn dtw_cached_kv_matches_projection() -> Result<()> {
         ensure!(
             d == 0,
             "{slots:?}: {d} of {n} scores differ from the projection"
+        );
+
+        // every row at full length runs the forward unpacked; the real tokens' scores
+        // must not change (cuBLAS runs the GEMMs at another row count)
+        let unpacked = DtwBatch {
+            actual_lens: vec![t_pad; rows],
+            ..batch.clone()
+        };
+        let padded = decoder
+            .dtw_scores(&gpu, &blas, &caches, &unpacked, slots)?
+            .download(&gpu)?;
+        ensure!(
+            padded.len() == n,
+            "{slots:?}: {} padded scores",
+            padded.len()
+        );
+        let planes = (rows, ALIGNMENT_HEADS.len(), t_pad);
+        let inner = |v: &[f32]| heads_inner(v, (ALIGNMENT_HEADS.len(), rows, t_pad));
+        let (pr, gr) = (
+            real_tokens(&inner(&padded), planes, &batch.actual_lens),
+            real_tokens(&inner(&got_raw), planes, &batch.actual_lens),
+        );
+        ensure!(
+            pr.len() == gr.len() && !gr.is_empty(),
+            "{slots:?}: {} and {} real-token scores",
+            pr.len(),
+            gr.len()
+        );
+        let (bits, max) = pr.iter().zip(&gr).fold((0, 0f64), |(d, m), (a, b)| {
+            (
+                d + usize::from(a.to_bits() != b.to_bits()),
+                m.max((a - b).abs()),
+            )
+        });
+        println!(
+            "{slots:?} lens {:?}: packed vs padded forward, {bits} of {} real-token scores \
+             differ, max {max:.3e}",
+            batch.actual_lens,
+            gr.len()
+        );
+        // a wrong row or token moves scores by their own size; GEMM rounding by far less
+        let scale = pr.iter().fold(0f64, |m, v| m.max(v.abs()));
+        ensure!(
+            max <= 0.01 * scale,
+            "{slots:?}: packed forward moves real-token scores by {max} (largest {scale})"
         );
 
         let (wm, gm) = (want.prep(&gpu, &batch)?, got.prep(&gpu, &batch)?);

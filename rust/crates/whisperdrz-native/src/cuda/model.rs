@@ -12,7 +12,7 @@
 
 use std::cell::Cell;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use eyre::{Result, ensure};
 use half::f16;
@@ -23,9 +23,11 @@ use super::ecapa2::Precision;
 use super::embedder::Embedder;
 use super::encoder::{N_FRAMES, N_MELS, Workspace};
 use super::{Blas, Buf, Encoder, Event, Gpu, HostBuf, Priority, Weights, nvtx};
-use crate::dtw::{DtwBatch, Matrices};
+use crate::dtw::{DtwBatch, Matrices, MatricesView};
 use crate::speaker::EMBED_DIM;
-use crate::transcriber::{DecodeStep, Logits, MelBatch, Model, StepLogits};
+use crate::transcriber::{
+    DecodeStep, DtwMatrices, Logits, MelBatch, Model, ReadyMatrices, StepLogits,
+};
 
 /// Logits rows per download chunk of a decode step: the host starts on the first rows
 /// while the rest copy, and a chunk copies in less time than its rows take to decode
@@ -62,6 +64,9 @@ pub struct GpuModel {
     /// per [`STEP_CHUNK_ROWS`] rows of it
     step_host: HostBuf,
     step_events: Vec<Event>,
+    /// Page-locked buffers the DTW matrices download into, back here once their batch
+    /// is aligned
+    dtw_host: Arc<Mutex<Vec<HostBuf>>>,
 }
 
 impl GpuModel {
@@ -102,6 +107,7 @@ impl GpuModel {
             mel: gpu.alloc(max_batch * N_MELS * N_FRAMES * 2)?,
             slot_ids: gpu.alloc((slots + 1) * 4)?,
             step_host: gpu.alloc_host(MAX_ROWS * N_VOCAB * 2)?,
+            dtw_host: Arc::default(),
             step_events: (0..MAX_ROWS.div_ceil(STEP_CHUNK_ROWS))
                 .map(|_| gpu.event())
                 .collect::<Result<_>>()?,
@@ -293,6 +299,48 @@ impl GpuModel {
             .dtw_prep(&self.gpu, &self.blas, &self.caches, batch, xa_slots)
     }
 
+    /// [`GpuModel::dtw_prep`] queued: the forward and prep go on the stream, then a copy
+    /// of the matrices into page-locked memory, which lands while the host goes on
+    pub fn dtw_launch(
+        &mut self,
+        batch: &DtwBatch,
+        xa_slots: &[usize],
+    ) -> Result<Box<dyn DtwMatrices>> {
+        let (out, shape) =
+            self.decoder
+                .dtw_prep_queued(&self.gpu, &self.blas, &self.caches, batch, xa_slots)?;
+        let bytes = out.bytes();
+        if bytes == 0 {
+            // no audio column anywhere: nothing to copy
+            return Ok(Box::new(ReadyMatrices(Matrices {
+                shape,
+                data: Vec::new(),
+            })));
+        }
+
+        let host = self.dtw_host_buf(bytes)?;
+        let done = self.gpu.sleeping_event()?;
+        self.gpu.download_async(&out, 0, &host, 0, bytes, &done)?;
+        Ok(Box::new(QueuedMatrices {
+            host: Some(host),
+            done,
+            shape,
+            pool: self.dtw_host.clone(),
+        }))
+    }
+
+    /// A free page-locked buffer of at least `bytes`, grown in powers of two so a run
+    /// settles on a few
+    fn dtw_host_buf(&self, bytes: usize) -> Result<HostBuf> {
+        let mut pool = self.dtw_host.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(i) = pool.iter().position(|b| b.bytes() >= bytes) {
+            return Ok(pool.swap_remove(i));
+        }
+
+        drop(pool);
+        self.gpu.alloc_host(bytes.next_power_of_two().max(1 << 20))
+    }
+
     /// The last position's logits of the first `rows` rows of the last prefill or step
     fn logits(&self, rows: usize, q_len: usize) -> Result<Logits> {
         let data = self.dec_ws.last_logits(&self.gpu, rows, q_len)?;
@@ -341,6 +389,11 @@ impl Model for GpuModel {
     fn dtw_prep(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Matrices> {
         let _range = nvtx::Range::new("dtw_prep");
         GpuModel::dtw_prep(self, batch, xa_slots)
+    }
+
+    fn dtw_launch(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Box<dyn DtwMatrices>> {
+        let _range = nvtx::Range::new("dtw_prep");
+        GpuModel::dtw_launch(self, batch, xa_slots)
     }
 
     fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]> {
@@ -418,5 +471,49 @@ impl StepLogits for InFlight<'_> {
         }
 
         Ok(())
+    }
+}
+
+/// DTW matrices copying into a page-locked buffer of [`GpuModel`]'s pool
+struct QueuedMatrices {
+    /// `None` only once dropped
+    host: Option<HostBuf>,
+    /// Recorded after the copy
+    done: Event,
+    shape: [usize; 3],
+    pool: Arc<Mutex<Vec<HostBuf>>>,
+}
+
+impl DtwMatrices for QueuedMatrices {
+    fn ready(&self) -> bool {
+        false
+    }
+
+    fn wait(&mut self) -> Result<MatricesView<'_>> {
+        self.done.synchronize_any_thread()?;
+        let host = self
+            .host
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("DTW matrices already returned"))?;
+        // SAFETY: the copy into the buffer finished at `done`, and no other copy targets
+        // it while this owns it
+        let data = unsafe { host.slice::<f32>(0, self.shape.iter().product())? };
+        Ok(MatricesView {
+            shape: self.shape,
+            data,
+        })
+    }
+}
+
+impl Drop for QueuedMatrices {
+    fn drop(&mut self) {
+        // back for the next batch. Even if nobody waited, the next copy into it is queued
+        // behind this one on the same stream, and its reader waits for that copy
+        if let Some(host) = self.host.take() {
+            self.pool
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(host);
+        }
     }
 }

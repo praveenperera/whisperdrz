@@ -294,7 +294,7 @@ fn check_batch_chunks(
     let matrices = recorded_matrices(set, call.prep.ok_or_else(|| eyre!("no recorded prep"))?)?;
     let mut used = vec![false; call.dtw.len()];
     for bi in 0..batch.rows() {
-        let neg = prepared.chunk_neg_matrix(bi, &matrices)?;
+        let neg = prepared.chunk_neg_matrix(bi, matrices.view())?;
         if neg.is_empty() {
             continue;
         }

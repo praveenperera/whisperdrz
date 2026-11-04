@@ -443,6 +443,13 @@ impl<M: Model> Transcriber<M> {
         logits.complete()?;
         drop(logits);
         drop(host);
+        // the last alignment's DTW thread ran its DP while the GPU finished the DTW
+        // forward and this step (queued behind it), so the join comes after the logits;
+        // its texts go in before this step's updates, which may clear a slot's text
+        if let Some(pending) = self.align_pending.take() {
+            let aligned = pending.join()?;
+            self.apply_align(aligned)?;
+        }
 
         for &s in decode_slots {
             self.kv_lens[s] += 1;
@@ -487,7 +494,11 @@ impl<M: Model> Transcriber<M> {
         self.prefill_slots(&new_slots)?;
         self.fill_warm_slots()?;
         if active.is_empty() {
-            return Ok(None);
+            // an alignment an earlier call queued and didn't settle (it returned an
+            // error) still owes its results
+            let mut completed = Vec::new();
+            self.settle_align(&mut completed)?;
+            return Ok((!completed.is_empty()).then_some(completed));
         }
 
         let max_seq_len = self.config.max_tokens;
@@ -555,6 +566,9 @@ impl<M: Model> Transcriber<M> {
                 self.decode_step(&decode_slots)?;
             }
 
+            // a queued alignment lands before the next window ends
+            self.settle_align(&mut completed)?;
+
             let align_prep = trace::Range::new("align_prep");
             let mut pending_align = Vec::new();
             let mut finished = Vec::new();
@@ -614,6 +628,7 @@ impl<M: Model> Transcriber<M> {
             self.prefill_slots(&needing_continue)?;
         }
 
+        self.settle_align(&mut completed)?;
         Ok((!completed.is_empty()).then_some(completed))
     }
 }

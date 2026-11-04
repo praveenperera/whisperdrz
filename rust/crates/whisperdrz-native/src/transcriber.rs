@@ -41,7 +41,10 @@ use eyre::{Result, ensure, eyre};
 
 pub use align::{AlignItem, ChunkResult, Phase};
 pub use graphs::{CUDA_GRAPH_BUCKETS, DecodeStep, captured_buckets, get_bucket};
-pub use model::{Logits, MEL_PAD, Mel, MelBatch, Model, N_FRAMES, PrefillEvent, StepLogits};
+pub use model::{
+    DtwMatrices, Logits, MEL_PAD, Mel, MelBatch, Model, N_FRAMES, PrefillEvent, ReadyMatrices,
+    StepLogits,
+};
 pub use probe::{Event, Probe};
 pub use pyset::PySet;
 pub use slot::{Chunk, Meta, SAMPLE_RATE, Slot};
@@ -133,6 +136,10 @@ pub struct Transcriber<M: Model> {
     pub(crate) probe: Option<Probe>,
     /// Crop planning for the speaker remap, while `transcribe` runs with it on
     pub(crate) planner: Option<CropPlanner>,
+    /// The last alignment batch, while its DTW runs on a helper thread
+    pub(crate) align_pending: Option<align::PendingAlign>,
+    /// Chunks the last applied alignment finished, until the scheduler collects them
+    pub(crate) resolved: Vec<ChunkResult>,
 }
 
 impl<M: Model> Transcriber<M> {
@@ -180,6 +187,8 @@ impl<M: Model> Transcriber<M> {
             batch_start: None,
             probe: None,
             planner: None,
+            align_pending: None,
+            resolved: Vec::new(),
             config,
             model,
             mel,
@@ -215,6 +224,8 @@ impl<M: Model> Transcriber<M> {
 
     fn busy(&self) -> bool {
         !self.pending.is_empty()
+            || self.align_pending.is_some()
+            || !self.resolved.is_empty()
             || self
                 .slots
                 .iter()
@@ -247,6 +258,12 @@ impl<M: Model> Transcriber<M> {
             start += chunk_len;
         }
 
+        // work an earlier call left behind when it failed would land in this file's
+        // results; flush() drains it
+        ensure!(
+            !self.busy(),
+            "transcriber still holds work from an earlier call; flush() it first"
+        );
         self.model.reset_embeds()?;
         self.planner = self
             .config

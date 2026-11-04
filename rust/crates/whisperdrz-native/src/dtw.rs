@@ -25,7 +25,9 @@ mod kernel;
 mod parse;
 mod rebuild;
 
-pub use batch::{DtwBatch, DtwOptions, Matrices, PreparedBatch, fill_word_timings_batch};
+pub use batch::{
+    DtwBatch, DtwOptions, Matrices, MatricesView, PreparedBatch, fill_word_timings_batch,
+};
 pub use chunk::{CharTokens, ChunkLine, ChunkPrep, TokensChars, chunk_speaker_lines, render_chunk};
 pub use kernel::{
     NegMatrix, WordAnchor, WordTime, apply_anchor_bands, dtw_from_neg_matrix, dtw_path,

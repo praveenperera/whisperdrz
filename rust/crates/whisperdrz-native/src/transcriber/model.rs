@@ -7,7 +7,7 @@ use eyre::{Result, ensure};
 use half::f16;
 
 use super::graphs::DecodeStep;
-use crate::dtw::{DtwBatch, Matrices};
+use crate::dtw::{DtwBatch, Matrices, MatricesView};
 use crate::speaker::EMBED_DIM;
 
 /// Mel frames per encoder window (`N_FRAMES`, 30 s at 100 frames per second)
@@ -120,6 +120,29 @@ impl StepLogits for Logits {
     }
 }
 
+/// A DTW prep's matrices on their way to the host (see [`Model::dtw_launch`])
+pub trait DtwMatrices: Send {
+    /// Whether the matrices are already on the host. The transcriber aligns a ready
+    /// batch in place and hands any other to a helper thread
+    fn ready(&self) -> bool;
+
+    /// Waits for the matrices, from any thread, and borrows them
+    fn wait(&mut self) -> Result<MatricesView<'_>>;
+}
+
+/// Matrices a synchronous [`Model::dtw_prep`] already returned
+pub struct ReadyMatrices(pub Matrices);
+
+impl DtwMatrices for ReadyMatrices {
+    fn ready(&self) -> bool {
+        true
+    }
+
+    fn wait(&mut self) -> Result<MatricesView<'_>> {
+        Ok(self.0.view())
+    }
+}
+
 /// Handle for an asynchronous prefill (a CUDA event recorded on the prefill stream)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PrefillEvent(pub u64);
@@ -166,6 +189,14 @@ pub trait Model {
     /// `batch.full_tokens` with row `i` attending to `xa_cache[xa_slots[i]]`,
     /// cross-attention capture on the alignment heads, then `_dtw_prep_batch`
     fn dtw_prep(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Matrices>;
+
+    /// [`Model::dtw_prep`] queued: the GPU work goes on the stream where `dtw_prep`
+    /// would run it, so later calls (such as the next window's encode over the same
+    /// slots) queue behind it, and the matrices arrive while the caller goes on. A
+    /// model that can't queue it runs `dtw_prep` and returns its result
+    fn dtw_launch(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Box<dyn DtwMatrices>> {
+        Ok(Box::new(ReadyMatrices(self.dtw_prep(batch, xa_slots)?)))
+    }
 
     /// `_embed_audio_segment`: the L2-normalised ECAPA2 embedding of 16 kHz audio
     fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]>;

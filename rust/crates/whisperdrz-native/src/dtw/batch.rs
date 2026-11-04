@@ -66,6 +66,22 @@ pub struct Matrices {
     pub data: Vec<f32>,
 }
 
+impl Matrices {
+    pub fn view(&self) -> MatricesView<'_> {
+        MatricesView {
+            shape: self.shape,
+            data: &self.data,
+        }
+    }
+}
+
+/// [`Matrices`] borrowed, such as from the page-locked buffer a GPU prep downloads into
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatricesView<'a> {
+    pub shape: [usize; 3],
+    pub data: &'a [f32],
+}
+
 /// Per flat word of a slot, its stitched `(start, end)`
 type SlotTimings = Vec<Option<(f64, f64)>>;
 
@@ -80,20 +96,21 @@ struct Pooled {
 }
 
 /// A `fill_word_timings_batch` call split into its stages, so tests and the GPU
-/// runtime can step through it
+/// runtime can step through it. It owns its inputs, so the stages after the GPU prep
+/// ([`PreparedBatch::align`]) can run on another thread
 #[derive(Debug, Clone)]
-pub struct PreparedBatch<'a> {
-    texts: Vec<&'a str>,
+pub struct PreparedBatch {
+    texts: Vec<String>,
     parsed: Vec<ParsedText>,
     pooled: Vec<Pooled>,
     batch: Option<DtwBatch>,
     sot_len: usize,
 }
 
-impl<'a> PreparedBatch<'a> {
+impl PreparedBatch {
     /// Parses and chunks every slot and builds the token batch; `slots` are
     /// `(window_text, num_frames)`
-    pub fn new<S, T>(slots: &'a [(S, i64)], tokenizer: &T, opts: &DtwOptions) -> Result<Self>
+    pub fn new<S, T>(slots: &[(S, i64)], tokenizer: &T, opts: &DtwOptions) -> Result<Self>
     where
         S: AsRef<str>,
         T: DtwTokenizer + ?Sized,
@@ -156,7 +173,7 @@ impl<'a> PreparedBatch<'a> {
             }
         });
 
-        let texts = slots.iter().map(|(t, _)| t.as_ref()).collect();
+        let texts = slots.iter().map(|(t, _)| t.as_ref().to_owned()).collect();
         Ok(Self {
             texts,
             parsed,
@@ -177,7 +194,7 @@ impl<'a> PreparedBatch<'a> {
     }
 
     /// Checks the prep output's shape against the batch
-    pub fn check_matrices(&self, m: &Matrices) -> Result<()> {
+    pub fn check_matrices(&self, m: MatricesView<'_>) -> Result<()> {
         let batch = self
             .batch
             .as_ref()
@@ -198,7 +215,7 @@ impl<'a> PreparedBatch<'a> {
 
     /// Chunk `bi`'s cost matrix: its text rows (no-timestamps row first, eot row
     /// dropped) and real audio columns, negated and anchor-banded
-    pub fn chunk_neg_matrix(&self, bi: usize, m: &Matrices) -> Result<NegMatrix> {
+    pub fn chunk_neg_matrix(&self, bi: usize, m: MatricesView<'_>) -> Result<NegMatrix> {
         let batch = self.batch.as_ref().ok_or_else(|| eyre!("no batch"))?;
         let rec = &self.pooled[bi].rec;
         let [_, t_pad, width] = m.shape;
@@ -234,9 +251,54 @@ impl<'a> PreparedBatch<'a> {
         dtw_from_neg_matrix(neg, rec.ext_words.len(), &rec.ext_word_tokens)
     }
 
+    /// Everything after the GPU prep: each chunk's banded cost matrix and DTW, spread
+    /// over threads like Python's pool of 8, then [`PreparedBatch::finish`]. Returns one
+    /// text per slot
+    pub fn align(&self, m: MatricesView<'_>) -> Result<Vec<String>> {
+        let Some(batch) = self.batch.as_ref() else {
+            return Ok(self.unchanged());
+        };
+        self.check_matrices(m)?;
+
+        // chunks are independent; stitching in `finish` runs in chunk order
+        let n = batch.rows();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |p| p.get())
+            .clamp(1, 8)
+            .min(n);
+        let per_worker: Vec<Result<Vec<(usize, ChunkTimes)>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|w| {
+                    scope.spawn(move || {
+                        (w..n)
+                            .step_by(workers)
+                            .map(|bi| Ok((bi, self.chunk_dtw(bi, &self.chunk_neg_matrix(bi, m)?))))
+                            .collect()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(eyre!("DTW worker panicked")))
+                })
+                .collect()
+        });
+
+        let mut results = vec![Vec::new(); n];
+        for done in per_worker {
+            for (bi, r) in done? {
+                results[bi] = r;
+            }
+        }
+
+        self.finish(&results)
+    }
+
     /// The input texts, for a call with nothing to align
     pub fn unchanged(&self) -> Vec<String> {
-        self.texts.iter().map(|t| (*t).to_owned()).collect()
+        self.texts.clone()
     }
 
     /// Stitches each slot's chunks onto its window timeline and rewrites the texts;
@@ -313,7 +375,7 @@ impl<'a> PreparedBatch<'a> {
             .zip(out_timings)
             .map(|((text, parsed), timings)| match timings {
                 Some(t) => rebuild_with_timings(text, &parsed.words, &t),
-                None => Ok((*text).to_owned()),
+                None => Ok(text.clone()),
             })
             .collect()
     }
@@ -342,47 +404,5 @@ where
     };
 
     let matrices = prep(batch)?;
-    prepared.check_matrices(&matrices)?;
-
-    // chunks are independent, so they spread over threads like Python's pool of 8;
-    // stitching below runs in chunk order
-    let n = batch.rows();
-    let workers = std::thread::available_parallelism()
-        .map_or(1, |p| p.get())
-        .clamp(1, 8)
-        .min(n);
-    let per_worker: Vec<Result<Vec<(usize, ChunkTimes)>>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let (prepared, matrices) = (&prepared, &matrices);
-                scope.spawn(move || {
-                    (w..n)
-                        .step_by(workers)
-                        .map(|bi| {
-                            Ok((
-                                bi,
-                                prepared.chunk_dtw(bi, &prepared.chunk_neg_matrix(bi, matrices)?),
-                            ))
-                        })
-                        .collect()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(eyre!("DTW worker panicked")))
-            })
-            .collect()
-    });
-
-    let mut results = vec![Vec::new(); n];
-    for done in per_worker {
-        for (bi, r) in done? {
-            results[bi] = r;
-        }
-    }
-
-    prepared.finish(&results)
+    prepared.align(matrices.view())
 }

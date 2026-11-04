@@ -50,6 +50,14 @@
 //! is `(q * 64^-0.25) . (k * 64^-0.25)` in FP32 per alignment head, from the FP16 query
 //! and key projections the reference's hooks see, then the masked softmax, per-column
 //! normalization over the real text rows, width-7 median filter and mean over heads
+//!
+//! The forward packs the batch: the shortest row runs last and the row-wise ops (GEMMs,
+//! LayerNorms, GELU) stop at its last real token, while attention keeps the padded
+//! stride. Real tokens see the same inputs; the GEMMs run at a smaller row count, and
+//! that row's padding scores are left as whatever the packed buffers hold (finite, read
+//! by no alignment). [`Decoder::dtw_prep_queued`] leaves the matrices on the GPU so the
+//! transcriber can download them behind an event and run the host DTW off the decode
+//! loop's critical path
 
 use eyre::{Result, ensure, eyre};
 use half::f16;
@@ -858,6 +866,20 @@ impl Decoder {
         scores.prep(gpu, batch)
     }
 
+    /// [`Decoder::dtw_prep`] without the download: the matrices stay on the GPU, ready
+    /// once the stream reaches them
+    pub fn dtw_prep_queued(
+        &self,
+        gpu: &Gpu,
+        blas: &Blas,
+        caches: &KvCaches,
+        batch: &DtwBatch,
+        slots: &[usize],
+    ) -> Result<(Buf, [usize; 3])> {
+        let scores = self.dtw_scores(gpu, blas, caches, batch, slots)?;
+        scores.prep_queued(gpu, batch)
+    }
+
     /// The capture alone: raw FP32 scores `q . k` of every alignment head before the
     /// softmax (`CrossAttnCapture.compute_attention`)
     ///
@@ -895,6 +917,12 @@ impl Decoder {
                 .all(|&tok| (tok as usize) < N_VOCAB),
             "DTW token past the vocabulary"
         );
+        ensure!(
+            batch.actual_lens.len() == rows
+                && batch.actual_lens.iter().all(|&n| (1..=t).contains(&n)),
+            "DTW lengths {:?} for {rows} rows of {t}",
+            batch.actual_lens
+        );
         let last = ALIGNMENT_HEADS.iter().map(|&(l, _)| l).max().unwrap_or(0);
         for &s in slots {
             ensure!(
@@ -904,20 +932,36 @@ impl Decoder {
             );
         }
 
-        let n = rows * t;
-        let tok = i32s(batch.full_tokens.iter().map(|&x| x as usize), "token")?;
+        // the shortest row runs last, so the row-wise ops (GEMMs, LayerNorms, GELU) stop
+        // at its last real token: `n` of the `full` padded token rows. Attention keeps the
+        // padded `t` stride, and no real token reads past `n` (causal self-attention; each
+        // query row's cross attention is its own), so the real rows' values don't change
+        let order = shortest_last(&batch.actual_lens);
+        let slots: Vec<usize> = order.iter().map(|&b| slots[b]).collect();
+        let full = rows * t;
+        let n = (rows - 1) * t + batch.actual_lens[order[rows - 1]];
+        let tok = i32s(
+            order
+                .iter()
+                .flat_map(|&b| &batch.full_tokens[b * t..][..t])
+                .map(|&x| x as usize),
+            "token",
+        )?;
         let tokens = gpu.upload(tok)?;
         let positions = gpu.upload(i32s((0..rows).flat_map(|_| 0..t), "position")?)?;
         let (x, h, o, ao) = (
-            gpu.alloc(n * D_MODEL * 2)?,
-            gpu.alloc(n * D_MODEL * 2)?,
-            gpu.alloc(n * D_MODEL * 2)?,
-            gpu.alloc(n * D_MODEL * 2)?,
+            gpu.alloc(full * D_MODEL * 2)?,
+            gpu.alloc(full * D_MODEL * 2)?,
+            gpu.alloc(full * D_MODEL * 2)?,
+            gpu.alloc(full * D_MODEL * 2)?,
         );
-        let qkv = gpu.alloc(n * 3 * D_MODEL * 2)?;
+        let qkv = gpu.alloc(full * 3 * D_MODEL * 2)?;
+        // the GEMMs never write the packed rows' tail, and self-attention multiplies its
+        // values by a zero weight, which would turn pool garbage (NaN) into NaN
+        gpu.memset_zero(qkv.at(n * 3 * D_MODEL * 2), (full - n) * 3 * D_MODEL * 2)?;
         let f = gpu.alloc(n * D_MLP * 2)?;
         let mut capture = DtwCapture::new(gpu, rows, t)?;
-        let runs = slot_runs(slots);
+        let runs = slot_runs(&slots);
 
         self.embed_rows(gpu, x.ptr(), (tokens.ptr(), positions.ptr()), n, true)?;
         self.blocks[0].attn_ln.apply(gpu, x.ptr(), h.ptr(), n)?;
@@ -989,8 +1033,26 @@ impl Decoder {
                 .add_apply(gpu, x.ptr(), ao.ptr(), h.ptr(), n)?;
         }
 
-        capture.scores(gpu, blas)
+        let mut scores = capture.scores(gpu, blas)?;
+        scores.order = order;
+        Ok(scores)
     }
+}
+
+/// The DTW forward's row order: the batch's, with its shortest row swapped to the end
+/// (none when the last row is already shortest). A swap is its own inverse, so
+/// `order[i]` is both the batch row at forward row `i` and the forward row of batch row
+/// `i`
+fn shortest_last(lens: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..lens.len()).collect();
+    let last = lens.len() - 1;
+    let min = lens.iter().copied().min().unwrap_or(0);
+    if lens[last] != min
+        && let Some(k) = lens.iter().position(|&l| l == min)
+    {
+        order.swap(k, last);
+    }
+    order
 }
 
 /// FP16 values of one slot's cross keys (or values) in one layer, `[1500, 1280]`
@@ -1115,6 +1177,7 @@ impl DtwCapture {
             heads,
             rows: self.rows,
             t_pad: self.t_pad,
+            order: (0..self.rows).collect(),
         })
     }
 }
@@ -1122,11 +1185,17 @@ impl DtwCapture {
 /// FP32 cross-attention scores `[heads, rows, t_pad, 1500]` of the alignment heads, the
 /// capture's output before `_dtw_prep_batch`; torch's `[rows, heads, t_pad, 1500]` is the
 /// same values transposed
+///
+/// On the GPU the rows stand in the forward's order, so [`DtwScores::download`] and the
+/// prep put them back in the batch's. Scores at a row's padding tokens are finite but
+/// aren't the padded reference's: the shortest row's padding isn't computed
 pub struct DtwScores {
     buf: Buf,
     heads: usize,
     rows: usize,
     t_pad: usize,
+    /// Batch row at each GPU row, a permutation that is its own inverse
+    order: Vec<usize>,
 }
 
 impl DtwScores {
@@ -1147,6 +1216,7 @@ impl DtwScores {
             heads,
             rows,
             t_pad,
+            order: (0..rows).collect(),
         })
     }
 
@@ -1154,15 +1224,30 @@ impl DtwScores {
         [self.heads, self.rows, self.t_pad, N_AUDIO_CTX]
     }
 
-    /// The scores as `[heads, rows, t_pad, 1500]`
+    /// The scores as `[heads, rows, t_pad, 1500]`, rows in the batch's order
     pub fn download(&self, gpu: &Gpu) -> Result<Vec<f32>> {
-        gpu.download(&self.buf)
+        let gpu_order: Vec<f32> = gpu.download(&self.buf)?;
+        let block = self.t_pad * N_AUDIO_CTX;
+        let mut out = vec![0.0; gpu_order.len()];
+        for (i, src) in gpu_order.chunks_exact(block).enumerate() {
+            let (head, row) = (i / self.rows, i % self.rows);
+            out[(head * self.rows + self.order[row]) * block..][..block].copy_from_slice(src);
+        }
+        Ok(out)
     }
 
     /// `_dtw_prep_batch` in place on the scores: softmax over each row's audio columns
     /// below its cap, standardization over the real text rows, the width-7 median filter
     /// and the mean over heads, cut to `[rows, t_pad, max_audio_cap]`
     pub fn prep(self, gpu: &Gpu, batch: &DtwBatch) -> Result<Matrices> {
+        let (out, shape) = self.prep_queued(gpu, batch)?;
+        let data: Vec<f32> = gpu.download(&out)?;
+        Ok(Matrices { shape, data })
+    }
+
+    /// [`DtwScores::prep`] left on the GPU: the FP32 matrices, once the stream reaches
+    /// them, and their shape
+    pub fn prep_queued(self, gpu: &Gpu, batch: &DtwBatch) -> Result<(Buf, [usize; 3])> {
         let (heads, rows, t) = (self.heads, self.rows, self.t_pad);
         ensure!(
             batch.rows() == rows
@@ -1176,8 +1261,17 @@ impl DtwScores {
         );
         let width = batch.max_audio_cap();
         ensure!(width <= N_AUDIO_CTX, "audio cap {width}");
-        let caps = gpu.upload(i32s(batch.audio_caps.iter().copied(), "audio cap")?)?;
-        let lens = gpu.upload(i32s(batch.actual_lens.iter().copied(), "length")?)?;
+        let order = &self.order;
+        ensure!(
+            order.len() == rows,
+            "{} row order for {rows} rows",
+            order.len()
+        );
+        let caps = gpu.upload(i32s(
+            order.iter().map(|&b| batch.audio_caps[b]),
+            "audio cap",
+        )?)?;
+        let lens = gpu.upload(i32s(order.iter().map(|&b| batch.actual_lens[b]), "length")?)?;
         let n = heads * rows * t * N_AUDIO_CTX;
         let score_rows = heads * rows * t;
 
@@ -1232,12 +1326,18 @@ impl DtwScores {
                 factor.into(),
             ],
         )?;
-        // the scores were standardized in place, so `self` drops with them here
-        let data: Vec<f32> = gpu.download(&out)?;
-        Ok(Matrices {
-            shape: [rows, t, width],
-            data,
-        })
+        let shape = [rows, t, width];
+        if order.iter().enumerate().all(|(i, &b)| i == b) {
+            // the scores were standardized in place, so `self` drops with them here
+            return Ok((out, shape));
+        }
+
+        let batch_order = gpu.alloc(out_n * 4)?;
+        let block = t * width * 4;
+        for (i, &b) in order.iter().enumerate() {
+            gpu.copy_dtod(out.at(i * block), batch_order.at(b * block), block)?;
+        }
+        Ok((batch_order, shape))
     }
 }
 

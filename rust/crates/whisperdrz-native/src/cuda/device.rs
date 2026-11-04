@@ -666,6 +666,13 @@ impl Event {
         Ok(())
     }
 
+    /// [`Event::synchronize`] from a thread that may not have the context current, such
+    /// as a helper thread: binds it first
+    pub fn synchronize_any_thread(&self) -> Result<()> {
+        self.device.bind()?;
+        self.synchronize()
+    }
+
     /// Whether the work queued before the last record has finished, without waiting
     pub fn query(&self) -> Result<bool> {
         // SAFETY: as in `synchronize`
@@ -704,6 +711,20 @@ impl Gpu {
 
     pub fn event(&self) -> Result<Event> {
         let event = cur::event::create(cu::CUevent_flags::CU_EVENT_DISABLE_TIMING)?;
+        Ok(Event {
+            event,
+            device: self.device.clone(),
+        })
+    }
+
+    /// An event whose waits sleep instead of spinning, for a helper thread that waits
+    /// on queued work while host threads beside it do theirs
+    pub fn sleeping_event(&self) -> Result<Event> {
+        let flags = cu::CUevent_flags::CU_EVENT_DISABLE_TIMING as u32
+            | cu::CUevent_flags::CU_EVENT_BLOCKING_SYNC as u32;
+        let mut event = std::ptr::null_mut();
+        // SAFETY: the context is current on this thread, and `event` receives the handle
+        unsafe { cu::cuEventCreate(&mut event, flags).result()? };
         Ok(Event {
             event,
             device: self.device.clone(),

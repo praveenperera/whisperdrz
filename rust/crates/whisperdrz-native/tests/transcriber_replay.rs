@@ -22,12 +22,12 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use whisperdrz_fixtures::{ArrayData, Event as Recorded, TraceSet, as_f64};
 use whisperdrz_native::decode::DecoderTables;
-use whisperdrz_native::dtw::{DtwBatch, Matrices};
+use whisperdrz_native::dtw::{DtwBatch, Matrices, MatricesView};
 use whisperdrz_native::speaker::{EMBED_DIM, PyRandom};
 use whisperdrz_native::text::Tokenizer;
 use whisperdrz_native::transcriber::{
-    Config, DecodeStep, Event, Logits, Mel, MelBatch, Model, Slot, Transcriber, captured_buckets,
-    get_bucket,
+    Config, DecodeStep, DtwMatrices, Event, Logits, Mel, MelBatch, Model, ReadyMatrices, Slot,
+    Transcriber, captured_buckets, get_bucket,
 };
 
 // shared with the decode tests, which use the parsing half
@@ -55,6 +55,14 @@ const REQUIRED: [&str; 15] = [
     "_finalize_slot_after_alignment",
     "_embed_audio_segment",
 ];
+
+/// Labels checked when the DTW is deferred: window finalisation isn't reported then,
+/// since the slot has moved on by the time its text is known
+fn required(defer_dtw: bool) -> impl Iterator<Item = &'static str> {
+    REQUIRED
+        .into_iter()
+        .filter(move |&l| !(defer_dtw && l == "_finalize_slot_after_alignment"))
+}
 
 /// Where `trace_synthetic.py` sets live, relative to the reference trace root: a
 /// sibling directory, since every set under the root is taken as a reference trace
@@ -179,9 +187,23 @@ struct Replay {
     embedded: HashSet<(usize, usize)>,
     /// Crops the remap embedded, over every file
     crop_embeds: usize,
+    /// Hand DTW matrices back as still in flight, so the scheduler takes its deferred
+    /// path: window state moves on at once and the texts follow from a helper thread
+    defer_dtw: bool,
 }
 
 impl Replay {
+    /// [`slot_diffs`], except that a deferred alignment appends a continuing window's
+    /// text at the next decode step, after the prefill and decode events in between
+    /// report the slot, so `sofar` is checked through the results instead
+    fn slot_diffs(&self, slot: &Slot, snap: &Map<String, Value>) -> Vec<String> {
+        let mut diffs = slot_diffs(slot, snap);
+        if self.defer_dtw {
+            diffs.retain(|d| !d.starts_with("sofar: "));
+        }
+        diffs
+    }
+
     fn check(&mut self, label: &str, ok: bool, msg: impl FnOnce() -> String) {
         *self
             .checks
@@ -293,7 +315,7 @@ impl Replay {
                     let slot = &all[s];
                     if let Some(snap) = states.get(r) {
                         diffs.extend(
-                            slot_diffs(slot, snapshot(snap)?)
+                            self.slot_diffs(slot, snapshot(snap)?)
                                 .into_iter()
                                 .map(|d| format!("row {r}: {d}")),
                         );
@@ -359,7 +381,7 @@ impl Replay {
 
                     if let Some(snap) = after.get(r) {
                         diffs.extend(
-                            slot_diffs(&all[s], snapshot(snap)?)
+                            self.slot_diffs(&all[s], snapshot(snap)?)
                                 .into_iter()
                                 .map(|d| format!("row {r} after: {d}")),
                         );
@@ -385,7 +407,7 @@ impl Replay {
                     ));
                 }
 
-                diffs.extend(slot_diffs(slot, snapshot(ev.after_arg("state")?)?));
+                diffs.extend(self.slot_diffs(slot, snapshot(ev.after_arg("state")?)?));
                 self.check("update_state_after_decode", diffs.is_empty(), || {
                     format!("#{}: {diffs:?}", ev.seq)
                 });
@@ -395,7 +417,7 @@ impl Replay {
                     return Ok(());
                 };
                 let ret = ev.ret()?;
-                let mut diffs = slot_diffs(slot, snapshot(ev.after_arg("s")?)?);
+                let mut diffs = self.slot_diffs(slot, snapshot(ev.after_arg("s")?)?);
                 match item {
                     None => {
                         if !ret.is_null() {
@@ -463,6 +485,12 @@ impl Replay {
                         ));
                     }
 
+                    // deferred, the event comes once the texts land, by when a later
+                    // window may have replaced the slot's encoder output
+                    if self.defer_dtw {
+                        continue;
+                    }
+
                     let sha = tup[0]["blob"].as_str().unwrap_or_default();
                     let mine = self
                         .xa
@@ -496,7 +524,7 @@ impl Replay {
                 let Some(ev) = self.pop("_finalize_slot_after_alignment")? else {
                     return Ok(());
                 };
-                let mut diffs = slot_diffs(slot, snapshot(ev.after_arg("s")?)?);
+                let mut diffs = self.slot_diffs(slot, snapshot(ev.after_arg("s")?)?);
                 let args = [
                     ("out", Value::from(*out)),
                     ("last_timing", opt_f64(Some(*last_timing))),
@@ -609,6 +637,19 @@ fn result_diffs(
 
 /// Serves the recorded GPU results in call order
 struct FakeModel(Rc<RefCell<Replay>>);
+
+/// Recorded matrices that claim to still be on their way
+struct InFlight(Matrices);
+
+impl DtwMatrices for InFlight {
+    fn ready(&self) -> bool {
+        false
+    }
+
+    fn wait(&mut self) -> Result<MatricesView<'_>> {
+        Ok(self.0.view())
+    }
+}
 
 impl Model for FakeModel {
     fn reset_kv(&mut self, _slots: &[usize]) -> Result<()> {
@@ -779,6 +820,15 @@ impl Model for FakeModel {
         })
     }
 
+    fn dtw_launch(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Box<dyn DtwMatrices>> {
+        let m = self.dtw_prep(batch, xa_slots)?;
+        Ok(if self.0.borrow().defer_dtw {
+            Box::new(InFlight(m))
+        } else {
+            Box::new(ReadyMatrices(m))
+        })
+    }
+
     fn reset_embeds(&mut self) -> Result<()> {
         let mut r = self.0.borrow_mut();
         // every prefetched crop must be one the remap embeds, so early work is never wasted
@@ -887,6 +937,7 @@ fn replay_file(
     config: &Config,
     tables: &Arc<DecoderTables>,
     checks: &Rc<RefCell<BTreeMap<String, usize>>>,
+    defer_dtw: bool,
 ) -> Result<()> {
     let events = set.events(stem)?;
     let result = set.result(stem)?;
@@ -916,6 +967,7 @@ fn replay_file(
         prefetched: HashSet::new(),
         embedded: HashSet::new(),
         crop_embeds: 0,
+        defer_dtw,
     }));
 
     let mel_replay = replay.clone();
@@ -956,7 +1008,7 @@ fn replay_file(
     }
 
     let out = out?;
-    for label in REQUIRED {
+    for label in required(defer_dtw) {
         let left = r.queues.get(label).map_or(0, VecDeque::len);
         ensure!(
             left == 0,
@@ -998,6 +1050,10 @@ fn replay_file(
 }
 
 fn replay(name: &str, config: Config) -> Result<()> {
+    replay_with(name, config, false)
+}
+
+fn replay_with(name: &str, config: Config, defer_dtw: bool) -> Result<()> {
     let Some(set) = TraceSet::open(name) else {
         return Ok(());
     };
@@ -1005,12 +1061,12 @@ fn replay(name: &str, config: Config) -> Result<()> {
     let tables = Arc::new(DecoderTables::new(Tokenizer::multilingual()?)?);
     let checks: Rc<RefCell<BTreeMap<String, usize>>> = Rc::default();
     for stem in set.stems()? {
-        replay_file(&set, &stem, &config, &tables, &checks)?;
+        replay_file(&set, &stem, &config, &tables, &checks, defer_dtw)?;
     }
 
     let checks = checks.borrow();
     eprintln!("{name} checks per label: {checks:?}");
-    for label in REQUIRED {
+    for label in required(defer_dtw) {
         ensure!(
             checks.get(label).copied().unwrap_or(0) > 0,
             "{name}: {label} never checked"
@@ -1036,6 +1092,19 @@ fn replay_e21c600() -> Result<()> {
     replay("e21c600", Config::default())
 }
 
+/// The deferred alignment path (a GPU model's): each window's state moves on before
+/// its DTW lands, and the texts and results, checked against the reference's, follow
+/// from a helper thread at the next decode step
+#[test]
+fn replay_short3_deferred_dtw() -> Result<()> {
+    replay_with("short3", Config::default(), true)
+}
+
+#[test]
+fn replay_e21c600_deferred_dtw() -> Result<()> {
+    replay_with("e21c600", Config::default(), true)
+}
+
 /// `rust/tools/trace_synthetic.py`: the Python scheduler on the CPU with BS=4 and a
 /// stand-in model, so freed slots are refilled in CPython set order and windows
 /// continue often
@@ -1047,6 +1116,20 @@ fn replay_synthetic_bs4() -> Result<()> {
             bs: 4,
             ..Config::default()
         },
+    )
+}
+
+/// The deferred alignment path where windows continue often and freed slots refill
+/// while a finished chunk's text is still on the DTW thread
+#[test]
+fn replay_synthetic_bs4_deferred_dtw() -> Result<()> {
+    replay_with(
+        &format!("{SYNTHETIC}/synth-bs4"),
+        Config {
+            bs: 4,
+            ..Config::default()
+        },
+        true,
     )
 }
 
