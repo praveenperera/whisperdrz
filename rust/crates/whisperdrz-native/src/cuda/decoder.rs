@@ -508,7 +508,8 @@ impl Decoder {
     }
 
     /// Every layer's cross keys and values for the prefill windows in `xa`, window `i` into
-    /// slot `slots[i]`, as `prefill_flash` computes them
+    /// slot `slots[i]`, as `prefill_flash` computes them, and each window's encoder output
+    /// into its slot, which the absorbed cross-attention of large decode buckets reads
     pub fn fill_cross(
         &self,
         gpu: &Gpu,
@@ -523,6 +524,7 @@ impl Decoder {
             "caches for {} layers",
             caches.layers()
         );
+        caches.store_xa(gpu, xa, slots)?;
         for (i, blk) in self.blocks.iter().enumerate() {
             let bv = blk
                 .cross_v

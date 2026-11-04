@@ -16,9 +16,10 @@
 //!   output and the FP32 truth per layer, and the layer-0 cross K/V cache bit for bit
 //!   against torch's. The K/V path must stay within 1.5x flash-attn's error. The absorbed
 //!   cross-attention of large decode buckets also runs on each layer's inputs and its
-//!   max-abs and mean-abs errors are printed as ratios to flash-attn's, without a bar:
-//!   folding the key projection into the query rounds `q W_k` to FP16 where torch rounds
-//!   `xa W_k`, which puts it at 1.3-1.6x on mean-abs; the end-to-end gate judges it
+//!   max-abs and mean-abs errors are printed as ratios to flash-attn's. Folding the key
+//!   projection into the query rounds `q W_k` to FP16 where torch rounds `xa W_k`, which
+//!   puts it at 1.1-1.65x on mean-abs, so the end-to-end gate judges its accuracy; the
+//!   2.5x bar here only catches layout bugs (a wrong stride or bias is far past it)
 //! - `absorbed_cross_within_f64_bound` (`WHISPERDRZ_GPU=1`, no torch side): the absorbed
 //!   path's attention `O' = softmax(Q' xa^T) xa` on random encoder outputs, on several
 //!   frame splits, against f64 within a bound derived from the kernel's own roundings, with
@@ -885,6 +886,16 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
         if !ca.max.is_finite() || !ca.mean().is_finite() {
             failed.push(format!("layer {layer} absorbed cross not finite"));
         }
+
+        // a regression guard on the whole absorbed path, both projections and the bias
+        // included, not an accuracy bar: the worst measured ratio is 1.65x on mean-abs
+        if ca.max > ABSORBED_GUARD * cf.max || ca.mean() > ABSORBED_GUARD * cf.mean() {
+            failed.push(format!(
+                "layer {layer} absorbed cross {:.2}x / {:.2}x flash, past {ABSORBED_GUARD}x",
+                ca.max / cf.max,
+                ca.mean() / cf.mean()
+            ));
+        }
         if !so.within(&sf) {
             failed.push(format!("layer {layer} self vs truth"));
         }
@@ -914,6 +925,9 @@ fn trace_prefill_layers_match_torch() -> Result<()> {
     ensure!(failed.is_empty(), "trace checks failed: {failed:?}");
     Ok(())
 }
+/// Error ratio to flash-attn past which the trace fails the absorbed path
+const ABSORBED_GUARD: f64 = 2.5;
+
 /// Real slots of the absorbed cross-attention cases; rows share them, since
 /// cross-attention only reads its slot
 const XA_SLOTS: usize = 12;

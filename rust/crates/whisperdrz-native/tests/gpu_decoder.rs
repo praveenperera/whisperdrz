@@ -1010,7 +1010,6 @@ fn decoder_layers_match_torch() -> Result<()> {
         // isolated: our layer N on torch FP16's layer N - 1 output and caches
         if phase == "prefill" {
             decoder.fill_cross(gpu, blas, &iso_kv, &ws, xa.ptr(), &p.slots)?;
-            iso_kv.store_xa(gpu, xa.ptr(), &p.slots)?;
         }
         load_torch_caches(gpu, &iso_kv, &dir)?;
         let batch = ws.stage(gpu, &p.tokens, &p.positions, &p.slots)?;
@@ -1120,7 +1119,6 @@ fn decoder_layers_match_torch() -> Result<()> {
         // chained: ours from the tokens on our own caches
         if phase == "prefill" {
             decoder.fill_cross(gpu, blas, &chain_kv, &ws, xa.ptr(), &p.slots)?;
-            chain_kv.store_xa(gpu, xa.ptr(), &p.slots)?;
             chain_kv.reset_lens(gpu, batch)?;
         }
         let (mut chain, mut noise_qkv, mut noise_sdpa, mut noise_eff) =
@@ -1185,7 +1183,6 @@ fn decoder_layers_match_torch() -> Result<()> {
 
         // the fused prefill / step on its own caches gives the chain bit for bit
         if phase == "prefill" {
-            fused_kv.store_xa(gpu, xa.ptr(), &p.slots)?;
             decoder.prefill(
                 gpu,
                 blas,
@@ -1395,7 +1392,6 @@ fn decoder_layers_match_torch() -> Result<()> {
     let nan = vec![NAN16; SELF_CAP.max(CROSS_LEN) * D_MODEL];
     let mut logits_of =
         |kv: &KvCaches, fill: Option<(&[u16], i32)>, tok: u32, pos: i32| -> Result<Vec<u16>> {
-            kv.store_xa(gpu, xa.ptr(), &p0.slots)?;
             decoder.prefill(
                 gpu,
                 blas,
