@@ -10,6 +10,7 @@
 #![no_std]
 
 pub mod attention;
+pub mod attention_varlen;
 pub mod common;
 pub mod cross;
 pub mod decoder;

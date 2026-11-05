@@ -31,6 +31,7 @@ mod pyset;
 mod rows;
 mod schedule;
 mod slot;
+mod spec;
 mod trace;
 
 use std::collections::VecDeque;
@@ -40,7 +41,9 @@ use std::time::Instant;
 use eyre::{Result, ensure, eyre};
 
 pub use align::{AlignItem, ChunkResult, Phase};
-pub use graphs::{CUDA_GRAPH_BUCKETS, DecodeStep, captured_buckets, get_bucket};
+pub use graphs::{
+    CUDA_GRAPH_BUCKETS, DecodeStep, VerifyRow, VerifyStep, captured_buckets, get_bucket,
+};
 pub use model::{
     DtwMatrices, Logits, MEL_PAD, Mel, MelBatch, Model, N_FRAMES, PrefillEvent, ReadyMatrices,
     StepLogits,
@@ -48,6 +51,7 @@ pub use model::{
 pub use probe::{Event, Probe};
 pub use pyset::PySet;
 pub use slot::{Chunk, Meta, SAMPLE_RATE, Slot};
+pub use spec::{SpecConfig, SpecStats};
 
 use crate::decode::{DecodeConfig, DecoderTables};
 use crate::post::{self, Segment};
@@ -79,6 +83,9 @@ pub struct Config {
     /// Whether decode steps run on captured graphs, which pads them to a bucket
     /// (CUDA with flash attention); otherwise every step is unpadded
     pub cuda_graphs: bool,
+    /// Self-speculative decoding: decode steps verify drafted tokens per row in one
+    /// forward. `None` runs one token a row per step, as the reference does
+    pub spec: Option<SpecConfig>,
 }
 
 impl Default for Config {
@@ -98,6 +105,7 @@ impl Default for Config {
             speaker_remap: true,
             speaker_remap_threshold: 1.1,
             cuda_graphs: true,
+            spec: None,
         }
     }
 }
@@ -140,6 +148,12 @@ pub struct Transcriber<M: Model> {
     pub(crate) align_pending: Option<align::PendingAlign>,
     /// Chunks the last applied alignment finished, until the scheduler collects them
     pub(crate) resolved: Vec<ChunkResult>,
+    /// Per slot, the drafting memory of speculative decoding
+    pub(crate) spec_rows: Vec<spec::RowMemory>,
+    /// Speculative decoding counters since the transcriber was built
+    pub(crate) spec_stats: SpecStats,
+    /// Finished windows' text for n-gram drafts
+    pub(crate) spec_log: spec::NgramLog,
 }
 
 impl<M: Model> Transcriber<M> {
@@ -147,6 +161,9 @@ impl<M: Model> Transcriber<M> {
     pub fn new(config: Config, model: M, mel: MelFn, tables: Arc<DecoderTables>) -> Result<Self> {
         config.decode.validate()?;
         ensure!(config.bs > 0, "BS must be positive");
+        if let Some(spec) = &config.spec {
+            spec.validate(&config.decode)?;
+        }
         ensure!(
             config.max_tokens > 0 && config.max_audio_length > 0.0,
             "max_tokens and max_audio_length must be positive"
@@ -189,6 +206,9 @@ impl<M: Model> Transcriber<M> {
             planner: None,
             align_pending: None,
             resolved: Vec::new(),
+            spec_rows: vec![spec::RowMemory::default(); n_slots],
+            spec_stats: SpecStats::default(),
+            spec_log: spec::NgramLog::default(),
             config,
             model,
             mel,
@@ -215,6 +235,11 @@ impl<M: Model> Transcriber<M> {
 
     pub fn n_slots(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Speculative decoding counters since the transcriber was built
+    pub fn spec_stats(&self) -> &SpecStats {
+        &self.spec_stats
     }
 
     /// Chunks waiting for a slot

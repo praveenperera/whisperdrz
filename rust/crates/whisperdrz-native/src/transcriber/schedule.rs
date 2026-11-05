@@ -9,12 +9,13 @@ use super::align::ChunkResult;
 use super::graphs::DecodeStep;
 use super::model::{Logits, MelBatch, Model, N_FRAMES, StepLogits};
 use super::probe::Event;
+use super::probe::Probe;
 use super::pyset::PySet;
 use super::rows::Pending;
 use super::slot::{Chunk, Slot};
 use super::trace;
-use super::{Transcriber, build_init_tokens};
-use crate::decode::{Decision, Decoder, Prepared, Status};
+use super::{Config, Transcriber, build_init_tokens};
+use crate::decode::{Decision, Decoder, Prepared, SlotState, Status};
 use crate::text::Token;
 
 /// Mel frames per second (`FRAMES_PER_SECOND`)
@@ -36,6 +37,83 @@ fn rows_of<'s>(all: &'s mut [Slot], slots: &[usize]) -> Result<Vec<(usize, &'s m
                 .ok_or_else(|| eyre!("slot {s} missing or listed twice"))
         })
         .collect()
+}
+
+/// The main loop's safety stops before a decode step: the window's token budget, and
+/// implausibly fast token rates. Only a `started` row can stop
+pub(crate) fn safety_stop(s: &mut SlotState, max_seq_len: usize) {
+    if s.status != Status::Started {
+        return;
+    }
+
+    let token_count = s.token_count;
+    if token_count + 2 > max_seq_len {
+        s.status = Status::Process;
+        s.stop_reason = Some(format!("safety_max_tokens:{token_count}"));
+        return;
+    }
+
+    if s.duration != 0.0 && token_count as f64 > 20.0 * s.duration {
+        s.status = Status::Process;
+        s.stop_reason = Some(format!(
+            "excessive_tokens:{token_count}>{:.0}",
+            20.0 * s.duration
+        ));
+    }
+}
+
+/// The transcriber fields a row's token update writes, borrowed apart from the model so
+/// a step's logits can stay borrowed while rows update
+pub(crate) struct RowState<'t> {
+    pub slots: &'t mut [Slot],
+    pub all_tokens: &'t mut [Vec<Token>],
+    pub seq_lens: &'t mut [usize],
+    pub probe: &'t mut Option<Probe>,
+    pub config: &'t Config,
+}
+
+impl RowState<'_> {
+    /// One row's `update_state_after_decode` and token write, then the main loop's
+    /// non-English early exit when `step`
+    pub(crate) fn apply_decision(
+        &mut self,
+        slot_idx: usize,
+        d: &Decision,
+        step: bool,
+    ) -> Result<()> {
+        let max_seq_len = self.config.max_tokens;
+        let detect = self.config.lang.is_none();
+        let s = &mut self.slots[slot_idx];
+        s.state.update_after_decode(&d.text, d.token, false)?;
+        let new_len = s.state.token_count;
+        if new_len <= max_seq_len {
+            self.all_tokens[slot_idx][new_len - 1] = d.token;
+            self.seq_lens[slot_idx] = new_len;
+        }
+
+        if step
+            && self.config.skip_non_english
+            && detect
+            && !s.state.language.is_empty()
+            && s.state.language != "en"
+            && !matches!(s.state.status, Status::Finished | Status::Ready)
+        {
+            s.state.status = Status::Finished;
+            s.state.stop_reason = Some(format!("skip_non_english:{}", s.state.language));
+            s.sofar.clear();
+            s.state.cur.clear();
+        }
+
+        if let Some(probe) = self.probe.as_mut() {
+            probe(&Event::UpdateState {
+                slot: &self.slots[slot_idx],
+                text: &d.text,
+                token: d.token,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 /// [`Decoder::prepare`] on each row, in order: the plan and mask, which read no logits
@@ -268,6 +346,7 @@ impl<M: Model> Transcriber<M> {
         self.model.reset_kv(slots)?;
         for &s in slots {
             self.kv_lens[s] = 0;
+            self.spec_new_window(s);
         }
 
         // every slot has a mel from `_init_slot`, so this is python's `has_mels` path
@@ -357,54 +436,55 @@ impl<M: Model> Transcriber<M> {
             }
         );
 
-        let max_seq_len = self.config.max_tokens;
-        let detect = self.config.lang.is_none();
         for (&slot_idx, d) in slots.iter().zip(decisions) {
-            let s = &mut self.slots[slot_idx];
-            s.state.update_after_decode(&d.text, d.token, false)?;
-            let new_len = s.state.token_count;
-            if new_len <= max_seq_len {
-                self.all_tokens[slot_idx][new_len - 1] = d.token;
-                self.seq_lens[slot_idx] = new_len;
+            // a queued window's text lands before the non-English clear, as it would have
+            // had the alignment joined before this step's updates
+            if step && self.align_pending_on(slot_idx) && self.may_stop_non_english(slot_idx) {
+                self.resolve_align()?;
             }
 
-            if step
-                && self.config.skip_non_english
-                && detect
-                && !s.state.language.is_empty()
-                && s.state.language != "en"
-                && !matches!(s.state.status, Status::Finished | Status::Ready)
-            {
-                // a queued window's text lands before the clear, as it would have had
-                // the alignment joined before this step's updates
-                if self.align_pending_on(slot_idx) {
-                    self.resolve_align()?;
-                }
-
-                let s = &mut self.slots[slot_idx];
-                s.state.status = Status::Finished;
-                s.state.stop_reason = Some(format!("skip_non_english:{}", s.state.language));
-                s.sofar.clear();
-                s.state.cur.clear();
-            }
-
-            emit!(
-                self,
-                Event::UpdateState {
-                    slot: &self.slots[slot_idx],
-                    text: &d.text,
-                    token: d.token,
-                }
-            );
+            self.apply_decision(slot_idx, d, step)?;
         }
 
         Ok(())
+    }
+
+    /// Whether the main loop's non-English exit could clear `slot_idx`'s text this step:
+    /// detection is on and the window, still decoding, isn't known to be English. A
+    /// superset of the exit's own test, so a join it guards may wait needlessly, never
+    /// too late
+    pub(crate) fn may_stop_non_english(&self, slot_idx: usize) -> bool {
+        let s = &self.slots[slot_idx].state;
+        self.config.skip_non_english
+            && self.config.lang.is_none()
+            && s.language != "en"
+            && !matches!(s.status, Status::Finished | Status::Ready)
+    }
+
+    fn apply_decision(&mut self, slot_idx: usize, d: &Decision, step: bool) -> Result<()> {
+        RowState {
+            slots: &mut self.slots,
+            all_tokens: &mut self.all_tokens,
+            seq_lens: &mut self.seq_lens,
+            probe: &mut self.probe,
+            config: &self.config,
+        }
+        .apply_decision(slot_idx, d, step)
     }
 
     /// One decode step over `decode_slots`: their last tokens at their KV
     /// positions, padded to a bucket. The rows are planned and masked while the GPU
     /// runs the step, since neither reads its logits, and finished as the logits land
     fn decode_step(&mut self, decode_slots: &[usize]) -> Result<()> {
+        if let Some(spec) = self.config.spec {
+            return self.spec_step(decode_slots, spec);
+        }
+
+        self.one_token_step(decode_slots)
+    }
+
+    /// [`Self::decode_step`] with one token a row
+    pub(crate) fn one_token_step(&mut self, decode_slots: &[usize]) -> Result<()> {
         let mut tokens = Vec::with_capacity(decode_slots.len());
         let mut positions = Vec::with_capacity(decode_slots.len());
         for &s in decode_slots {
@@ -547,25 +627,7 @@ impl<M: Model> Transcriber<M> {
 
             // safety stops: window token budget, and implausibly fast token rates
             for &slot_idx in &active {
-                let s = &mut self.slots[slot_idx].state;
-                if s.status != Status::Started {
-                    continue;
-                }
-
-                let token_count = s.token_count;
-                if token_count + 2 > max_seq_len {
-                    s.status = Status::Process;
-                    s.stop_reason = Some(format!("safety_max_tokens:{token_count}"));
-                    continue;
-                }
-
-                if s.duration != 0.0 && token_count as f64 > 20.0 * s.duration {
-                    s.status = Status::Process;
-                    s.stop_reason = Some(format!(
-                        "excessive_tokens:{token_count}>{:.0}",
-                        20.0 * s.duration
-                    ));
-                }
+                safety_stop(&mut self.slots[slot_idx].state, max_seq_len);
             }
 
             let decode_slots: Vec<usize> = active

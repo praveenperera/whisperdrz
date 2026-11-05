@@ -55,5 +55,5 @@ export WHISPERDRZ_DECODER_REF="${WHISPERDRZ_DECODER_REF:-$HOME/.cache/whisperdrz
 # every GPU test binary runs even after one fails
 cargo test --release --features cuda --no-fail-fast -p whisperdrz-native \
   --test gpu_blas --test gpu_weights --test gpu_decoder_attn --test gpu_ops --test gpu_encoder --test gpu_ecapa2 \
-  --test gpu_decoder --test gpu_dtw --test gpu_small_m \
+  --test gpu_decoder --test gpu_dtw --test gpu_small_m --test gpu_verify \
   "$@" -- --nocapture --test-threads 1

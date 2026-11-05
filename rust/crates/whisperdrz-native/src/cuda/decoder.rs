@@ -69,6 +69,8 @@ use super::small_m::{SmallM, SmallStrides};
 use super::{Blas, Tensor, Weights};
 use crate::dtw::{DtwBatch, Matrices};
 
+pub mod verify;
+
 pub const D_MODEL: usize = 1280;
 pub const N_HEAD: usize = 20;
 pub const HEAD_DIM: usize = 64;

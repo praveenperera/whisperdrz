@@ -79,3 +79,111 @@ impl DecodeStep {
         self.bucket > self.rows
     }
 }
+
+/// One speculative verify step's inputs: rows of different lengths, packed
+///
+/// Row `r` feeds `tokens[starts[r]..starts[r + 1]]`, its slot's last written token then
+/// its drafts, at consecutive positions from the slot's KV length. Logits come back only
+/// for the tokens in `need`: a draft the FSM forces is decided without logits, so the
+/// position before it needs none, as long as every draft before it was forced too. The
+/// real tokens are followed by padding up to the bucket for their count: token 0 at
+/// position 0 on the trash slot, one padding row per token
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyStep {
+    /// Real rows
+    pub rows: usize,
+    /// KV slot of each real row
+    pub slots: Vec<usize>,
+    /// `rows + 1` offsets into `tokens`; `starts[rows]` is the real token count
+    pub starts: Vec<usize>,
+    /// `[bucket]` token ids, real then padding
+    pub tokens: Vec<u32>,
+    /// `[bucket]` positions
+    pub positions: Vec<i32>,
+    /// The KV slot padding rows write to
+    pub trash_slot: usize,
+    /// Real tokens whose logits the step returns, ascending; logits row `i` is token
+    /// `need[i]`'s
+    pub need: Vec<usize>,
+    /// Rows the LM head runs over: `need` padded to the bucket for its count, as a
+    /// one-token step over that many rows pads
+    pub head_rows: usize,
+}
+
+/// One row of a [`VerifyStep`]
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyRow<'a> {
+    pub slot: usize,
+    /// The slot's KV length, the first fed token's position
+    pub kv_len: usize,
+    /// The last written token, then the drafts
+    pub fed: &'a [u32],
+    /// Leading fed tokens after which the next token is forced for certain: their
+    /// logits are never read
+    pub forced: usize,
+}
+
+impl VerifyStep {
+    /// Packs `rows` and pads them to the bucket for their token count
+    pub fn new(rows: &[VerifyRow<'_>], buckets: &[usize], trash_slot: usize) -> Self {
+        let mut slots = Vec::with_capacity(rows.len());
+        let mut starts = Vec::with_capacity(rows.len() + 1);
+        let mut tokens = Vec::new();
+        let mut positions = Vec::new();
+        let mut need = Vec::new();
+        starts.push(0);
+        for row in rows {
+            debug_assert!(
+                !row.fed.is_empty() && row.forced < row.fed.len(),
+                "a verify row feeds at least its last token, and needs the logits of its \
+                 last fed token"
+            );
+            slots.push(row.slot);
+            let at = tokens.len();
+            need.extend(at + row.forced..at + row.fed.len());
+            tokens.extend_from_slice(row.fed);
+            positions.extend((0..row.fed.len()).map(|j| (row.kv_len + j) as i32));
+            starts.push(tokens.len());
+        }
+
+        let bucket = get_bucket(tokens.len(), buckets);
+        tokens.resize(bucket, 0);
+        positions.resize(bucket, 0);
+        let head_rows = get_bucket(need.len(), buckets);
+        Self {
+            rows: rows.len(),
+            slots,
+            starts,
+            tokens,
+            positions,
+            trash_slot,
+            need,
+            head_rows,
+        }
+    }
+
+    /// The logits row of real token `j`, if the step returns one
+    pub fn logit_row(&self, j: usize) -> Option<usize> {
+        self.need.binary_search(&j).ok()
+    }
+
+    /// Real tokens, padding excluded
+    pub fn real_tokens(&self) -> usize {
+        self.starts[self.rows]
+    }
+
+    /// Tokens including padding
+    pub fn bucket(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Tokens row `r` feeds
+    pub fn row_len(&self, r: usize) -> usize {
+        self.starts[r + 1] - self.starts[r]
+    }
+
+    /// The most tokens any row feeds
+    pub fn max_row_len(&self) -> usize {
+        (0..self.rows).map(|r| self.row_len(r)).max().unwrap_or(0)
+    }
+}

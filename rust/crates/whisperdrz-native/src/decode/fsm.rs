@@ -288,6 +288,19 @@ impl<'t> Decoder<'t> {
         prepared.masks.is_some()
     }
 
+    /// Phase 1 alone, for drafting: the token the next position is forced to, or `None`
+    /// when it samples. Changes `state` as [`Self::prepare`] would, so run it on a copy
+    pub fn lookahead(
+        &self,
+        state: &mut SlotState,
+        window: Option<&[Token]>,
+    ) -> Result<Option<(String, Token)>> {
+        Ok(match self.plan(state, window)? {
+            Plan::Fixed(text, token) => Some((text, token)),
+            _ => None,
+        })
+    }
+
     /// The rest of [`Self::decode_row`] for a row [`Self::prepare`] planned, on the
     /// same `state`: Phase 3's argmax and Phase 4's corrections. `logits` may be `None`
     /// only when [`Self::needs_logits`] is false

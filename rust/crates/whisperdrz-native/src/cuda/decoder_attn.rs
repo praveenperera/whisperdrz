@@ -57,6 +57,8 @@ use super::Blas;
 use super::blas::{BatchedKey, Strided};
 use super::device::{Arg, Buf, Event, Gpu, StreamRef, blocks};
 
+pub mod verify;
+
 /// Rows from which a decode step (one token a row) runs the absorbed cross-attention
 ///
 /// Per-layer cross-attention time on the RTX 5090 (us, median of 25 with L2 flushed and

@@ -32,8 +32,10 @@ use super::{Blas, Buf, Encoder, Event, Gpu, HostBuf, Priority, UploadMark, Weigh
 use crate::dtw::{DtwBatch, Matrices, MatricesView};
 use crate::speaker::EMBED_DIM;
 use crate::transcriber::{
-    DecodeStep, DtwMatrices, Logits, MelBatch, Model, ReadyMatrices, StepLogits,
+    DecodeStep, DtwMatrices, Logits, MelBatch, Model, ReadyMatrices, StepLogits, VerifyStep,
 };
+
+mod verify;
 
 /// Logits rows per download chunk of a decode step: the host starts on the first rows
 /// while the rest copy, and a chunk copies in less time than its rows take to decode
@@ -78,6 +80,10 @@ pub struct GpuModel {
     /// Page-locked buffers of `dtw_gpu` the DTW matrices download into, back here once
     /// their batch is aligned
     dtw_host: Arc<Mutex<Vec<HostBuf>>>,
+    /// Speculative verify buffers, from the first verify step on
+    verify: Option<decoder::verify::VerifyState>,
+    /// Per slot, whether a verify step left its device cache length behind the host's
+    stale_lens: Vec<bool>,
 }
 
 impl Drop for GpuModel {
@@ -134,6 +140,8 @@ impl GpuModel {
             step_events: (0..MAX_ROWS.div_ceil(STEP_CHUNK_ROWS))
                 .map(|_| gpu.event())
                 .collect::<Result<_>>()?,
+            verify: None,
+            stale_lens: vec![false; slots + 1],
             embedder,
             encoder,
             blas,
@@ -172,6 +180,7 @@ impl GpuModel {
         }
 
         let batch = self.host_batch(slots, 1)?;
+        self.clear_stale(slots);
         self.caches.reset_lens(&self.gpu, batch)
     }
 
@@ -235,6 +244,7 @@ impl GpuModel {
             };
         }
 
+        self.clear_stale(slots);
         let batch = self.decoder.prefill(
             &self.gpu,
             &self.blas,
@@ -308,6 +318,9 @@ impl GpuModel {
         let batch = self
             .dec_ws
             .stage(&self.gpu, &step.tokens, &step.positions, &step.slots)?;
+        if self.take_stale(&step.slots[..step.rows]) {
+            self.dec_ws.sync_lens(&self.gpu, &self.caches, batch)?;
+        }
         self.decoder.step(
             &self.gpu,
             &self.blas,
@@ -425,6 +438,20 @@ impl Model for GpuModel {
         let range = nvtx::Range::new("decode_step");
         let logits = GpuModel::launch_step(self, step)?;
         drop(range);
+        during()?;
+        Ok(Box::new(logits))
+    }
+
+    fn verify_capacity(&self) -> usize {
+        verify::MAX_VERIFY_TOKENS
+    }
+
+    fn launch_verify<'a>(
+        &'a mut self,
+        step: &VerifyStep,
+        during: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Box<dyn StepLogits + 'a>> {
+        let logits = GpuModel::launch_verify(self, step)?;
         during()?;
         Ok(Box::new(logits))
     }

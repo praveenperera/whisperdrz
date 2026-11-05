@@ -945,6 +945,21 @@ fn replay_file(
     checks: &Rc<RefCell<BTreeMap<String, usize>>>,
     defer_dtw: bool,
 ) -> Result<()> {
+    replay_recorded(set, stem, config, tables, checks, defer_dtw, None)
+}
+
+/// [`replay_file`], also filling `oracle` with every result the replay served, keyed by
+/// content, when given
+#[allow(clippy::too_many_arguments)]
+fn replay_recorded(
+    set: &Rc<TraceSet>,
+    stem: &str,
+    config: &Config,
+    tables: &Arc<DecoderTables>,
+    checks: &Rc<RefCell<BTreeMap<String, usize>>>,
+    defer_dtw: bool,
+    oracle: Option<Rc<RefCell<Oracle>>>,
+) -> Result<()> {
     let events = set.events(stem)?;
     let result = set.result(stem)?;
     let samples = result["samples"]
@@ -977,16 +992,26 @@ fn replay_file(
     }));
 
     let mel_replay = replay.clone();
+    let mel_oracle = oracle.clone();
     let mut trn = Transcriber::new(
         config,
-        FakeModel(replay.clone()),
-        Box::new(move |a: &[f32]| mel_replay.borrow_mut().mel(a)),
+        Recorder::new(FakeModel(replay.clone()), oracle.clone()),
+        Box::new(move |a: &[f32]| {
+            let mel = mel_replay.borrow_mut().mel(a)?;
+            if let Some(o) = &mel_oracle {
+                o.borrow_mut().mel.insert(sha20(&f32_bytes(a)), mel.clone());
+            }
+            Ok(mel)
+        }),
         tables.clone(),
     )?;
     let probe_replay = replay.clone();
     let probe_error: Rc<RefCell<Option<eyre::Report>>> = Rc::default();
     let probe_err = probe_error.clone();
     trn.set_probe(Box::new(move |event| {
+        if let (Some(o), Event::UpdateState { slot, text, token }) = (&oracle, event) {
+            o.borrow_mut().tokens.record(slot, text, *token);
+        }
         if let Err(e) = probe_replay.borrow_mut().on_event(event) {
             probe_err.borrow_mut().get_or_insert(e);
         }
@@ -1150,5 +1175,716 @@ fn replay_synthetic_bs6_lockstep() -> Result<()> {
             bs: 6,
             ..Config::default()
         },
+    )
+}
+
+// ---------------------------------------------------------------------------------------
+// Speculative decoding proof
+//
+// The reference replay serves results in call order, which only a scheduler making the
+// reference's calls can follow. With speculation on, steps carry several tokens a row and
+// windows end at other steps, so batches differ. The proof records, during a passing
+// reference replay, every result keyed by content instead: the encoder input row of each
+// slot's window, the token prefix fed at each position, the DTW row's tokens, the audio of
+// each crop. A speculative run then gets the answer an ideal model would give for each
+// position from its own prefix, and has to emit every token and output of the reference
+// run. Logits of a prefix the reference never ran (a rejected draft's position) exist
+// only as an error, raised if a decision reads them
+// ---------------------------------------------------------------------------------------
+
+use whisperdrz_native::transcriber::{SpecConfig, SpecStats, StepLogits, VerifyStep};
+
+/// A slot's window, by its encoder input row
+type WindowKey = String;
+
+/// The tokens each window emitted, in order, by chunk id and window offset
+#[derive(Debug, Default, Clone, PartialEq)]
+struct WindowTokens(BTreeMap<(String, u64), Vec<(u32, String)>>);
+
+impl WindowTokens {
+    fn record(&mut self, slot: &Slot, text: &str, token: u32) {
+        let key = (
+            slot.id.clone().unwrap_or_default(),
+            slot.state.offset.to_bits(),
+        );
+        self.0
+            .entry(key)
+            .or_default()
+            .push((token, text.to_owned()));
+    }
+
+    /// Fails on the first window or token that differs
+    fn check_same(&self, want: &Self, stem: &str) -> Result<usize> {
+        let got_keys: Vec<_> = self.0.keys().collect();
+        let want_keys: Vec<_> = want.0.keys().collect();
+        ensure!(
+            got_keys == want_keys,
+            "{stem}: windows differ\nreference {want_keys:?}\nspec      {got_keys:?}"
+        );
+        let mut n = 0;
+        for (key, w) in &want.0 {
+            let g = &self.0[key];
+            ensure!(
+                g.len() == w.len(),
+                "{stem}: window {key:?} emitted {} tokens, the reference {}",
+                g.len(),
+                w.len()
+            );
+            for (i, (a, b)) in g.iter().zip(w).enumerate() {
+                ensure!(
+                    a == b,
+                    "{stem}: window {key:?} token {i}: spec {a:?}, reference {b:?}"
+                );
+            }
+            n += w.len();
+        }
+        Ok(n)
+    }
+}
+
+/// Every result a reference replay served, keyed by content
+#[derive(Default)]
+struct Oracle {
+    /// Waveform hash to mel
+    mel: HashMap<String, Mel>,
+    /// Encoder input rows seen
+    windows: HashSet<WindowKey>,
+    /// (window, start tokens) to the prefill's last-position logits
+    prefill: HashMap<(WindowKey, Vec<u32>), Vec<f16>>,
+    /// (window, token prefix hash) to the logits after that prefix
+    logits: HashMap<(WindowKey, u64), Vec<f16>>,
+    /// (window, the DTW row's real tokens, audio cap) to its `[tokens, cap]` matrix rows
+    dtw: HashMap<(WindowKey, Vec<u32>, usize), Vec<f32>>,
+    /// Audio hash to embedding
+    embed: HashMap<String, [f32; EMBED_DIM]>,
+    /// The tokens the reference run emitted
+    tokens: WindowTokens,
+}
+
+/// Each slot's window and the tokens its KV holds, as a model sees them
+#[derive(Default)]
+struct SlotTrack {
+    window: HashMap<usize, WindowKey>,
+    tokens: HashMap<usize, Vec<u32>>,
+}
+
+fn prefix_hash(tokens: &[u32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tokens.hash(&mut h);
+    h.finish()
+}
+
+impl SlotTrack {
+    fn reset(&mut self, slots: &[usize]) {
+        for s in slots {
+            self.tokens.remove(s);
+        }
+    }
+
+    fn encode(&mut self, mel: &MelBatch, slots: &[usize]) -> Vec<WindowKey> {
+        let per = mel.data.len() / mel.rows.max(1);
+        slots
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let key = sha20(&f16_bytes(&mel.data[i * per..(i + 1) * per]));
+                self.window.insert(s, key.clone());
+                key
+            })
+            .collect()
+    }
+
+    fn window(&self, slot: usize) -> Result<WindowKey> {
+        self.window
+            .get(&slot)
+            .cloned()
+            .ok_or_else(|| eyre!("slot {slot} decodes with no encoded window"))
+    }
+
+    /// Writes `token` at `pos` of the slot's KV, as an append at the slot's length or an
+    /// overwrite of positions a verify step fed but didn't keep, and returns the key of
+    /// the logits after it
+    fn feed(&mut self, slot: usize, pos: i32, token: u32) -> Result<(WindowKey, u64)> {
+        let window = self.window(slot)?;
+        let t = self.tokens.entry(slot).or_default();
+        let pos = usize::try_from(pos)?;
+        ensure!(
+            pos <= t.len(),
+            "slot {slot} fed at position {pos}, past the {} positions its KV holds",
+            t.len()
+        );
+        t.truncate(pos);
+        t.push(token);
+        Ok((window, prefix_hash(t)))
+    }
+}
+
+/// [`FakeModel`] that also records each result into an [`Oracle`]
+struct Recorder {
+    inner: FakeModel,
+    oracle: Option<Rc<RefCell<Oracle>>>,
+    track: SlotTrack,
+}
+
+impl Recorder {
+    fn new(inner: FakeModel, oracle: Option<Rc<RefCell<Oracle>>>) -> Self {
+        Self {
+            inner,
+            oracle,
+            track: SlotTrack::default(),
+        }
+    }
+}
+
+/// The `[actual_len, cap]` rows of DTW batch row `bi` that the DP reads
+fn dtw_region(batch: &DtwBatch, m: MatricesView<'_>, bi: usize) -> Vec<f32> {
+    let [_, t_pad, width] = m.shape;
+    let (len, cap) = (batch.actual_lens[bi], batch.audio_caps[bi].min(width));
+    let mut out = Vec::with_capacity(len * cap);
+    for r in 0..len.min(t_pad) {
+        let base = (bi * t_pad + r) * width;
+        out.extend_from_slice(&m.data[base..base + cap]);
+    }
+    out
+}
+
+fn dtw_key(batch: &DtwBatch, window: WindowKey, bi: usize) -> (WindowKey, Vec<u32>, usize) {
+    let tokens = batch.row(bi)[..batch.actual_lens[bi]].to_vec();
+    (window, tokens, batch.audio_caps[bi])
+}
+
+impl Model for Recorder {
+    fn reset_kv(&mut self, slots: &[usize]) -> Result<()> {
+        self.track.reset(slots);
+        self.inner.reset_kv(slots)
+    }
+
+    fn encode(&mut self, mel: &MelBatch, slots: &[usize]) -> Result<()> {
+        let keys = self.track.encode(mel, slots);
+        if let Some(o) = &self.oracle {
+            o.borrow_mut().windows.extend(keys);
+        }
+        self.inner.encode(mel, slots)
+    }
+
+    fn prefill(&mut self, tokens: &[u32], slots: &[usize]) -> Result<Logits> {
+        let logits = self.inner.prefill(tokens, slots)?;
+        let per = tokens.len() / slots.len();
+        for (i, &s) in slots.iter().enumerate() {
+            let row = tokens[i * per..(i + 1) * per].to_vec();
+            self.track.tokens.insert(s, row.clone());
+            if let Some(o) = &self.oracle {
+                let key = (self.track.window(s)?, row);
+                o.borrow_mut().prefill.insert(key, logits.row(i).to_vec());
+            }
+        }
+        Ok(logits)
+    }
+
+    fn decode_step(&mut self, step: &DecodeStep) -> Result<Logits> {
+        let logits = self.inner.decode_step(step)?;
+        for i in 0..step.rows {
+            let key = self
+                .track
+                .feed(step.slots[i], step.positions[i], step.tokens[i])?;
+            if let Some(o) = &self.oracle {
+                o.borrow_mut().logits.insert(key, logits.row(i).to_vec());
+            }
+        }
+        Ok(logits)
+    }
+
+    fn dtw_prep(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Matrices> {
+        let m = self.inner.dtw_prep(batch, xa_slots)?;
+        if let Some(o) = &self.oracle {
+            for (bi, &xa) in xa_slots.iter().enumerate().take(batch.rows()) {
+                let key = dtw_key(batch, self.track.window(xa)?, bi);
+                let region = dtw_region(batch, m.view(), bi);
+                o.borrow_mut().dtw.insert(key, region);
+            }
+        }
+        Ok(m)
+    }
+
+    fn dtw_launch(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Box<dyn DtwMatrices>> {
+        let m = self.dtw_prep(batch, xa_slots)?;
+        Ok(if self.inner.0.borrow().defer_dtw {
+            Box::new(InFlight(m))
+        } else {
+            Box::new(ReadyMatrices(m))
+        })
+    }
+
+    fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]> {
+        let e = self.inner.embed(audio)?;
+        if let Some(o) = &self.oracle {
+            o.borrow_mut().embed.insert(sha20(&f32_bytes(audio)), e);
+        }
+        Ok(e)
+    }
+
+    fn reset_embeds(&mut self) -> Result<()> {
+        self.inner.reset_embeds()
+    }
+
+    fn prefetch_embed(&mut self, audio: &Arc<[f32]>, start: usize, len: usize) -> Result<()> {
+        self.inner.prefetch_embed(audio, start, len)
+    }
+
+    fn embed_crop(
+        &mut self,
+        audio: &Arc<[f32]>,
+        start: usize,
+        len: usize,
+    ) -> Result<[f32; EMBED_DIM]> {
+        // the inner model checks the prefetch, then calls its own embed
+        let e = self.inner.embed_crop(audio, start, len)?;
+        if let Some(o) = &self.oracle {
+            o.borrow_mut()
+                .embed
+                .insert(sha20(&f32_bytes(&audio[start..start + len])), e);
+        }
+        Ok(e)
+    }
+}
+
+/// Answers every call from an [`Oracle`]: an ideal model whose outputs depend only on
+/// each slot's window and token prefix
+struct OracleModel {
+    oracle: Rc<RefCell<Oracle>>,
+    track: SlotTrack,
+    defer_dtw: bool,
+    buckets: Vec<usize>,
+    /// [`Model::verify_capacity`], small in one case so wide drafts fall back
+    capacity: usize,
+}
+
+/// Verify logits, `None` for a prefix the reference never ran
+struct OracleLogits(Vec<Option<Vec<f16>>>);
+
+impl StepLogits for OracleLogits {
+    fn rows(&self) -> usize {
+        self.0.len()
+    }
+
+    fn row(&self, r: usize) -> Result<&[f16]> {
+        match self.0.get(r) {
+            Some(Some(row)) => Ok(row),
+            Some(None) => bail!(
+                "logits row {r} was read, but the reference never ran its token prefix: a \
+                 position after a rejected draft reached a decision"
+            ),
+            None => bail!("logits row {r} of {}", self.0.len()),
+        }
+    }
+
+    fn landed(&self) -> Result<usize> {
+        Ok(self.0.len())
+    }
+
+    fn complete(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl Model for OracleModel {
+    fn verify_capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn reset_kv(&mut self, slots: &[usize]) -> Result<()> {
+        self.track.reset(slots);
+        Ok(())
+    }
+
+    fn encode(&mut self, mel: &MelBatch, slots: &[usize]) -> Result<()> {
+        for key in self.track.encode(mel, slots) {
+            ensure!(
+                self.oracle.borrow().windows.contains(&key),
+                "encoder input {key} never ran in the reference"
+            );
+        }
+        Ok(())
+    }
+
+    fn prefill(&mut self, tokens: &[u32], slots: &[usize]) -> Result<Logits> {
+        let per = tokens.len() / slots.len();
+        let o = self.oracle.borrow();
+        let mut data = Vec::new();
+        for (i, &s) in slots.iter().enumerate() {
+            let row = tokens[i * per..(i + 1) * per].to_vec();
+            self.track.tokens.insert(s, row.clone());
+            let key = (self.track.window(s)?, row);
+            let l = o
+                .prefill
+                .get(&key)
+                .ok_or_else(|| eyre!("prefill of slot {s} never ran in the reference"))?;
+            data.extend_from_slice(l);
+        }
+        Logits::new(slots.len(), data.len() / slots.len(), data)
+    }
+
+    fn decode_step(&mut self, step: &DecodeStep) -> Result<Logits> {
+        let n = step.rows;
+        ensure!(
+            step.bucket == get_bucket(n, &self.buckets)
+                && step.slots[n..].iter().all(|&s| s == step.trash_slot),
+            "decode step padding"
+        );
+        let mut data = Vec::new();
+        for i in 0..n {
+            let key = self
+                .track
+                .feed(step.slots[i], step.positions[i], step.tokens[i])?;
+            let o = self.oracle.borrow();
+            let l = o.logits.get(&key).ok_or_else(|| {
+                eyre!(
+                    "one-token step row {i} (slot {}, position {}) has a prefix the \
+                     reference never ran",
+                    step.slots[i],
+                    step.positions[i]
+                )
+            })?;
+            data.extend_from_slice(l);
+        }
+        Logits::new(n, data.len() / n.max(1), data)
+    }
+
+    fn launch_verify<'a>(
+        &'a mut self,
+        step: &VerifyStep,
+        during: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Box<dyn StepLogits + 'a>> {
+        let real = step.real_tokens();
+        ensure!(
+            step.starts.len() == step.rows + 1
+                && step.slots.len() == step.rows
+                && step.starts[0] == 0
+                && step.starts.windows(2).all(|w| w[1] > w[0])
+                && step.tokens.len() == get_bucket(real, &self.buckets)
+                && step.positions.len() == step.tokens.len()
+                && step.tokens[real..].iter().all(|&t| t == 0)
+                && step.positions[real..].iter().all(|&p| p == 0),
+            "verify step layout: {step:?}"
+        );
+        let mut rows = Vec::with_capacity(real);
+        let mut seen = HashSet::new();
+        for r in 0..step.rows {
+            let s = step.slots[r];
+            ensure!(s < step.trash_slot && seen.insert(s), "verify slot {s}");
+            let start = step.starts[r];
+            // a row starts at or before its slot's KV length (past it lie positions an
+            // earlier verify step fed but didn't keep) and runs on consecutive positions;
+            // a wrong start shows as a prefix the oracle doesn't hold
+            let len = self.track.tokens.get(&s).map_or(0, Vec::len);
+            let first = usize::try_from(step.positions[start])?;
+            ensure!(
+                first <= len,
+                "slot {s} verify row starts at position {first}, past the {len} its KV holds"
+            );
+            for j in start..step.starts[r + 1] {
+                let pos = step.positions[j];
+                ensure!(
+                    usize::try_from(pos)? == first + (j - start),
+                    "slot {s} verify token {} at position {pos}, the row starts at {first}",
+                    j - start
+                );
+                let key = self.track.feed(s, pos, step.tokens[j])?;
+                if step.logit_row(j).is_some() {
+                    rows.push(self.oracle.borrow().logits.get(&key).cloned());
+                }
+            }
+        }
+        ensure!(
+            rows.len() == step.need.len()
+                && step.need.iter().all(|&j| j < real)
+                && step.head_rows == get_bucket(step.need.len(), &self.buckets),
+            "verify step needs logits of {:?} over {} LM-head rows",
+            step.need,
+            step.head_rows
+        );
+
+        during()?;
+        Ok(Box::new(OracleLogits(rows)))
+    }
+
+    fn dtw_prep(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Matrices> {
+        let (rows, t_pad, width) = (batch.rows(), batch.t_pad, batch.max_audio_cap());
+        let mut data = vec![0.0f32; rows * t_pad * width];
+        let o = self.oracle.borrow();
+        for (bi, &xa) in xa_slots.iter().enumerate().take(rows) {
+            let key = dtw_key(batch, self.track.window(xa)?, bi);
+            let region = o
+                .dtw
+                .get(&key)
+                .ok_or_else(|| eyre!("DTW row {bi} never ran in the reference"))?;
+            let cap = batch.audio_caps[bi].min(width);
+            for (r, src) in region.chunks(cap.max(1)).enumerate() {
+                let base = (bi * t_pad + r) * width;
+                data[base..base + src.len()].copy_from_slice(src);
+            }
+        }
+        Ok(Matrices {
+            shape: [rows, t_pad, width],
+            data,
+        })
+    }
+
+    fn dtw_launch(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Box<dyn DtwMatrices>> {
+        let m = self.dtw_prep(batch, xa_slots)?;
+        Ok(if self.defer_dtw {
+            Box::new(InFlight(m))
+        } else {
+            Box::new(ReadyMatrices(m))
+        })
+    }
+
+    fn embed(&mut self, audio: &[f32]) -> Result<[f32; EMBED_DIM]> {
+        self.oracle
+            .borrow()
+            .embed
+            .get(&sha20(&f32_bytes(audio)))
+            .copied()
+            .ok_or_else(|| {
+                eyre!(
+                    "embedding of {} samples never ran in the reference",
+                    audio.len()
+                )
+            })
+    }
+}
+
+/// Replays each file of `name` with speculation off (the reference replay, recording an
+/// oracle), then on against the oracle, and checks that every window emits the same
+/// tokens and every file the same outputs
+fn spec_proof(
+    name: &str,
+    config: Config,
+    spec: SpecConfig,
+    defer_dtw: bool,
+    capacity: usize,
+) -> Result<SpecStats> {
+    let mut total = SpecStats::default();
+    let Some(set) = TraceSet::open(name) else {
+        return Ok(total);
+    };
+    let set = Rc::new(set);
+    let tables = Arc::new(DecoderTables::new(Tokenizer::multilingual()?)?);
+    let checks: Rc<RefCell<BTreeMap<String, usize>>> = Rc::default();
+    for stem in set.stems()? {
+        let oracle = Rc::new(RefCell::new(Oracle::default()));
+        replay_recorded(
+            &set,
+            &stem,
+            &config,
+            &tables,
+            &checks,
+            false,
+            Some(oracle.clone()),
+        )?;
+        let want = std::mem::take(&mut oracle.borrow_mut().tokens);
+
+        let events = set.events(&stem)?;
+        let result = set.result(&stem)?;
+        let samples = result["samples"]
+            .as_u64()
+            .ok_or_else(|| eyre!("no samples"))? as usize;
+        let audio: Arc<[f32]> = file_audio(&set, &events, samples)?.into();
+
+        let mel_oracle = oracle.clone();
+        let model = OracleModel {
+            oracle: oracle.clone(),
+            track: SlotTrack::default(),
+            defer_dtw,
+            buckets: captured_buckets(config.bs),
+            capacity,
+        };
+        let mut trn = Transcriber::new(
+            Config {
+                spec: Some(spec),
+                ..config.clone()
+            },
+            model,
+            Box::new(move |a: &[f32]| {
+                mel_oracle
+                    .borrow()
+                    .mel
+                    .get(&sha20(&f32_bytes(a)))
+                    .cloned()
+                    .ok_or_else(|| eyre!("mel of {} samples never ran in the reference", a.len()))
+            }),
+            tables.clone(),
+        )?;
+        let got: Rc<RefCell<WindowTokens>> = Rc::default();
+        let probe_got = got.clone();
+        trn.set_probe(Box::new(move |event| {
+            if let Event::UpdateState { slot, text, token } = event {
+                probe_got.borrow_mut().record(slot, text, *token);
+            }
+        }));
+
+        let out = trn.transcribe(&audio, &mut PyRandom::new(0))?;
+        let tokens = got.borrow().check_same(&want, &stem)?;
+        ensure!(
+            out.text == result["text"].as_str().unwrap_or_default(),
+            "{stem}: spec text differs\npython {:?}\nrust   {:?}",
+            result["text"],
+            out.text
+        );
+        ensure!(
+            json_eq(&serde_json::to_value(&out.segments)?, &result["segments"]),
+            "{stem}: spec segments differ"
+        );
+        let raw = result["raw_chunks"]
+            .as_array()
+            .ok_or_else(|| eyre!("raw_chunks"))?;
+        ensure!(
+            raw.len() == out.raw_chunks.len(),
+            "{stem}: spec chunk count"
+        );
+        for (py, mine) in raw.iter().zip(&out.raw_chunks) {
+            let diffs = result_diffs(py, Some(mine));
+            ensure!(
+                diffs.is_empty(),
+                "{stem}: spec raw_chunks {}: {diffs:?}",
+                mine.id
+            );
+        }
+
+        let stats = trn.spec_stats();
+        eprintln!(
+            "{stem}: {tokens} tokens in {} windows match with speculation; {}",
+            want.0.len(),
+            stats.summary()
+        );
+        add_stats(&mut total, stats);
+    }
+
+    Ok(total)
+}
+
+fn add_stats(total: &mut SpecStats, s: &SpecStats) {
+    total.verify_steps += s.verify_steps;
+    total.forced_kept += s.forced_kept;
+    total.carry_kept += s.carry_kept;
+    total.ngram_kept += s.ngram_kept;
+    total.ngram_fed += s.ngram_fed;
+    total.full_steps += s.full_steps;
+}
+
+/// Runs [`spec_proof`] over a spread of configs; `real` sets must also keep drafts of
+/// every source, which the synthetic noise sets mostly never draft
+fn spec_all(name: &str, config: Config, real: bool) -> Result<()> {
+    let cases = [
+        (
+            SpecConfig {
+                k: 1,
+                max_rows: 64,
+                carry: false,
+                ngram: 0,
+            },
+            false,
+            usize::MAX,
+        ),
+        (
+            SpecConfig {
+                k: 4,
+                max_rows: 64,
+                carry: true,
+                ngram: 2,
+            },
+            true,
+            usize::MAX,
+        ),
+        (
+            SpecConfig {
+                k: 7,
+                max_rows: 64,
+                carry: true,
+                ngram: 7,
+            },
+            false,
+            usize::MAX,
+        ),
+        (
+            SpecConfig {
+                k: 4,
+                max_rows: 2,
+                carry: true,
+                ngram: 0,
+            },
+            true,
+            usize::MAX,
+        ),
+        // a verify workspace of 8 tokens: wider drafts fall back to one token a row
+        (
+            SpecConfig {
+                k: 4,
+                max_rows: 64,
+                carry: true,
+                ngram: 2,
+            },
+            true,
+            8,
+        ),
+    ];
+    let mut total = SpecStats::default();
+    let mut full_steps = 0;
+    for (spec, defer, capacity) in cases {
+        eprintln!("{name}: {spec:?}, deferred DTW {defer}, verify capacity {capacity}");
+        let stats = spec_proof(name, config.clone(), spec, defer, capacity)?;
+        full_steps += stats.full_steps;
+        add_stats(&mut total, &stats);
+    }
+
+    // the proof means nothing unless verify steps kept drafts of each source
+    if real && TraceSet::open(name).is_some() {
+        ensure!(
+            total.verify_steps > 0
+                && total.forced_kept > 0
+                && total.carry_kept > 0
+                && total.ngram_kept > 0,
+            "{name}: verify steps never kept a draft of each source: {total:?}"
+        );
+        ensure!(
+            full_steps > 0,
+            "{name}: no step overfilled the 8-token verify workspace"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn spec_short3() -> Result<()> {
+    spec_all("short3", Config::default(), true)
+}
+
+#[test]
+fn spec_e21c600() -> Result<()> {
+    spec_all("e21c600", Config::default(), true)
+}
+
+#[test]
+fn spec_synthetic_bs4() -> Result<()> {
+    spec_all(
+        &format!("{SYNTHETIC}/synth-bs4"),
+        Config {
+            bs: 4,
+            ..Config::default()
+        },
+        false,
+    )
+}
+
+#[test]
+fn spec_synthetic_bs6_lockstep() -> Result<()> {
+    spec_all(
+        &format!("{SYNTHETIC}/synth-bs6-lockstep"),
+        Config {
+            bs: 6,
+            ..Config::default()
+        },
+        false,
     )
 }

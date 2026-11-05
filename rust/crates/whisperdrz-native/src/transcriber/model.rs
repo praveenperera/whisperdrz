@@ -6,7 +6,7 @@ use std::sync::Arc;
 use eyre::{Result, ensure};
 use half::f16;
 
-use super::graphs::DecodeStep;
+use super::graphs::{DecodeStep, VerifyStep};
 use crate::dtw::{DtwBatch, Matrices, MatricesView};
 use crate::speaker::EMBED_DIM;
 
@@ -183,6 +183,25 @@ pub trait Model {
         let logits = self.decode_step(step)?;
         during()?;
         Ok(Box::new(logits))
+    }
+
+    /// A speculative verify step: queues the forward over `step`'s ragged rows (each
+    /// row's KV filled at every position it feeds), runs `during` while the GPU computes,
+    /// and returns the logits of the tokens in `step.need`, in that order. A slot's KV
+    /// length is left to the caller: the next step's positions say how many of the fed
+    /// positions were kept. Models that can't verify fail
+    /// Most packed tokens, padding included, one [`Model::launch_verify`] step may feed;
+    /// a step that would feed more runs one token a row instead
+    fn verify_capacity(&self) -> usize {
+        usize::MAX
+    }
+
+    fn launch_verify<'a>(
+        &'a mut self,
+        _step: &VerifyStep,
+        _during: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Box<dyn StepLogits + 'a>> {
+        eyre::bail!("this model has no speculative verify step")
     }
 
     /// The GPU half of `fill_word_timings_batch`: the decoder forward over

@@ -8,6 +8,11 @@
 //! to 0 before each call. Files run in list order, since transcriber state carries
 //! across calls, and OUT_JSON maps each basename to `{text, segments}` sorted by name,
 //! the order `rust/gate/gate.py` reads
+//!
+//! Decode steps run speculative decoding with [`SpecConfig::SHIPPED`]. `WHISPERDRZ_SPEC`
+//! overrides it: `off` runs one token a row per step, as the reference does, and anything
+//! else is read by [`SpecConfig::parse`], such as `k=4,rows=16,carry,ngram=2`. With
+//! speculation on, its counters go to stderr at the end
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +26,7 @@ use whisperdrz_native::decode::tables::DecoderTables;
 use whisperdrz_native::mel::{LogMel, N_MELS, SAMPLE_RATE};
 use whisperdrz_native::speaker::PyRandom;
 use whisperdrz_native::text::Tokenizer;
-use whisperdrz_native::transcriber::{Config, Mel, Transcriber};
+use whisperdrz_native::transcriber::{Config, Mel, SpecConfig, Transcriber};
 
 mod wav;
 
@@ -117,7 +122,23 @@ fn main() -> Result<()> {
         .map(|p| wav::read_mono(p, SAMPLE_RATE as u32))
         .collect::<Result<Vec<_>>>()?;
 
-    let config = Config::default();
+    // `Config::default` is the reference's one-token decode, which the replay tests
+    // check against; the CLI ships the speculative setting on top of it
+    let mut config = Config {
+        spec: Some(SpecConfig::SHIPPED),
+        ..Config::default()
+    };
+    // an env var rather than a flag, so a wrapper can change it under a bench harness
+    // that runs every arm with the same arguments
+    if let Some(spec) = std::env::var_os("WHISPERDRZ_SPEC") {
+        let spec = spec
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("WHISPERDRZ_SPEC is not UTF-8"))?;
+        config.spec = match spec.trim() {
+            "off" => None,
+            spec => Some(SpecConfig::parse(spec).wrap_err("WHISPERDRZ_SPEC")?),
+        };
+    }
     let model = GpuModel::new(&args.weights, &args.ecapa, config.bs, config.bs)?;
     let tables = Arc::new(DecoderTables::new(Tokenizer::multilingual()?)?);
     let log_mel = LogMel::new();
@@ -126,6 +147,7 @@ fn main() -> Result<()> {
         let data = log_mel.compute(audio)?;
         Mel::new(N_MELS, data.len() / N_MELS, data)
     });
+    let config_spec = config.spec.is_some();
     let mut trn = Transcriber::new(config, model, mel, tables)?;
 
     let warmup = &audios[0][..audios[0].len().min(WARMUP_SECONDS * SAMPLE_RATE)];
@@ -162,6 +184,9 @@ fn main() -> Result<()> {
         paths.len(),
         total_audio / total_wall
     );
+    if config_spec {
+        eprintln!("{}", trn.spec_stats().summary());
+    }
     // serde_json's default map is sorted, the reference JSON's file order
     std::fs::write(&args.out, serde_json::to_string(&Value::Object(out))?)
         .wrap_err_with(|| format!("write {}", args.out.display()))?;
