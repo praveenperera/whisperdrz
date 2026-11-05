@@ -1,0 +1,264 @@
+//! The f32 arithmetic of the torch 2.8 CPU kernels `cluster_speakers` runs, in
+//! their summation order, for the AVX2 build torch dispatches to on the reference
+//! machine (Core Ultra 7 270K Plus: no AVX-512, so `Vectorized<float>` has 8 lanes)
+//!
+//! Matched bit for bit against torch on that CPU (`tests/data/torch_cpu.json`):
+//! `F.normalize` (the `norm` last-dim fast path), `pow(2).sum(-1)` (cascade sum) and
+//! `cdist` up to 25 rows (scalar loop). `cdist` past 25 rows goes through MKL
+//! `sgemm`, whose blocking depends on the matrix size and its thread split; the
+//! model here matches most elements and is off by an ulp or two on the rest, so
+//! callers log how close each decision came (see [`super::cluster`])
+
+/// AVX2 `Vectorized<float>` width
+const LANES: usize = 8;
+
+/// One `Vectorized<float>`
+type Vec8 = [f32; LANES];
+
+fn vadd(acc: &mut Vec8, v: &Vec8) {
+    for (a, b) in acc.iter_mut().zip(v) {
+        *a += b;
+    }
+}
+
+/// `x.norm(2, dim=-1)` for one contiguous row: 8 lane accumulators of `v * v` (no
+/// FMA), folded left to right, then the scalar tail, then `sqrt`
+pub fn norm2(x: &[f32]) -> f32 {
+    let (vecs, tail) = x.as_chunks::<LANES>();
+    let mut acc = [0f32; LANES];
+    for v in vecs {
+        for (a, &e) in acc.iter_mut().zip(v) {
+            *a += e * e;
+        }
+    }
+
+    let mut total = acc[0];
+    for &a in &acc[1..] {
+        total += a;
+    }
+
+    for &e in tail {
+        total += e * e;
+    }
+
+    total.sqrt()
+}
+
+/// `F.normalize(x, p=2, dim=-1)` for one row, in place: `x / max(norm, 1e-12)`
+pub fn normalize(x: &mut [f32]) {
+    let denom = norm2(x).max(1e-12);
+    for v in x {
+        *v /= denom;
+    }
+}
+
+/// `x.sum(-1)` for one contiguous row: `cascade_sum`'s inner reduction. Four
+/// interleaved 8-lane accumulators (`multi_row_sum` with `ilp_factor` 4) take the
+/// vectors in groups of four, folding up a cascade level every 16 groups; leftover
+/// vectors go to the first accumulator, the four are folded in order, and the
+/// scalar tail is summed before the lanes are added left to right
+pub fn sum(x: &[f32]) -> f32 {
+    const ILP: usize = 4;
+    const LEVELS: usize = 4;
+    // `level_power` is 4 for any row under 2^16 groups
+    const LEVEL_STEP: usize = 16;
+
+    type Quad = [Vec8; ILP];
+    let add_quad = |acc: &mut Quad, q: &Quad| {
+        for (a, v) in acc.iter_mut().zip(q) {
+            vadd(a, v);
+        }
+    };
+
+    let (vecs, tail) = x.as_chunks::<LANES>();
+    let (quads, rest) = vecs.as_chunks::<ILP>();
+    let mut acc = [[[0f32; LANES]; ILP]; LEVELS];
+    let mut i = 0;
+    while i + LEVEL_STEP <= quads.len() {
+        for q in &quads[i..i + LEVEL_STEP] {
+            add_quad(&mut acc[0], q);
+        }
+
+        i += LEVEL_STEP;
+        for j in 1..LEVELS {
+            let lower = std::mem::take(&mut acc[j - 1]);
+            add_quad(&mut acc[j], &lower);
+            if i & (0xF << (j * 4)) != 0 {
+                break;
+            }
+        }
+    }
+
+    for q in &quads[i..] {
+        add_quad(&mut acc[0], q);
+    }
+
+    for j in 1..LEVELS {
+        let upper = acc[j];
+        add_quad(&mut acc[0], &upper);
+    }
+
+    let [mut p0, p1, p2, p3] = acc[0];
+    for v in rest {
+        vadd(&mut p0, v);
+    }
+
+    for p in [p1, p2, p3] {
+        vadd(&mut p0, &p);
+    }
+
+    let mut total = 0f32;
+    for &e in tail {
+        total += e;
+    }
+
+    for p in p0 {
+        total += p;
+    }
+
+    total
+}
+
+/// `sum(0)` down one column: `cascade_sum`'s outer reduction, which adds rows in
+/// order into a first-level accumulator and folds it up a level every 16 rows
+pub fn column_sum(col: &[f32]) -> f32 {
+    const LEVEL_STEP: usize = 16;
+
+    let mut acc = [0f32; 4];
+    let mut i = 0;
+    while i + LEVEL_STEP <= col.len() {
+        for &v in &col[i..i + LEVEL_STEP] {
+            acc[0] += v;
+        }
+
+        i += LEVEL_STEP;
+        for j in 1..4 {
+            acc[j] += acc[j - 1];
+            acc[j - 1] = 0.0;
+            if i & (0xF << (j * 4)) != 0 {
+                break;
+            }
+        }
+    }
+
+    for &v in &col[i..] {
+        acc[0] += v;
+    }
+
+    for j in 1..4 {
+        acc[0] += acc[j];
+    }
+
+    acc[0]
+}
+
+/// `torch.cdist(a, b)` (p = 2) between row sets of width `dim`, row-major `[ra, rb]`
+pub fn cdist(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
+    let (ra, rb) = (a.len() / dim, b.len() / dim);
+    match CdistPath::for_rows(ra.max(rb)) {
+        CdistPath::Direct => cdist_direct(a, b, dim),
+        path => euclidean_dist_mm(a, b, dim, path),
+    }
+}
+
+/// The arithmetic `cdist` uses, chosen by the larger operand's row count; each
+/// element then depends only on its two rows, so callers may compute elements one
+/// pair at a time ([`cdist_direct_pair`], [`mm_pair`]) and match `cdist` bit for bit
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CdistPath {
+    /// Up to 25 rows: the scalar loop
+    Direct,
+    /// The MKL `sgemm` path modeled as one FMA chain over k
+    OneChain,
+    /// The same with two interleaved chains (even and odd k), for 30 to 64 rows
+    TwoChains,
+}
+
+impl CdistPath {
+    pub fn for_rows(rows: usize) -> Self {
+        match rows {
+            0..=25 => Self::Direct,
+            30..=64 => Self::TwoChains,
+            _ => Self::OneChain,
+        }
+    }
+}
+
+/// `_cdist_forward` on the CPU for one pair: a scalar sum of `|x - y|^2` (no FMA),
+/// then `sqrt`
+pub fn cdist_direct_pair(x: &[f32], y: &[f32]) -> f32 {
+    let mut agg = 0f32;
+    for (&p, &q) in x.iter().zip(y) {
+        let d = (p - q).abs();
+        agg += d * d;
+    }
+
+    agg.sqrt()
+}
+
+fn cdist_direct(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(a.len() / dim * (b.len() / dim));
+    for x in a.chunks_exact(dim) {
+        for y in b.chunks_exact(dim) {
+            out.push(cdist_direct_pair(x, y));
+        }
+    }
+
+    out
+}
+
+/// A row of the left operand of `_euclidean_dist`'s product: `[-2x, |x|^2, 1]`
+pub fn mm_lhs(row: &[f32]) -> Vec<f32> {
+    mm_pack(row, -2.0, false)
+}
+
+/// A row of the right operand: `[y, 1, |y|^2]`
+pub fn mm_rhs(row: &[f32]) -> Vec<f32> {
+    mm_pack(row, 1.0, true)
+}
+
+fn mm_pack(row: &[f32], scale: f32, norm_last: bool) -> Vec<f32> {
+    let sq: Vec<f32> = row.iter().map(|v| v * v).collect();
+    let norm = sum(&sq);
+    let mut out: Vec<f32> = row.iter().map(|v| v * scale).collect();
+    if norm_last {
+        out.extend([1.0, norm]);
+    } else {
+        out.extend([norm, 1.0]);
+    }
+
+    out
+}
+
+/// One element of `_euclidean_dist` from packed rows ([`mm_lhs`], [`mm_rhs`]):
+/// the product as FMA chains over k, clamped at 0, `sqrt`
+pub fn mm_pair(x: &[f32], y: &[f32], path: CdistPath) -> f32 {
+    let chains = if path == CdistPath::TwoChains { 2 } else { 1 };
+    let mut acc = [0f32; 2];
+    for (k, (&p, &q)) in x.iter().zip(y).enumerate() {
+        let c = k % chains;
+        acc[c] = p.mul_add(q, acc[c]);
+    }
+
+    let dot = if chains == 1 { acc[0] } else { acc[0] + acc[1] };
+    dot.max(0.0).sqrt()
+}
+
+/// `_euclidean_dist`: `[-2x, |x|^2, 1] @ [y, 1, |y|^2]^T`, clamped at 0, `sqrt`.
+/// The product models MKL `sgemm` as FMA chains over k: two interleaved chains (even
+/// and odd k, summed) for 30 to 64 rows, one chain otherwise. Against MKL on the
+/// reference CPU it is exact at 28, 31 and 33 rows and elsewhere differs on up to 5%
+/// of the off-diagonal elements by an ulp or two (probed at 26 to 150 rows); MKL
+/// picks its kernels by size and thread split, so no fixed chain order is exact
+fn euclidean_dist_mm(a: &[f32], b: &[f32], dim: usize, path: CdistPath) -> Vec<f32> {
+    let xa: Vec<Vec<f32>> = a.chunks_exact(dim).map(mm_lhs).collect();
+    let yb: Vec<Vec<f32>> = b.chunks_exact(dim).map(mm_rhs).collect();
+    let mut out = Vec::with_capacity(xa.len() * yb.len());
+    for x in &xa {
+        for y in &yb {
+            out.push(mm_pair(x, y, path));
+        }
+    }
+
+    out
+}

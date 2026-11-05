@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/whisperdrz-native", "crates/whisperdrz-cli", "crates/whisperdrz-fixtures"]
+# the cuda-oxide kernel crate needs its own pinned toolchain with rustc-dev, so only
+# scripts/build-ptx.sh builds it; the host crates embed the PTX it commits
+exclude = ["kernels"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/fluxions-ai/whisperdrz"
+
+[workspace.dependencies]
+eyre = "0.6"
+color-eyre = "0.6"
+half = { version = "2", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+safetensors = "0.6"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+fancy-regex = "0.19"
+regex = "1"
+base64 = "0.22"
+unicode_names2 = "4"
+unicode-general-category = "1"
+sha2 = "0.10"
+realfft = "3.5"
+rayon = "1"
+libloading = "0.8"
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "cublas", "cublaslt", "dynamic-loading", "cuda-12080"] }
+
+[profile.release]
+debug = 1

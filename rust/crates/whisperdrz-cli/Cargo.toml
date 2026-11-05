@@ -1,0 +1,18 @@
+[package]
+name = "whisperdrz-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transcribe and bench CLI for the native whisperdrz runtime"
+
+[[bin]]
+name = "whisperdrz-native"
+path = "src/main.rs"
+
+[dependencies]
+# the CLI drives the GPU runtime, so it always builds the CUDA host layer
+whisperdrz-native = { path = "../whisperdrz-native", features = ["cuda"] }
+color-eyre.workspace = true
+eyre.workspace = true
+serde_json.workspace = true
