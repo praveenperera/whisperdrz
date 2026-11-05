@@ -79,6 +79,25 @@ impl Row {
         self.ours.mean_abs <= MAX_RATIO * self.torch.mean_abs
     }
 
+    /// Ours over the max-abs bar
+    pub fn max_ratio(&self) -> f64 {
+        self.ours.max_abs / self.max_bar.max(f64::MIN_POSITIVE)
+    }
+
+    /// Ours over torch FP16's mean-abs
+    pub fn mean_ratio(&self) -> f64 {
+        self.ours.mean_abs / self.torch.mean_abs.max(f64::MIN_POSITIVE)
+    }
+
+    /// This row as a miss named `name`, judged on `check`'s bars
+    pub fn miss(&self, name: String, check: Check) -> Miss {
+        Miss {
+            name,
+            max_ratio: (check == Check::Full).then(|| self.max_ratio()),
+            mean_ratio: self.mean_ratio(),
+        }
+    }
+
     fn passes_check(&self, check: Check) -> bool {
         match check {
             Check::Full => self.passes(),
@@ -99,9 +118,25 @@ pub enum Check {
     Off,
 }
 
+/// A row past its bar, with ours over each bar its check asserts
+pub struct Miss {
+    pub name: String,
+    /// `None` where only the mean-abs bar is asserted
+    pub max_ratio: Option<f64>,
+    pub mean_ratio: f64,
+}
+
 /// Prints a table and returns the names of the rows that fail `check`; failing rows are
 /// marked, and a [`Check::Off`] table marks and returns none
 pub fn report(title: &str, rows: &[Row], check: Check) -> Vec<String> {
+    report_misses(title, rows, check)
+        .into_iter()
+        .map(|m| m.name)
+        .collect()
+}
+
+/// [`report`], returning each failing row as a [`Miss`] with its ratios
+pub fn report_misses(title: &str, rows: &[Row], check: Check) -> Vec<Miss> {
     println!("\n{title}");
     println!(
         "{:<12} {:>11} {:>11} {:>11} {:>6} {:>11} {:>11} {:>6}",
@@ -114,15 +149,15 @@ pub fn report(title: &str, rows: &[Row], check: Check) -> Vec<String> {
             r.ours.max_abs,
             r.torch.max_abs,
             r.max_bar,
-            r.ours.max_abs / r.max_bar,
+            r.max_ratio(),
             r.ours.mean_abs,
             r.torch.mean_abs,
-            r.ours.mean_abs / r.torch.mean_abs,
+            r.mean_ratio(),
             if r.passes_check(check) { "" } else { "  FAIL" }
         );
     }
     rows.iter()
         .filter(|r| !r.passes_check(check))
-        .map(|r| format!("{title}: {}", r.name))
+        .map(|r| r.miss(format!("{title}: {}", r.name), check))
         .collect()
 }

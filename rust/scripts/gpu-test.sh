@@ -45,8 +45,9 @@ export WHISPERDRZ_GPU=1
 export WHISPERDRZ_ENCODER_REF="${WHISPERDRZ_ENCODER_REF:-$HOME/.cache/whisperdrz/encoder-ref}"
 "$python" -I "$root/tools/encoder_layers.py" --src "$ref_src" --model "$WHISPERDRZ_WEIGHTS" "$WHISPERDRZ_ENCODER_REF"
 
-# decoder: torch per layer on the traced prefill and two decode steps, and the DTW forward
-# and prep on every recorded call (skips when its output is already there)
+# decoder: torch per layer on the traced prefill and five decode steps (5 rows down to 1),
+# and the DTW forward and prep on every recorded call (skips when its output is already
+# there)
 export WHISPERDRZ_DECODER_REF="${WHISPERDRZ_DECODER_REF:-$HOME/.cache/whisperdrz/decoder-ref}"
 "$python" -I "$root/tools/decoder_layers.py" --src "$ref_src" --model "$WHISPERDRZ_WEIGHTS" \
   --trace "$traces/short3" "$WHISPERDRZ_DECODER_REF"

@@ -3,16 +3,20 @@
 usage: decoder_layers.py --src SNAPSHOT_SRC --model CKPT --trace TRACE_SET_DIR OUT_DIR
 
 Decode (`tests/gpu_decoder.rs`): the first `prefill_flash` call of the trace set's first
-file (5 windows on slots 0..4, 7 prompt tokens each), then two decode steps on caches with
-a trash slot (5) as the padding fix sets them up:
+file (5 windows on slots 0..4, 7 prompt tokens each), then five decode steps on caches
+with a trash slot (5) as the padding fix sets them up, one of every bucket from 5 rows
+down to 1:
 
   step1  4 rows on slots [3, 0, 4, 1] at position 7, plus a padding row (token 0,
          position 0, trash slot)
   step2  3 rows on slots [2, 0, 4] at positions [7, 8, 8] (ragged cache lengths), plus a
          padding row
+  step3  2 rows on slots [1, 3] at position 8, plus a padding row
+  step4  1 row on slot 2 at position 8, plus a padding row
+  step5  1 row on slot 1 at position 9, no padding row
 
 Each step's tokens are torch FP16's argmax at the row's last position, fixed once so
-every run below sees the same inputs. Per phase (`prefill`, `step1`, `step2`) and layer
+every run below sees the same inputs. Per phase (`prefill`, `step1`..`step5`) and layer
 (`embed`, `block00`..`block31`, `ln`, `logits`):
 
   <phase>/f16_<name>.npy     torch FP16 as the transcriber runs it (flash-attn caches)
@@ -38,7 +42,7 @@ every run below sees the same inputs. Per phase (`prefill`, `step1`, `step2`) an
   sub/<phase>/bNN_<op>32.npy  the FP32 truth of each piece (h1, a, h2, c, h3, m) on torch
                              FP16's input to it
   <phase>/self_k.npy, self_v.npy, lens.npy   torch FP16's self-attention caches (positions
-                             0..8) and lengths before the phase, `[32, 6, 8, 1280]`
+                             0..9) and lengths before the phase, `[32, 6, 10, 1280]`
   <phase>/inputs.json        tokens, positions, slots
 
 DTW (`tests/gpu_dtw.rs`): every recorded `dtw_decoder_forward` call of every file, rerun
@@ -64,13 +68,17 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-VERSION = 4
+VERSION = 5
 N_SLOTS = 5
 TRASH = N_SLOTS
 SELF_CAP = 448
-KEEP = 8
+KEEP = 10
 STEP1_SLOTS = [3, 0, 4, 1]
 STEP2_SLOTS = [2, 0, 4]
+STEP3_SLOTS = [1, 3]
+STEP4_SLOTS = [2]
+STEP5_SLOTS = [1]
+PHASES = ("prefill", "step1", "step2", "step3", "step4", "step5")
 # the capture's bitwise check: a call with one short row keeps the dump small
 CAPTURE_CALL = ("nctdh", 365)
 
@@ -232,7 +240,7 @@ def main():
     xa16 = torch.from_numpy(array(args.trace, a["xa"])).cuda()
 
     def run(model, kind, tokens_of=None):
-        """Prefill and both steps; returns per-phase captures, logits and inputs"""
+        """Prefill and the steps; returns per-phase captures, logits and inputs"""
         dt = model.dtype
         self_kv, cross_kv = model.create_flash_kv(N_SLOTS + 1, max_tokens=SELF_CAP)
         xa = xa16.to(dt)
@@ -256,17 +264,20 @@ def main():
             }
             return logits
 
-        def step(name, real_slots, toks, poss):
+        def step(name, real_slots, toks, poss, pad=True):
             for kv in self_kv:
                 kv.seq_lens[TRASH] = 0
-            slots = real_slots + [TRASH]
-            tok = torch.tensor(toks + [0], device="cuda").view(-1, 1)
-            pos = torch.tensor(poss + [0], device="cuda")
+            # the padding row: token 0 at position 0 on the trash slot
+            extra = 1 if pad else 0
+            slots = real_slots + [TRASH] * extra
+            toks, poss = toks + [0] * extra, poss + [0] * extra
+            tok = torch.tensor(toks, device="cuda").view(-1, 1)
+            pos = torch.tensor(poss, device="cuda")
             sl = torch.tensor(slots, device="cuda")
             return phase(
                 name,
                 lambda: model.decoder.forward_flash(tok, self_kv, cross_kv, pos, slot_indices=sl),
-                slots, toks + [0], poss + [0],
+                slots, toks, poss,
             )
 
         def ctx():
@@ -299,7 +310,22 @@ def main():
                     toks2 = [first[2], nxt[0], nxt[4]]
                 else:
                     toks2 = tokens_of["step2"]
-                step("step2", STEP2_SLOTS, toks2, [T, T + 1, T + 1])
+                l2 = step("step2", STEP2_SLOTS, toks2, [T, T + 1, T + 1])
+                if tokens_of is None:
+                    toks3 = [nxt[1], nxt[3]]
+                else:
+                    toks3 = tokens_of["step3"]
+                l3 = step("step3", STEP3_SLOTS, toks3, [T + 1, T + 1])
+                if tokens_of is None:
+                    toks4 = [l2[0, -1].argmax(-1).item()]
+                else:
+                    toks4 = tokens_of["step4"]
+                step("step4", STEP4_SLOTS, toks4, [T + 1])
+                if tokens_of is None:
+                    toks5 = [l3[0, -1].argmax(-1).item()]
+                else:
+                    toks5 = tokens_of["step5"]
+                step("step5", STEP5_SLOTS, toks5, [T + 2], pad=False)
         finally:
             undo()
             undo_sdpa()
@@ -315,7 +341,11 @@ def main():
     got = runs["f16"]["prefill"]["out"]["logits"].reshape(recorded.shape).cpu().numpy()
     prefill_differs = int((got.view(np.uint16) != recorded.view(np.uint16)).sum())
     print(f"prefill logits rerun vs recorded: {prefill_differs} values differ")
-    fixed = {p: runs["f16"][p]["tokens"][:-1] for p in ("step1", "step2")}
+    # the real rows' tokens, which lead the padding row's
+    fixed = {
+        p: runs["f16"][p]["tokens"][: sum(s != TRASH for s in runs["f16"][p]["slots"])]
+        for p in PHASES[1:]
+    }
     for kind, model in (("f16qkv", m16), ("f16sdpa", m16), ("f16eff", m16), ("f32", m32)):
         runs[kind], _, _ = run(model, kind, fixed)
 
@@ -323,7 +353,7 @@ def main():
         "version": VERSION, "stem": stem, "seq": ev["seq"], "names": names, "phases": {},
         "prefill_differs": prefill_differs, "timing": "timing.npy",
     }
-    for p in ("prefill", "step1", "step2"):
+    for p in PHASES:
         ref = runs["f16"][p]
         for kind in runs:
             assert runs[kind][p]["tokens"] == ref["tokens"], (kind, p)
@@ -343,7 +373,7 @@ def main():
     sub_in = {}
     manifest["sub_differs"] = {}
     with torch.inference_mode():
-        for p in ("prefill", "step1", "step2"):
+        for p in PHASES:
             ref = runs["f16"][p]
             st = ref["state"]
             sl = torch.tensor(ref["slots"], device="cuda")
@@ -387,7 +417,7 @@ def main():
                 slots0,
             )
             cross32.append(kv)
-        for p in ("prefill", "step1", "step2"):
+        for p in PHASES:
             ref = runs["f16"][p]
             st = ref["state"]
             sl = torch.tensor(ref["slots"], device="cuda")
@@ -433,7 +463,7 @@ def main():
     # the same isolated layers in torch FP16 on the memory-efficient backend, against
     # copies of its caches (decode steps write into the self cache)
     with torch.inference_mode(), sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION]):
-        for p in ("prefill", "step1", "step2"):
+        for p in PHASES:
             ref = runs["f16"][p]
             st = ref["state"]
             sl = torch.tensor(ref["slots"], device="cuda")
