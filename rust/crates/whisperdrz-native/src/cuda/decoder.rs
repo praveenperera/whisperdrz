@@ -59,7 +59,7 @@
 //! transcriber can download them behind an event and run the host DTW off the decode
 //! loop's critical path
 
-use eyre::{Result, ensure, eyre};
+use eyre::{Result, WrapErr, ensure, eyre};
 use half::f16;
 
 use super::decoder_attn::{self, Batch, CrossKv, DecoderAttn, KvCaches, Rows};
@@ -924,13 +924,10 @@ impl Decoder {
             batch.actual_lens
         );
         let last = ALIGNMENT_HEADS.iter().map(|&(l, _)| l).max().unwrap_or(0);
-        for &s in slots {
-            ensure!(
-                s < caches.slots() && caches.cross_from_xa(s, last + 1),
-                "DTW row on slot {s}, whose cross keys and values aren't the prefill of its \
-                 current encoder output"
-            );
-        }
+        // `gpu` may run on another stream than the caches; the lease orders the two
+        let lease = caches
+            .lend_cross(gpu, slots, last + 1)
+            .wrap_err("DTW forward")?;
 
         // the shortest row runs last, so the row-wise ops (GEMMs, LayerNorms, GELU) stop
         // at its last real token: `n` of the `full` padded token rows. Attention keeps the
@@ -994,7 +991,7 @@ impl Decoder {
                 if l == li {
                     let keys = slots
                         .iter()
-                        .map(|&slot| caches.cross_slot(li, slot).map(|(k, _)| k))
+                        .map(|&slot| lease.cross_slot(li, slot).map(|(k, _)| k))
                         .collect::<Result<Vec<_>>>()?;
                     capture.gather(gpu, s, qkv.ptr(), &keys, head)?;
                 }
@@ -1004,7 +1001,7 @@ impl Decoder {
             }
 
             for run in &runs {
-                let (k, v) = caches.cross_slot(li, slots[run.first])?;
+                let (k, v) = lease.cross_slot(li, slots[run.first])?;
                 let cached = |ptr: u64| HeadView {
                     ptr,
                     len: (run.rows - 1) * run.stride * SLOT_ELEMS + SLOT_ELEMS,
@@ -1033,6 +1030,8 @@ impl Decoder {
                 .add_apply(gpu, x.ptr(), ao.ptr(), h.ptr(), n)?;
         }
 
+        // every read of the caches is queued: the slots' next writes may go once it runs
+        drop(lease);
         let mut scores = capture.scores(gpu, blas)?;
         scores.order = order;
         Ok(scores)

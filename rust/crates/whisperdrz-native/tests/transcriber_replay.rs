@@ -641,12 +641,18 @@ struct FakeModel(Rc<RefCell<Replay>>);
 /// Recorded matrices that claim to still be on their way
 struct InFlight(Matrices);
 
+/// How long the fake DTW thread waits for its matrices: long against a replayed decode
+/// step, so the texts land several steps after their launch, as on a GPU whose forward
+/// runs beside the steps, and the scheduler's joins on demand are what keeps them exact
+const IN_FLIGHT: std::time::Duration = std::time::Duration::from_millis(3);
+
 impl DtwMatrices for InFlight {
     fn ready(&self) -> bool {
         false
     }
 
     fn wait(&mut self) -> Result<MatricesView<'_>> {
+        std::thread::sleep(IN_FLIGHT);
         Ok(self.0.view())
     }
 }
@@ -1094,7 +1100,7 @@ fn replay_e21c600() -> Result<()> {
 
 /// The deferred alignment path (a GPU model's): each window's state moves on before
 /// its DTW lands, and the texts and results, checked against the reference's, follow
-/// from a helper thread at the next decode step
+/// from a helper thread some decode steps later
 #[test]
 fn replay_short3_deferred_dtw() -> Result<()> {
     replay_with("short3", Config::default(), true)

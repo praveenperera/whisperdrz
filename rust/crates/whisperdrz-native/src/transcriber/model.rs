@@ -190,10 +190,11 @@ pub trait Model {
     /// cross-attention capture on the alignment heads, then `_dtw_prep_batch`
     fn dtw_prep(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Matrices>;
 
-    /// [`Model::dtw_prep`] queued: the GPU work goes on the stream where `dtw_prep`
-    /// would run it, so later calls (such as the next window's encode over the same
-    /// slots) queue behind it, and the matrices arrive while the caller goes on. A
-    /// model that can't queue it runs `dtw_prep` and returns its result
+    /// [`Model::dtw_prep`] queued, and the matrices arrive while the caller goes on. The
+    /// model orders later calls that overwrite what the forward reads (the next
+    /// window's encode and prefill over the same slots) after its reads, on whatever
+    /// stream it runs them; the caller only has to wait on the result before using it.
+    /// A model that can't queue it runs `dtw_prep` and returns its result
     fn dtw_launch(&mut self, batch: &DtwBatch, xa_slots: &[usize]) -> Result<Box<dyn DtwMatrices>> {
         Ok(Box::new(ReadyMatrices(self.dtw_prep(batch, xa_slots)?)))
     }

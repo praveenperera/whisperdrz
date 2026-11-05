@@ -22,7 +22,10 @@
 //! `dtw_cached_kv_matches_projection` runs the whole forward and prep on cached keys and
 //! values against the reference's projection, bit for bit, over slot patterns that
 //! exercise every launch grouping (`WHISPERDRZ_GPU=1`, the second also
-//! `WHISPERDRZ_WEIGHTS`). Run through the GPU queue with `rust/scripts/gpu-test.sh`
+//! `WHISPERDRZ_WEIGHTS`). `dtw_side_stream_is_fenced` runs the forward on a second stream
+//! between a prefill and the next one into the same slots, queued with no host wait, and
+//! wants the same bits as the forward on the caches' own stream. Run through the GPU queue
+//! with `rust/scripts/gpu-test.sh`
 #![cfg(feature = "cuda")]
 
 #[allow(dead_code)]
@@ -43,7 +46,7 @@ use whisperdrz_native::cuda::decoder::{
     ALIGNMENT_HEADS, D_MODEL, DtwCapture, DtwScores, N_AUDIO_CTX, N_LAYER, Workspace,
 };
 use whisperdrz_native::cuda::decoder_attn::XA_BYTES;
-use whisperdrz_native::cuda::{Blas, Buf, Decoder, Gpu, KvCaches, Weights};
+use whisperdrz_native::cuda::{Blas, Buf, Decoder, Gpu, KvCaches, Priority, Weights};
 use whisperdrz_native::dtw::{DtwBatch, DtwOptions, Matrices, PreparedBatch, TokenizerDtw};
 use whisperdrz_native::text::Tokenizer;
 
@@ -915,6 +918,83 @@ fn dtw_cached_kv_matches_projection() -> Result<()> {
     ensure!(
         !caches.cross_from_xa(4, 1),
         "slot 4 claims cross keys from its current encoder output"
+    );
+    Ok(())
+}
+
+/// The DTW forward on another stream, as the transcriber queues it: a prefill of window
+/// set A into slots, the forward on a second handle and a prefill of window set B into
+/// the same slots, all queued with no host wait. The lease must order the forward after
+/// A's keys land and B's prefill after the forward's reads, so the scores match the
+/// forward on the caches' own stream bit for bit. Each round also queues B's encoder
+/// output copy first thing, which `store_xa` fences too
+#[test]
+fn dtw_side_stream_is_fenced() -> Result<()> {
+    let Some((gpu, blas)) = gpu_only()? else {
+        return Ok(());
+    };
+    let Some(weights) = std::env::var_os("WHISPERDRZ_WEIGHTS").map(PathBuf::from) else {
+        eprintln!("skipping: WHISPERDRZ_WEIGHTS not set (run scripts/gpu-test.sh)");
+        return Ok(());
+    };
+    let mut w = Weights::load(&gpu, &weights, |n| n.starts_with("decoder."))?;
+    let decoder = Decoder::new(&gpu, &mut w)?;
+    let side = Gpu::with_priority(0, Priority::Mid)?;
+    let side_blas = Blas::new(&side)?;
+
+    let slots = [1usize, 2];
+    let mut rng = Rng::new(0x51de_57a3);
+    let window_set = |rng: &mut Rng| -> Result<Buf> {
+        gpu.upload(rng.f16_normal(slots.len() * WINDOW, 0.0, 1.0))
+    };
+    let (a, b) = (window_set(&mut rng)?, window_set(&mut rng)?);
+    let ws = Workspace::new(&gpu, 1, 1, slots.len())?;
+    let batch = DtwBatch {
+        slots: slots.to_vec(),
+        ..random_batch(&mut rng, &slots, 300)
+    };
+
+    // A's scores on the caches' own stream
+    let reference = KvCaches::new(&gpu, N_LAYER, 4)?;
+    decoder.fill_cross(&gpu, &blas, &reference, &ws, a.ptr(), &slots)?;
+    let want = decoder
+        .dtw_scores(&gpu, &blas, &reference, &batch, &slots)?
+        .download(&gpu)?;
+    ensure!(
+        want.iter().all(|v| v.is_finite()),
+        "non-finite reference scores"
+    );
+
+    let caches = KvCaches::new(&gpu, N_LAYER, 4)?;
+    decoder.fill_cross(&gpu, &blas, &caches, &ws, b.ptr(), &slots)?;
+    gpu.synchronize()?;
+    for round in 0..4 {
+        decoder.fill_cross(&gpu, &blas, &caches, &ws, a.ptr(), &slots)?;
+        let got = decoder.dtw_scores(&side, &side_blas, &caches, &batch, &slots)?;
+        decoder.fill_cross(&gpu, &blas, &caches, &ws, b.ptr(), &slots)?;
+        let got = got.download(&side)?;
+        gpu.synchronize()?;
+        ensure!(
+            got.len() == want.len(),
+            "round {round}: {} scores, want {}",
+            got.len(),
+            want.len()
+        );
+        let d = got
+            .iter()
+            .zip(&want)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        ensure!(
+            d == 0,
+            "round {round}: {d} of {} side-stream scores differ from the same-stream forward",
+            want.len()
+        );
+    }
+
+    println!(
+        "side-stream DTW over slots {slots:?}: {} scores bit for bit in 4 rounds",
+        want.len()
     );
     Ok(())
 }

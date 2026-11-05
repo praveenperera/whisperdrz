@@ -1,13 +1,15 @@
 //! One CUDA context and stream, buffers from a private memory pool, and launches of the
 //! embedded cuda-oxide PTX
 //!
-//! Everything runs on one stream, so buffers carry no event tracking and every step can
-//! be captured into a CUDA graph. Each buffer holds an `Arc` of the shared [`Device`],
-//! so the stream, pool and context outlive every allocation whatever order owners drop in
+//! Each handle runs on one stream, so its buffers carry no event tracking and every step
+//! can be captured into a CUDA graph. Each buffer holds an `Arc` of the shared
+//! [`Device`], so the stream, pool and context outlive every allocation whatever order
+//! owners drop in. Handles on other streams order against each other only through the
+//! explicit [`Gpu::wait_for`] and [`Gpu::wait_event`]
 
 use std::any::Any;
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CString, c_void};
 use std::sync::Arc;
 
@@ -197,6 +199,10 @@ pub enum Priority {
     Default,
     /// The greatest priority the context offers, for latency-bound work
     High,
+    /// One step below [`Priority::High`] (the lowest if the context offers only two), for
+    /// throughput work that should fill the gaps latency-bound work leaves before
+    /// [`Priority::Background`] work does
+    Mid,
     /// The lowest priority, with host waits that sleep rather than spin, so a helper
     /// thread waiting on the GPU leaves its core to the host work beside it
     Background,
@@ -214,8 +220,7 @@ pub struct Gpu {
     /// Dynamic shared memory a block may opt into, in bytes
     smem_optin: usize,
     /// Host sources of asynchronous uploads, kept until the stream next synchronizes
-    pending: RefCell<Vec<Box<dyn Any + Send>>>,
-    pending_bytes: Cell<usize>,
+    pending: RefCell<PendingUploads>,
     /// A blocking-sync event that [`Gpu::synchronize`] waits on instead of the stream,
     /// for [`Priority::Background`]
     sleep_event: Option<cu::CUevent>,
@@ -254,6 +259,8 @@ impl Gpu {
         let stream = match priority {
             Priority::Default => ctx.new_stream()?,
             Priority::High => ctx.new_stream_with_priority(greatest)?,
+            // numerically lower is higher priority, so one step down is `greatest + 1`
+            Priority::Mid => ctx.new_stream_with_priority((greatest + 1).min(least))?,
             Priority::Background => ctx.new_stream_with_priority(least)?,
         };
         let sleep_event = match priority {
@@ -276,7 +283,6 @@ impl Gpu {
             cc: (major, minor),
             smem_optin,
             pending: RefCell::default(),
-            pending_bytes: Cell::new(0),
             sleep_event,
         })
     }
@@ -299,6 +305,91 @@ impl Gpu {
         self.device.stream.cu_stream()
     }
 
+    /// This handle's stream, for another handle to order its work against
+    pub fn stream_ref(&self) -> StreamRef {
+        StreamRef(self.device.clone())
+    }
+
+    /// Whether `other` is this handle's own stream, so its work is already in order
+    pub fn is_stream(&self, other: &StreamRef) -> bool {
+        Arc::ptr_eq(&self.device, &other.0)
+    }
+
+    /// Makes work queued on this stream from now on wait for everything queued on
+    /// `other` so far; neither the host nor `other` waits
+    pub fn wait_for(&self, other: &StreamRef) -> Result<()> {
+        if self.is_stream(other) {
+            return Ok(());
+        }
+
+        let event = cur::event::create(cu::CUevent_flags::CU_EVENT_DISABLE_TIMING)?;
+        // SAFETY: both streams belong to this context. The wait takes the event's state at
+        // the call, so destroying it right after is allowed (the driver frees it once
+        // the record completes)
+        let waited = unsafe {
+            cur::event::record(event, other.0.stream.cu_stream()).and_then(|()| {
+                cur::stream::wait_event(
+                    self.cu_stream(),
+                    event,
+                    cu::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                )
+            })
+        };
+        unsafe {
+            let _ = cur::event::destroy(event);
+        }
+        waited?;
+        Ok(())
+    }
+
+    /// Records `event` on this stream: it completes once the work queued so far has
+    pub fn record(&self, event: &Event) -> Result<()> {
+        // SAFETY: the event belongs to this context and lives until it drops
+        unsafe { cur::event::record(event.event, self.cu_stream())? };
+        Ok(())
+    }
+
+    /// Makes work queued on this stream from now on wait until `event`, recorded on any
+    /// handle's stream, completes; the host doesn't wait
+    pub fn wait_event(&self, event: &Event) -> Result<()> {
+        // SAFETY: as in `record`
+        unsafe {
+            cur::stream::wait_event(
+                self.cu_stream(),
+                event.event,
+                cu::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )?
+        };
+        Ok(())
+    }
+
+    /// Records the point on this stream that [`Gpu::release_uploads`] later frees the
+    /// uploads before
+    pub fn upload_mark(&self) -> Result<UploadMark> {
+        let event = self.event()?;
+        self.record(&event)?;
+        Ok(UploadMark {
+            event,
+            seq: self.pending.borrow().queued(),
+        })
+    }
+
+    /// Drops the host sources of the uploads queued before `mark` once the stream has
+    /// passed it, which [`Gpu::synchronize`] would otherwise do, for a handle that never
+    /// synchronizes. Uploads queued after the mark stay. Returns whether it had passed
+    pub fn release_uploads(&self, mark: &UploadMark) -> Result<bool> {
+        ensure!(
+            Arc::ptr_eq(&mark.event.device, &self.device),
+            "upload release on another handle's mark"
+        );
+        if !mark.event.query()? {
+            return Ok(false);
+        }
+
+        self.pending.borrow_mut().release_through(mark.seq);
+        Ok(true)
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         match self.sleep_event {
             // SAFETY: the event belongs to this handle and lives until it drops
@@ -308,8 +399,7 @@ impl Gpu {
             },
             None => self.device.stream.synchronize()?,
         }
-        self.pending.borrow_mut().clear();
-        self.pending_bytes.set(0);
+        self.pending.borrow_mut().release_all();
         Ok(())
     }
 
@@ -381,10 +471,9 @@ impl Gpu {
         }
 
         unsafe { cur::memcpy_htod_async(buf.ptr, bytes, self.cu_stream())? };
-        self.pending_bytes
-            .set(self.pending_bytes.get() + bytes.len());
-        self.pending.borrow_mut().push(Box::new(host));
-        if self.pending_bytes.get() > PENDING_LIMIT {
+        let len = bytes.len();
+        let over = self.pending.borrow_mut().push(Box::new(host), len) > PENDING_LIMIT;
+        if over {
             self.synchronize()?;
         }
 
@@ -648,6 +737,56 @@ impl Drop for HostBuf {
         }
     }
 }
+
+/// Host sources of a handle's queued uploads, oldest first
+#[derive(Default)]
+struct PendingUploads {
+    sources: VecDeque<(Box<dyn Any + Send>, usize)>,
+    bytes: usize,
+    /// Sources released so far, so `released + sources.len()` numbers every upload ever
+    /// queued and a mark stays valid across a synchronize that releases everything
+    released: u64,
+}
+
+impl PendingUploads {
+    /// Uploads queued so far
+    fn queued(&self) -> u64 {
+        self.released + self.sources.len() as u64
+    }
+
+    /// Keeps `source` until the stream passes its copy; returns the bytes now held
+    fn push(&mut self, source: Box<dyn Any + Send>, bytes: usize) -> usize {
+        self.sources.push_back((source, bytes));
+        self.bytes += bytes;
+        self.bytes
+    }
+
+    /// Drops the sources of the first `seq` uploads ever queued
+    fn release_through(&mut self, seq: u64) {
+        while self.released < seq
+            && let Some((_, bytes)) = self.sources.pop_front()
+        {
+            self.bytes -= bytes;
+            self.released += 1;
+        }
+    }
+
+    fn release_all(&mut self) {
+        self.release_through(self.queued());
+    }
+}
+
+/// A point on a [`Gpu`] handle's stream from [`Gpu::upload_mark`]: the uploads queued
+/// before it can go once the stream passes it
+pub struct UploadMark {
+    event: Event,
+    seq: u64,
+}
+
+/// Another [`Gpu`] handle's stream, from [`Gpu::stream_ref`]: something to order
+/// against with [`Gpu::wait_for`], not to queue work on
+#[derive(Clone)]
+pub struct StreamRef(Arc<Device>);
 
 /// A CUDA event without timing, recorded on a [`Gpu`]'s stream
 pub struct Event {

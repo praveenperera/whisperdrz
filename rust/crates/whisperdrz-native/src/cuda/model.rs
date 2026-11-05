@@ -9,6 +9,12 @@
 //! prefill computed from it, which the DTW forward reads per row. Prefill runs on the encoder's contiguous output for the batch it just encoded,
 //! as the reference passes `xa` straight from `model.encoder` to `prefill_flash`, so the
 //! cross K/V GEMMs see torch's row count
+//!
+//! Three streams share the GPU. The decoder's runs at the highest priority. The queued DTW
+//! forward ([`GpuModel::dtw_launch`]) runs on a handle of its own one step below, so it
+//! fills the SMs the latency-bound decode steps leave instead of stalling them, ordered
+//! against the caches by the [`CrossLease`](super::decoder_attn::CrossLease) it reads
+//! through. ECAPA2 runs at the lowest priority
 
 use std::cell::Cell;
 use std::path::Path;
@@ -22,7 +28,7 @@ use super::decoder_attn::{Batch, DecoderAttn, KvCaches, XA_BYTES};
 use super::ecapa2::Precision;
 use super::embedder::Embedder;
 use super::encoder::{N_FRAMES, N_MELS, Workspace};
-use super::{Blas, Buf, Encoder, Event, Gpu, HostBuf, Priority, Weights, nvtx};
+use super::{Blas, Buf, Encoder, Event, Gpu, HostBuf, Priority, UploadMark, Weights, nvtx};
 use crate::dtw::{DtwBatch, Matrices, MatricesView};
 use crate::speaker::EMBED_DIM;
 use crate::transcriber::{
@@ -40,10 +46,15 @@ struct Encoded {
     slots: Vec<usize>,
 }
 
-/// Every GPU stage the transcriber calls, on one device and stream
+/// Every GPU stage the transcriber calls, on one device
 pub struct GpuModel {
     gpu: Gpu,
     blas: Blas,
+    /// The queued DTW forward's stream, pool and cuBLAS handles
+    dtw_gpu: Gpu,
+    dtw_blas: Blas,
+    /// Marked after the last queued DTW forward's uploads, to free their host copies
+    dtw_uploaded: Option<UploadMark>,
     encoder: Encoder,
     enc_ws: Workspace,
     decoder: Decoder,
@@ -64,9 +75,17 @@ pub struct GpuModel {
     /// per [`STEP_CHUNK_ROWS`] rows of it
     step_host: HostBuf,
     step_events: Vec<Event>,
-    /// Page-locked buffers the DTW matrices download into, back here once their batch
-    /// is aligned
+    /// Page-locked buffers of `dtw_gpu` the DTW matrices download into, back here once
+    /// their batch is aligned
     dtw_host: Arc<Mutex<Vec<HostBuf>>>,
+}
+
+impl Drop for GpuModel {
+    fn drop(&mut self) {
+        // a queued DTW forward reads the decoder's weights and caches, which drop with the
+        // fields after this
+        let _ = self.dtw_gpu.synchronize();
+    }
 }
 
 impl GpuModel {
@@ -87,6 +106,10 @@ impl GpuModel {
         // decoder's idle time instead of delaying its steps
         let gpu = Gpu::with_priority(0, Priority::High)?;
         let blas = Blas::new(&gpu)?;
+        // below the decoder, so a queued forward takes the SMs a step leaves rather than
+        // delaying it, and above the embedder, since the next step's join waits for it
+        let dtw_gpu = Gpu::with_priority(0, Priority::Mid)?;
+        let dtw_blas = Blas::new(&dtw_gpu)?;
         let mut weights = Weights::load(&gpu, whisper, |name| !name.starts_with("speaker_head"))?;
         let encoder = Encoder::new(&gpu, &mut weights)?;
         let decoder = Decoder::new(&gpu, &mut weights)?;
@@ -115,6 +138,9 @@ impl GpuModel {
             encoder,
             blas,
             gpu,
+            dtw_blas,
+            dtw_gpu,
+            dtw_uploaded: None,
         })
     }
 
@@ -299,16 +325,31 @@ impl GpuModel {
             .dtw_prep(&self.gpu, &self.blas, &self.caches, batch, xa_slots)
     }
 
-    /// [`GpuModel::dtw_prep`] queued: the forward and prep go on the stream, then a copy
-    /// of the matrices into page-locked memory, which lands while the host goes on
+    /// [`GpuModel::dtw_prep`] queued on the DTW stream: the forward and prep, then a copy
+    /// of the matrices into page-locked memory, which lands while the host and the
+    /// decoder's stream go on. The forward starts after the work queued on the decoder's
+    /// stream so far, and the slots' next prefill waits for its reads
     pub fn dtw_launch(
         &mut self,
         batch: &DtwBatch,
         xa_slots: &[usize],
     ) -> Result<Box<dyn DtwMatrices>> {
-        let (out, shape) =
-            self.decoder
-                .dtw_prep_queued(&self.gpu, &self.blas, &self.caches, batch, xa_slots)?;
+        // the handle never synchronizes, so the uploads' host copies go once a later
+        // event shows the stream past them
+        if let Some(uploaded) = &self.dtw_uploaded
+            && self.dtw_gpu.release_uploads(uploaded)?
+        {
+            self.dtw_uploaded = None;
+        }
+
+        let (out, shape) = self.decoder.dtw_prep_queued(
+            &self.dtw_gpu,
+            &self.dtw_blas,
+            &self.caches,
+            batch,
+            xa_slots,
+        )?;
+        self.dtw_uploaded = Some(self.dtw_gpu.upload_mark()?);
         let bytes = out.bytes();
         if bytes == 0 {
             // no audio column anywhere: nothing to copy
@@ -319,8 +360,9 @@ impl GpuModel {
         }
 
         let host = self.dtw_host_buf(bytes)?;
-        let done = self.gpu.sleeping_event()?;
-        self.gpu.download_async(&out, 0, &host, 0, bytes, &done)?;
+        let done = self.dtw_gpu.sleeping_event()?;
+        self.dtw_gpu
+            .download_async(&out, 0, &host, 0, bytes, &done)?;
         Ok(Box::new(QueuedMatrices {
             host: Some(host),
             done,
@@ -338,7 +380,8 @@ impl GpuModel {
         }
 
         drop(pool);
-        self.gpu.alloc_host(bytes.next_power_of_two().max(1 << 20))
+        self.dtw_gpu
+            .alloc_host(bytes.next_power_of_two().max(1 << 20))
     }
 
     /// The last position's logits of the first `rows` rows of the last prefill or step

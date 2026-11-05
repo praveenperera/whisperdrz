@@ -415,10 +415,41 @@ impl<M: Model> Transcriber<M> {
         Ok(())
     }
 
+    /// [`Self::resolve_align`] if the queued alignment's thread is done, without waiting
+    pub(crate) fn resolve_align_if_done(&mut self) -> Result<()> {
+        if self
+            .align_pending
+            .as_ref()
+            .is_some_and(PendingAlign::finished)
+        {
+            self.resolve_align()?;
+        }
+
+        Ok(())
+    }
+
+    /// Whether the queued alignment, if any, will write slot `slot`'s text
+    pub(crate) fn align_pending_on(&self, slot: usize) -> bool {
+        self.align_pending
+            .as_ref()
+            .is_some_and(|p| p.batch.entries.iter().any(|&(_, s)| s == slot))
+    }
+
     /// Settles any queued alignment and hands its finished chunks to the crop planner
     /// and `completed`
     pub(crate) fn settle_align(&mut self, completed: &mut Vec<ChunkResult>) -> Result<()> {
         self.resolve_align()?;
+        self.hand_over_resolved(completed)
+    }
+
+    /// [`Self::settle_align`] only if that needs no wait: the alignment's thread is done,
+    /// or nothing is queued
+    pub(crate) fn settle_align_if_done(&mut self, completed: &mut Vec<ChunkResult>) -> Result<()> {
+        self.resolve_align_if_done()?;
+        self.hand_over_resolved(completed)
+    }
+
+    fn hand_over_resolved(&mut self, completed: &mut Vec<ChunkResult>) -> Result<()> {
         for r in std::mem::take(&mut self.resolved) {
             self.plan_crops(&r)?;
             completed.push(r);
@@ -797,6 +828,11 @@ struct AlignBatch {
 }
 
 impl PendingAlign {
+    /// Whether the DTW thread is done, so [`PendingAlign::join`] won't wait
+    pub(crate) fn finished(&self) -> bool {
+        self.worker.is_finished()
+    }
+
     /// Waits for the DTW thread
     pub(crate) fn join(self) -> Result<JoinedAlign> {
         let _range = trace::Range::new("dtw_wait");

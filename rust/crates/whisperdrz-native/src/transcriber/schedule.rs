@@ -82,7 +82,13 @@ fn finish_rows(
 
 impl<M: Model> Transcriber<M> {
     fn is_active(&self, slot: usize) -> bool {
-        matches!(self.slots[slot].status(), Status::Started | Status::Process)
+        // `Finished` lasts only until the same step's alignment prep moves the slot to
+        // `Ready`, unless a deferred alignment's error cut the step short; the retry must
+        // still align it, or `flush` would spin on a slot nothing schedules
+        matches!(
+            self.slots[slot].status(),
+            Status::Started | Status::Process | Status::Finished
+        )
     }
 
     /// `_init_slot(slot_idx, chunk)`: resets the slot, computes the chunk's mel once
@@ -369,6 +375,13 @@ impl<M: Model> Transcriber<M> {
                 && s.state.language != "en"
                 && !matches!(s.state.status, Status::Finished | Status::Ready)
             {
+                // a queued window's text lands before the clear, as it would have had
+                // the alignment joined before this step's updates
+                if self.align_pending_on(slot_idx) {
+                    self.resolve_align()?;
+                }
+
+                let s = &mut self.slots[slot_idx];
                 s.state.status = Status::Finished;
                 s.state.stop_reason = Some(format!("skip_non_english:{}", s.state.language));
                 s.sofar.clear();
@@ -443,13 +456,11 @@ impl<M: Model> Transcriber<M> {
         logits.complete()?;
         drop(logits);
         drop(host);
-        // the last alignment's DTW thread ran its DP while the GPU finished the DTW
-        // forward and this step (queued behind it), so the join comes after the logits;
-        // its texts go in before this step's updates, which may clear a slot's text
-        if let Some(pending) = self.align_pending.take() {
-            let aligned = pending.join()?;
-            self.apply_align(aligned)?;
-        }
+        // the last alignment's forward runs on its own stream beside the steps, so its
+        // texts go in once its thread is done, without a wait. Until then nothing reads
+        // or writes the slots' texts: the next alignment settles it first, and the
+        // non-English stop in `update_after_decode` waits for it before clearing one
+        self.resolve_align_if_done()?;
 
         for &s in decode_slots {
             self.kv_lens[s] += 1;
@@ -566,8 +577,16 @@ impl<M: Model> Transcriber<M> {
                 self.decode_step(&decode_slots)?;
             }
 
-            // a queued alignment lands before the next window ends
-            self.settle_align(&mut completed)?;
+            // a queued alignment lands before the next window ends: waited for when a
+            // slot is about to align (its text reads the slot's), taken if done otherwise
+            let aligning = active
+                .iter()
+                .any(|&i| matches!(self.slots[i].status(), Status::Process | Status::Finished));
+            if aligning {
+                self.settle_align(&mut completed)?;
+            } else {
+                self.settle_align_if_done(&mut completed)?;
+            }
 
             let align_prep = trace::Range::new("align_prep");
             let mut pending_align = Vec::new();

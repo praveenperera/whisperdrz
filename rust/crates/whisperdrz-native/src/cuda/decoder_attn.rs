@@ -36,15 +36,26 @@
 //! launches on the one stream, with no allocation, synchronization or host read, so a
 //! decode step can be captured into a CUDA graph per bucket. The path and the split count
 //! depend only on the row count, the tokens per row and the SM count, which a bucket fixes
+//!
+//! # Readers on another stream
+//!
+//! The DTW forward reads slots' cross keys and values on a stream of its own, so it
+//! overlaps the decode steps. It takes them through a [`CrossLease`]
+//! ([`KvCaches::lend_cross`]), which orders its stream after the caches' own and, when
+//! it drops, leaves an event per slot. Every write of a slot's encoder output or cross
+//! keys and values ([`KvCaches::store_xa`], [`KvCaches::fill_cross`]) first makes its
+//! stream wait on those events, so the next window's prefill can't overwrite keys a
+//! queued forward still reads. Lengths and self-attention caches aren't fenced: the
+//! forward doesn't read them
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use eyre::{Result, ensure};
 
 use super::Blas;
 use super::blas::{BatchedKey, Strided};
-use super::device::{Arg, Buf, Gpu, blocks};
+use super::device::{Arg, Buf, Event, Gpu, StreamRef, blocks};
 
 /// Rows from which a decode step (one token a row) runs the absorbed cross-attention
 ///
@@ -303,6 +314,11 @@ pub struct KvCaches {
     /// Per layer and slot, the `xa_gen` its cross keys and values were computed from, so
     /// the DTW forward can check it reads the prefill of the window it aligns
     cross_gen: Vec<Cell<u64>>,
+    /// The stream the caches are written on, which a [`CrossLease`]'s reader waits for
+    owner: StreamRef,
+    /// Per slot, events after reads that [`CrossLease`]s queued on other streams; the
+    /// slot's next write waits on them
+    readers: RefCell<Vec<Vec<Event>>>,
 }
 
 /// Last encoder-output generation handed out; process-wide, so a [`StoredXa`] from one
@@ -351,7 +367,67 @@ impl KvCaches {
             lens: gpu.zeros(n * 4)?,
             xa_gen: vec![Cell::new(0); n],
             cross_gen: vec![Cell::new(0); layers * n],
+            owner: gpu.stream_ref(),
+            readers: RefCell::new((0..n).map(|_| Vec::new()).collect()),
         })
+    }
+
+    /// Lends the cross keys and values of layers below `layers` of `slots` to work that
+    /// `reader` queues next, on its own stream or another. Errors unless every slot
+    /// holds the prefill of its current encoder output ([`KvCaches::cross_from_xa`]).
+    /// From another stream, `reader` first waits for everything queued on the caches'
+    /// stream, and the slots' next writes wait for the reads queued while the lease lives
+    pub fn lend_cross<'a>(
+        &'a self,
+        reader: &'a Gpu,
+        slots: &[usize],
+        layers: usize,
+    ) -> Result<CrossLease<'a>> {
+        for &s in slots {
+            ensure!(
+                s < self.slots && self.cross_from_xa(s, layers),
+                "cross keys and values of slot {s} lent, but they aren't the prefill of its \
+                 current encoder output"
+            );
+        }
+
+        let mut unique = slots.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        let side = !reader.is_stream(&self.owner);
+        let done = if side {
+            reader.wait_for(&self.owner)?;
+            unique
+                .iter()
+                .map(|_| reader.event())
+                .collect::<Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(CrossLease {
+            caches: self,
+            reader,
+            slots: unique,
+            layers,
+            done,
+        })
+    }
+
+    /// Makes `gpu`'s stream wait for the reads other streams queued on `slots`
+    fn wait_readers(&self, gpu: &Gpu, slots: &[usize]) -> Result<()> {
+        let mut readers = self.readers.borrow_mut();
+        for &s in slots {
+            let Some(events) = readers.get_mut(s) else {
+                continue;
+            };
+            for event in events.iter() {
+                gpu.wait_event(event)?;
+            }
+
+            events.clear();
+        }
+
+        Ok(())
     }
 
     pub fn layers(&self) -> usize {
@@ -457,6 +533,8 @@ impl KvCaches {
         let (xa, slots) = (src.xa, src.slots);
         let windows = slots.len();
         ensure!(windows > 0, "fill_cross with no windows");
+        // `store_xa` already waited, unless a lease was taken since
+        self.wait_readers(gpu, slots)?;
         ensure!(
             slots.iter().all(|&s| s < self.slots),
             "fill_cross slots {slots:?} outside the {} real slots",
@@ -537,6 +615,9 @@ impl KvCaches {
             "encoder outputs for slots {slots:?} outside the {} real slots",
             self.slots
         );
+        // a new encoder output starts the slot's next window: queued DTW reads of its
+        // cross keys and values must finish before `fill_cross` replaces them
+        self.wait_readers(gpu, slots)?;
         let mut gens = Vec::with_capacity(slots.len());
         for (i, &s) in slots.iter().enumerate() {
             gpu.copy_dtod(xa + (i * XA_BYTES) as u64, self.xa_slot(s)?, XA_BYTES)?;
@@ -584,6 +665,56 @@ impl KvCaches {
                 self.trash().into(),
             ],
         )
+    }
+}
+
+/// Cross keys and values of some slots lent to a reader by [`KvCaches::lend_cross`],
+/// the only way work on another stream should get their addresses. On drop it records,
+/// on the reader's stream, the event each slot's next write waits for, so drop it once
+/// the reads are queued
+#[must_use = "the reads are fenced only while and after the lease lives"]
+pub struct CrossLease<'a> {
+    caches: &'a KvCaches,
+    reader: &'a Gpu,
+    /// Lent slots, sorted and unique
+    slots: Vec<usize>,
+    layers: usize,
+    /// One event per lent slot when the reader is on another stream, else none
+    done: Vec<Event>,
+}
+
+impl CrossLease<'_> {
+    /// Device addresses of the cross-attention K and V rows `[CROSS_LEN, STATE]` of a lent
+    /// slot in a lent layer
+    pub fn cross_slot(&self, layer: usize, slot: usize) -> Result<(u64, u64)> {
+        ensure!(
+            layer < self.layers && self.slots.binary_search(&slot).is_ok(),
+            "layer {layer} slot {slot} not in the lease"
+        );
+        self.caches.cross_slot(layer, slot)
+    }
+}
+
+impl Drop for CrossLease<'_> {
+    fn drop(&mut self) {
+        if self.done.is_empty() {
+            return;
+        }
+
+        let recorded = self.done.iter().try_for_each(|e| self.reader.record(e));
+        if recorded.is_err() {
+            // with no event to wait on, the reads must be over before any write is queued
+            let _ = self.reader.synchronize();
+            return;
+        }
+
+        let mut readers = self.caches.readers.borrow_mut();
+        for (&s, event) in self.slots.iter().zip(self.done.drain(..)) {
+            let events = &mut readers[s];
+            // a finished read needs no wait; a failed query keeps the event to be safe
+            events.retain(|e| !e.query().unwrap_or(false));
+            events.push(event);
+        }
     }
 }
 
